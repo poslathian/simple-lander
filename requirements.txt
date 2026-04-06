@@ -2,3 +2,8 @@ drake>=1.51
 numpy>=2.4
 scipy>=1.17
 pytest>=9.0
+torch
+gymnasium[box2d]
+pygame
+Pillow
+swig

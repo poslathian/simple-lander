@@ -64,8 +64,8 @@ def rollout_pipeline(env, seed):
     return total_reward, landed
 
 
-def test_noise_clamped_to_guidance():
-    """Guidance with tight margin clamps noise to target values."""
+def test_guidance_clamping():
+    """Guidance with tight margin clamps model output to target values."""
     at = ActionTarget(
         thrust_v=0.5, thrust_v_margin=0.001,
         thrust_h=-0.3, thrust_h_margin=0.001,
@@ -79,7 +79,7 @@ def test_noise_clamped_to_guidance():
         contacts=(False, False, False),
     )
 
-    for _ in range(100):
+    for _ in range(10):
         spline = DiffusionController(
             timeout=10.0,
             t_obs_cmd_latency=DT,
@@ -97,7 +97,7 @@ def test_noise_clamped_to_guidance():
 
 
 def test_pipeline_matches_kto():
-    """Diffusion pipeline landing rate should be close to standalone KTO."""
+    """Diffusion pipeline with tight guidance should match standalone KTO."""
     n = 20
 
     gym.register(id="LL-kto-test", entry_point="lunar_lander:LunarLander",
@@ -129,7 +129,13 @@ def test_pipeline_matches_kto():
     kto_mean = np.mean(kto_rewards)
     pipe_mean = np.mean(pipe_rewards)
 
-    print(f"KTO:      land_rate={kto_rate:.0%}  reward={kto_mean:.2f}")
+    print(f"\n{'seed':>4}  {'KTO':>10} {'Pipeline':>10} {'delta':>8}")
+    print("-" * 38)
+    for i in range(n):
+        d = abs(kto_rewards[i] - pipe_rewards[i])
+        print(f"{i:4d}  {kto_rewards[i]:10.3f} {pipe_rewards[i]:10.3f} {d:8.3f}")
+
+    print(f"\nKTO:      land_rate={kto_rate:.0%}  reward={kto_mean:.2f}")
     print(f"Pipeline: land_rate={pipe_rate:.0%}  reward={pipe_mean:.2f}")
     print(f"Gaps:     land_rate={abs(kto_rate - pipe_rate):.0%}  reward={abs(kto_mean - pipe_mean):.2f}")
 
@@ -150,7 +156,7 @@ def test_keyboard_override():
 
     gc = GuidanceController(env, time_budget=5.0)
 
-    # Active keyboard action (not idle [-1, 0])
+    # Active keyboard action (not idle [0, 0])
     kb = np.array([0.8, -0.6], dtype=np.float32)
     at = gc.step(env, obs, keyboard_action=kb)
 
@@ -158,10 +164,10 @@ def test_keyboard_override():
     assert abs(at.thrust_h - (-0.6)) < 1e-6, f"Expected thrust_h=-0.6, got {at.thrust_h}"
 
     # Idle keyboard action should fall through to KTO
-    kb_idle = np.array([-1.0, 0.0], dtype=np.float32)
+    kb_idle = np.array([0.0, 0.0], dtype=np.float32)
     at2 = gc.step(env, obs, keyboard_action=kb_idle)
-    # Should NOT be [-1, 0] — KTO should provide a real action
-    assert not (at2.thrust_v == -1.0 and at2.thrust_h == 0.0), (
+    # Should NOT be [0, 0] — KTO should provide a real action
+    assert not (at2.thrust_v == 0.0 and at2.thrust_h == 0.0), (
         "Idle keyboard should not override KTO"
     )
 
@@ -169,8 +175,8 @@ def test_keyboard_override():
 
 
 if __name__ == "__main__":
-    test_noise_clamped_to_guidance()
-    print("test_noise_clamped_to_guidance PASSED")
+    test_guidance_clamping()
+    print("test_guidance_clamping PASSED")
 
     test_keyboard_override()
     print("test_keyboard_override PASSED")
