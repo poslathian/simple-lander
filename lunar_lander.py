@@ -623,12 +623,12 @@ class KTOController:
     """
 
     # Cascaded PD gains (tuned via headless rollouts, 75% landing rate)
-    KP_Y = 0.5         # vertical position error → main thrust
-    KD_Y = 0.3         # vertical velocity error → main thrust
+    KP_Y = 0.8         # vertical position error → main thrust
+    KD_Y = 0.4         # vertical velocity error → main thrust
     KP_X = 0.03        # lateral position error → desired θ offset (rad/m)
     KD_X = 0.02        # lateral velocity error → desired θ offset
-    KP_THETA = 0.5     # angle error → side thrust (via torque)
-    KD_THETA = 0.3     # angular velocity error → side thrust (via torque)
+    KP_THETA = 0.8     # angle error → side thrust (via torque)
+    KD_THETA = 0.4     # angular velocity error → side thrust (via torque)
     MAX_THETA_CMD = 0.08 # max θ correction from lateral error (rad)
 
     def __init__(self, env, time_budget=5.0, warmstart_budget=1.0):
