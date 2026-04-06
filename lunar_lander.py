@@ -862,7 +862,7 @@ if __name__ == "__main__":
             if event.type == pygame.KEYDOWN and event.key in (pygame.K_q, pygame.K_ESCAPE):
                 _kb["quit"] = True
         keys = pygame.key.get_pressed()
-        main = 1.0 if (keys[pygame.K_UP] or keys[pygame.K_w]) else 0.0
+        main = 1.0 if (keys[pygame.K_UP] or keys[pygame.K_w]) else -1.0
         side = 0.0
         if keys[pygame.K_LEFT] or keys[pygame.K_a]:
             side = -1.0
