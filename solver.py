@@ -6,23 +6,24 @@ constraints at sampled times ensure every acceleration along the path is
 achievable within the lander's thrust limits.  Circular obstacles are avoided
 via sampled distance constraints.
 
-Physics model (2D rigid-body rocket, constants from physics.py):
+Physics model (2D rigid-body rocket, constants from lunar_lander.py):
 
-    x''  = (-Fm sin theta  +  Fs cos theta) / m
-    y''  = ( Fm cos theta  +  Fs sin theta) / m  -  g
-    th'' =   Fs * arm / I
+    Main engine force direction (body up):  (-sin θ,  cos θ)
+    Side engine force direction (body right): ( cos θ, -sin θ)
 
-Given (x'', y'', theta) we can invert for the required thrusts:
+    x''  = (-Fm sin θ  +  Fs cos θ) / m
+    y''  = ( Fm cos θ  -  Fs sin θ) / m  -  g
 
-    Fm =  m * ( -x'' sin theta  + (y'' + g) cos theta )
-    Fs =  m * (  x'' cos theta  + (y'' + g) sin theta )
+Given (x'', y'', θ) we can invert for the required thrusts:
 
-and the torque-consistency requirement:
+    Fm =  m * ( -x'' sin θ  + (y'' + g) cos θ )
+    Fs =  m * (  x'' cos θ  - (y'' + g) sin θ )
 
-    th''  ==  Fs * arm / I
+Torque from the side engine applied at the Box2D impulse point:
 
-Mass, inertia, gravity, thrust limits, and torque arm are all derived from
-the Box2D-matched constants in physics.py rather than hand-tuned values.
+    τ  = Fs · (2·A_AWAY·sinθ·cosθ + ARM_A·sin²θ - ARM_B·cos²θ) / I
+
+where A_AWAY = SIDE_ENGINE_AWAY / SCALE (lateral offset of application point).
 """
 
 from dataclasses import dataclass
@@ -33,34 +34,34 @@ from pydrake.solvers import Solve, SnoptSolver, SolverOptions
 from pydrake.trajectories import BsplineTrajectory
 from scipy.interpolate import BSpline
 
-import physics as phys
+import lunar_lander as ll
 
 # ── World geometry (matches Gymnasium LunarLander viewport) ──────────────
-SCALE = phys.SCALE
-VIEWPORT_W, VIEWPORT_H = 600, 400
-W = VIEWPORT_W / SCALE  # 20.0  world units
-H = VIEWPORT_H / SCALE  # 13.33 world units
-PAD_X = W / 2            # 10.0
-PAD_Y = H / 4            # 3.33
+SCALE = ll.SCALE
+VIEWPORT_W, VIEWPORT_H = ll.VIEWPORT_W, ll.VIEWPORT_H
+W = VIEWPORT_W / SCALE  # 30.0  world units
+H = VIEWPORT_H / SCALE  # 20.0  world units
+PAD_X = W / 2            # 15.0
+PAD_Y = H / 4            # 5.0
 
 # ── 2D rocket physics (derived from Box2D-matched physics.py) ───────────
-GRAVITY = abs(phys.GRAVITY)                    # 10.0
-MASS = phys.SYSTEM_MASS                        # ~4.959 (lander + legs)
-INERTIA = phys.LANDER_INERTIA_CM              # ~0.833
+GRAVITY = abs(ll.GRAVITY)                    # 10.0
+MASS = ll.SYSTEM_MASS                        # ~4.959 (lander + legs)
+INERTIA = ll.LANDER_INERTIA_CM              # ~0.833
 
 # Max continuous force = peak impulse / dt
-THRUST_MAX = (phys.MAIN_ENGINE_POWER
-              * phys.MAIN_ENGINE_Y_LOCATION / (phys.SCALE * phys.DT))
-SIDE_MAX   = (phys.SIDE_ENGINE_POWER
-              * phys.SIDE_ENGINE_AWAY / (phys.SCALE * phys.DT))
+THRUST_MAX = (ll.MAIN_ENGINE_POWER
+              * ll.MAIN_ENGINE_Y_LOCATION / (ll.SCALE * ll.DT))
+SIDE_MAX   = (ll.SIDE_ENGINE_POWER
+              * ll.SIDE_ENGINE_AWAY / (ll.SCALE * ll.DT))
 
-# Side-engine effective torque arm is θ-dependent due to the 17/SCALE vs
-# SIDE_ENGINE_HEIGHT/SCALE asymmetry in the Box2D application-point code.
-#   effective_arm(θ) = SIDE_ARM_A·sin²θ + SIDE_ARM_B·cos²θ
-# SIDE_ARM_A dominates at large tilt; SIDE_ARM_B near upright.
-SIDE_ARM_A = 17.0 / phys.SCALE - phys.LANDER_CM_LOCAL[1]  # ≈ 0.465
-SIDE_ARM_B = phys.SIDE_ENGINE_HEIGHT / phys.SCALE - phys.LANDER_CM_LOCAL[1]  # ≈ 0.365
-SIDE_ARM = SIDE_ARM_B  # backward-compat alias (upright value)
+# Side-engine torque arm components (from Box2D impulse application point).
+# The application point offset from COM has three geometric terms whose
+# cross product with the force direction (cosθ, -sinθ) yields:
+#   τ = Fs · (2·A_AWAY·sinθ·cosθ + ARM_A·sin²θ - ARM_B·cos²θ) / I
+SIDE_ARM_A = 17.0 / ll.SCALE - ll.LANDER_CM_LOCAL[1]       # ≈ 0.465
+SIDE_ARM_B = ll.SIDE_ENGINE_HEIGHT / ll.SCALE - ll.LANDER_CM_LOCAL[1]  # ≈ 0.365
+SIDE_AWAY  = ll.SIDE_ENGINE_AWAY / ll.SCALE                 # = 0.400
 
 # ── Default boundary conditions ──────────────────────────────────────────
 START = np.array([PAD_X + 4.0, H - 0.5, 0.0])
@@ -423,12 +424,12 @@ def _add_goal_cost(kto, prog, goal, weight):
 def _add_dynamics_constraints(kto, prog, n_samples):
     """Constrain implied thrusts to be within physical limits at each sample.
 
-    Uses the full physics.py torque model:
-    - Main engine produces zero torque (force passes through COM when
-      LANDER_CM_LOCAL[0] == 0).
-    - Side engine effective arm is θ-dependent due to the 17/SCALE vs
-      SIDE_ENGINE_HEIGHT/SCALE asymmetry:
-        α = -Fs · (SIDE_ARM_A·sin²θ + SIDE_ARM_B·cos²θ) / I
+    Force directions (world frame):
+      Main: Fm · (-sinθ,  cosθ)   — body up
+      Side: Fs · ( cosθ, -sinθ)   — body right
+
+    Torque from side engine at Box2D application point:
+      τ = Fs · (2·SIDE_AWAY·sinθ·cosθ + SIDE_ARM_A·sin²θ - SIDE_ARM_B·cos²θ)
 
     Outputs per sample:  [Fm, Fs, torque_error]
     Bounds:              [0, THRUST_MAX] x [-SIDE_MAX, SIDE_MAX] x {0}
@@ -456,11 +457,13 @@ def _add_dynamics_constraints(kto, prog, n_samples):
 
                 ct, st = np.cos(pos[2]), np.sin(pos[2])
                 Fm = MASS * (-acc[0] * st + (acc[1] + GRAVITY) * ct)
-                Fs = MASS * ( acc[0] * ct + (acc[1] + GRAVITY) * st)
+                Fs = MASS * ( acc[0] * ct - (acc[1] + GRAVITY) * st)
 
-                # θ-dependent effective torque arm (physics.py asymmetry)
-                eff_arm = SIDE_ARM_A * st * st + SIDE_ARM_B * ct * ct
-                torque_err = acc[2] + Fs * eff_arm / INERTIA
+                # Torque from side impulse at Box2D application point
+                torque_arm = (2 * SIDE_AWAY * st * ct
+                              + SIDE_ARM_A * st * st
+                              - SIDE_ARM_B * ct * ct)
+                torque_err = acc[2] - Fs * torque_arm / INERTIA
                 return np.array([Fm, Fs, torque_err])
             return constraint
 
@@ -600,7 +603,7 @@ def _sample(traj, n=300, n_constraint_pts=8):
 
         ct, st = np.cos(q[2]), np.sin(q[2])
         S["Fm"][i] = MASS * (-qdd[0] * st + (qdd[1] + GRAVITY) * ct)
-        S["Fs"][i] = MASS * ( qdd[0] * ct + (qdd[1] + GRAVITY) * st)
+        S["Fs"][i] = MASS * ( qdd[0] * ct - (qdd[1] + GRAVITY) * st)
 
     t0, t1 = traj.start_time(), traj.end_time()
 

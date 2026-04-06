@@ -42,9 +42,15 @@ LEG_SPRING_TORQUE = 40
 SIDE_ENGINE_HEIGHT = 14
 SIDE_ENGINE_AWAY = 12
 MAIN_ENGINE_Y_LOCATION = 4
+GRAVITY = -10.0
 
 VIEWPORT_W = 900
 VIEWPORT_H = 600
+
+# Derived Box2D constants (lander polygon density=5.0, two legs density=1.0)
+SYSTEM_MASS = 4.958889
+LANDER_INERTIA_CM = 0.833315
+LANDER_CM_LOCAL = (0.0, 0.101307)
 
 
 class ContactDetector(contactListener):
