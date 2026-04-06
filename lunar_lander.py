@@ -591,6 +591,96 @@ def heuristic(env, s):
 
 
 # ---------------------------------------------------------------------------
+# KTO open-loop controller
+# ---------------------------------------------------------------------------
+
+class KTOController:
+    """KTO trajectory controller: solver plan + heuristic settle.
+
+    Phase 1: Replay the KTO thrust plan (targets 2m above pad, zero end velocity).
+    Phase 2: Heuristic PD controller for final descent and landing.
+    """
+
+    def __init__(self, env, time_budget=5.0, warmstart_budget=1.0):
+        import solver
+
+        uw = env.unwrapped
+        # Zero initial velocity to match solver boundary conditions
+        uw.lander.linearVelocity = (0.0, 0.0)
+        uw.lander.angularVelocity = 0.0
+
+        pos = uw.lander.position
+        start = np.array([pos.x, pos.y, uw.lander.angle])
+        # Target above the pad — heuristic handles final descent
+        goal_y = uw.helipad_y + LEG_DOWN / SCALE + 2.0
+        goal = np.array([solver.PAD_X, goal_y, 0.0])
+
+        obstacle_tuples = []
+        for obs_body, r in zip(uw.obstacles, getattr(uw, "obstacle_radii", [])):
+            obstacle_tuples.append((obs_body.position.x, obs_body.position.y, r))
+
+        times, plan, *_ = solver.solve(
+            start=start, goal=goal,
+            obstacles=tuple(obstacle_tuples),
+            time_budget=time_budget,
+            warmstart_budget=warmstart_budget,
+        )
+
+        duration = times[-1] - times[0]
+        n_steps = int(duration / DT)
+        sim_times = np.linspace(times[0], times[-1], n_steps)
+        self.Fm = np.interp(sim_times, times, plan["Fm"])
+        self.Fs = np.interp(sim_times, times, plan["Fs"])
+        self.n_steps = n_steps
+        self.idx = 0
+
+    def step(self, env):
+        """Apply this frame's thrust and return a no-op action for env.step()."""
+        if self.idx < self.n_steps:
+            Fm = float(self.Fm[self.idx])
+            Fs = float(self.Fs[self.idx])
+            self.idx += 1
+
+            uw = env.unwrapped
+            lander = uw.lander
+            theta = lander.angle
+            ct, st = math.cos(theta), math.sin(theta)
+
+            # Main engine impulse at the engine application point
+            if Fm > 0:
+                ox = st * MAIN_ENGINE_Y_LOCATION / SCALE
+                oy = -ct * MAIN_ENGINE_Y_LOCATION / SCALE
+                impulse_pos = (lander.position[0] + ox, lander.position[1] + oy)
+                lander.ApplyLinearImpulse(
+                    (Fm * DT * (-st), Fm * DT * ct), impulse_pos, True)
+                uw.m_power = min(1.0, Fm / (MAIN_ENGINE_POWER * MAIN_ENGINE_Y_LOCATION / (SCALE * DT)))
+            else:
+                uw.m_power = 0.0
+
+            # Side engine impulse at the engine application point
+            if abs(Fs) > 1e-6:
+                side_x, side_y = -ct, st
+                ox = side_x * SIDE_ENGINE_AWAY / SCALE
+                oy = -side_y * SIDE_ENGINE_AWAY / SCALE
+                impulse_pos = (
+                    lander.position[0] + ox - st * 17 / SCALE,
+                    lander.position[1] + oy + ct * SIDE_ENGINE_HEIGHT / SCALE,
+                )
+                lander.ApplyLinearImpulse(
+                    (Fs * DT * ct, Fs * DT * (-st)), impulse_pos, True)
+                uw.s_power = min(1.0, abs(Fs) / (SIDE_ENGINE_POWER / DT))
+                uw.s_dir = 1.0 if Fs > 0 else -1.0
+            else:
+                uw.s_power = 0.0
+                uw.s_dir = 0.0
+        else:
+            # Plan exhausted — fall back to heuristic for final settle
+            return heuristic(env, env.unwrapped._build_obs())
+
+        return np.array([0.0, 0.0], dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Main — heuristic by default, --keyboard for manual control
 # ---------------------------------------------------------------------------
 
@@ -602,6 +692,8 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=0, help="0 = infinite")
     parser.add_argument("--keyboard", action="store_true",
                         help="Manual control (arrow keys / WASD)")
+    parser.add_argument("--kto", action="store_true",
+                        help="KTO trajectory solver (open-loop + heuristic settle)")
     parser.add_argument("--obstacles", type=int, default=0,
                         help="Number of obstacles (0-5)")
     parser.add_argument("--save-frames", type=str, default=None,
@@ -655,9 +747,19 @@ if __name__ == "__main__":
         total_reward, done, steps = 0.0, False, 0
         frame_idx = 0
 
+        kto_ctrl = None
+        if args.kto:
+            import time as _time
+            t0 = _time.monotonic()
+            kto_ctrl = KTOController(env, time_budget=5.0)
+            print(f"  KTO solve: {_time.monotonic() - t0:.2f}s, "
+                  f"{kto_ctrl.n_steps} steps planned")
+
         while not done:
             if args.keyboard:
                 action = _kb["action"]
+            elif kto_ctrl is not None:
+                action = kto_ctrl.step(env)
             else:
                 action = heuristic(env, obs)
 
