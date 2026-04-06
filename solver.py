@@ -186,7 +186,7 @@ def solve(start=None, goal=None, obstacles=(),
           terrain=None,
           on_progress=None, max_iters=None,
           time_budget=0.25, warmstart_budget=0.10,
-          strategy=None):
+          strategy=None, goal_velocity=None):
     """Plan a minimum-time landing trajectory.
 
     Parameters
@@ -263,10 +263,14 @@ def solve(start=None, goal=None, obstacles=(),
         else:
             kto.AddPathPositionConstraint(goal, goal, 1.0)
 
-        # Velocity: always zero at endpoints
+        # Velocity: zero at start, goal_velocity (or zero) at end
         z = np.zeros((3, 1))
         kto.AddPathVelocityConstraint(z, z, 0.0)
-        kto.AddPathVelocityConstraint(z, z, 1.0)
+        if goal_velocity is not None:
+            gv = np.asarray(goal_velocity, dtype=float).reshape(3, 1)
+            kto.AddPathVelocityConstraint(gv, gv, 1.0)
+        else:
+            kto.AddPathVelocityConstraint(z, z, 1.0)
 
         kto.AddPositionBounds(
             np.array([0.0, PAD_Y - 1.0, -np.pi / 3]),

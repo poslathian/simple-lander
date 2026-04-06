@@ -739,7 +739,7 @@ class KTOController:
         pos = uw.lander.position
         start = np.array([pos.x, pos.y, uw.lander.angle])
         # Target above the pad — heuristic handles final descent
-        goal_y = uw.helipad_y + LEG_DOWN / SCALE + 2.0
+        goal_y = uw.helipad_y + LEG_DOWN / SCALE + 1.0
         goal = np.array([solver.PAD_X, goal_y, 0.0])
 
         obstacle_tuples = []
@@ -751,6 +751,7 @@ class KTOController:
             obstacles=tuple(obstacle_tuples),
             time_budget=time_budget,
             warmstart_budget=warmstart_budget,
+            goal_velocity=np.array([0.0, -0.5, 0.0]),
         )
 
         self.plan_times = times
@@ -836,11 +837,18 @@ if __name__ == "__main__":
                         help="Save frames to directory (e.g. ./tmp)")
     parser.add_argument("--speedup", type=float, default=1.0,
                         help="0=fast as possible, 1.0=realtime 50fps, 2.0=2x faster")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run without rendering")
+    parser.add_argument("--diffusion", action="store_true",
+                        help="Route actions through DiffusionController pipeline")
     args = parser.parse_args()
 
-    render_mode = "human"
-    if args.save_frames:
+    if args.headless:
+        render_mode = None
+    elif args.save_frames:
         render_mode = "rgb_array"
+    else:
+        render_mode = "human"
 
     gym.register(
         id="LunarLander-simple",
@@ -884,7 +892,18 @@ if __name__ == "__main__":
         frame_idx = 0
 
         kto_ctrl = None
-        if args.kto:
+        guidance_ctrl = None
+        if args.diffusion:
+            from diffusion_controller import (
+                DiffusionController, LanderState, ActionTarget,
+            )
+            from guidance_controller import GuidanceController
+            import time as _time
+            t0 = _time.monotonic()
+            guidance_ctrl = GuidanceController(env, time_budget=5.0)
+            print(f"  KTO solve: {_time.monotonic() - t0:.2f}s, "
+                  f"{guidance_ctrl.kto.n_steps} steps planned")
+        elif args.kto:
             import time as _time
             t0 = _time.monotonic()
             kto_ctrl = KTOController(env, time_budget=5.0)
@@ -892,7 +911,30 @@ if __name__ == "__main__":
                   f"{kto_ctrl.n_steps} steps planned")
 
         while not done:
-            if args.keyboard:
+            if guidance_ctrl is not None:
+                kb_act = _kb["action"] if args.keyboard else None
+                at = guidance_ctrl.step(env, obs, keyboard_action=kb_act)
+                state = LanderState(
+                    t_sim_lander=float(obs[8]),
+                    q=(float(obs[0]), float(obs[1]), float(obs[4])),
+                    q_prime=(float(obs[2]), float(obs[3]), float(obs[5])),
+                    thrust=(0.0, 0.0),
+                    contacts=(bool(obs[6]), bool(obs[7]), False),
+                )
+                spline = DiffusionController(
+                    timeout=TIMEOUT,
+                    t_obs_cmd_latency=DT,
+                    obstacles=[],
+                    lander_state=state,
+                    waypoint_goals=[],
+                    guidance_actions=[at],
+                    classifier_free_guidance=[],
+                    action_horizon=0.1,
+                    target_frequency=50.0,
+                )
+                tv, th = spline(DT)
+                action = np.array([tv, th], dtype=np.float32)
+            elif args.keyboard:
                 action = _kb["action"]
             elif kto_ctrl is not None:
                 action = kto_ctrl.step(env)
