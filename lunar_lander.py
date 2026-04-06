@@ -505,7 +505,13 @@ class LunarLander(gym.Env, EzPickle):
         if self.render_mode == "human":
             assert self.screen is not None
             self.screen.blit(self.surf, (0, 0))
-            pygame.event.pump()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.close()
+                    raise SystemExit
+                if event.type == pygame.KEYDOWN and event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    self.close()
+                    raise SystemExit
             target_fps = self.metadata["render_fps"] * getattr(self, "speedup", 1.0)
             if target_fps > 0:
                 self.clock.tick(target_fps)
