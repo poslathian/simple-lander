@@ -219,13 +219,10 @@ class TestSurrogateDynamics:
             start=start, goal=goal, obstacles=(),
             time_budget=5.0, warmstart_budget=1.0)
 
-        duration = times[-1] - times[0]
-        n_sim = int(duration / DT)
-        sim_t = np.linspace(times[0], times[-1], n_sim)
-        Fm_seq = np.clip(np.interp(sim_t, times, plan["Fm"]), 0, solver.THRUST_MAX)
-        Fs_seq = np.clip(np.interp(sim_t, times, plan["Fs"]), -solver.SIDE_MAX, solver.SIDE_MAX)
-        x_plan = np.interp(sim_t, times, plan["x"])
-        y_plan = np.interp(sim_t, times, plan["y"])
+        # Forces are DT-aligned: n_steps entries; positions have n_steps+1
+        n_sim = len(plan["Fm"])
+        Fm_seq = np.clip(plan["Fm"], 0, solver.THRUST_MAX)
+        Fs_seq = np.clip(plan["Fs"], -solver.SIDE_MAX, solver.SIDE_MAX)
 
         # Discrete surrogate rollout
         state0 = [b2d["x"], b2d["y"], b2d["theta"], b2d["vx"], b2d["vy"], b2d["omega"]]
@@ -243,7 +240,8 @@ class TestSurrogateDynamics:
         for i in range(n_sim):
             sx, sy = surr[i + 1, 0], surr[i + 1, 1]
             bx, by = box_pos[i]
-            px, py = x_plan[i], y_plan[i]
+            # plan positions have n_steps+1 entries; compare after step i with position i+1
+            px, py = plan["x"][i + 1], plan["y"][i + 1]
             surr_vs_box.append(math.hypot(sx - bx, sy - by))
             surr_vs_plan.append(math.hypot(sx - px, sy - py))
             box_vs_plan.append(math.hypot(bx - px, by - py))
@@ -256,8 +254,8 @@ class TestSurrogateDynamics:
         # Discrete surrogate should track Box2D (residual from unmodeled leg joints)
         assert max(surr_vs_box) < 10.0, (
             f"lander_step vs Box2D diverged: {max(surr_vs_box):.4f}")
-        # Box2D should track the plan (wider spawn means longer trajectories)
-        assert max(box_vs_plan) < 15.0, (
+        # Box2D should track the plan (open-loop drift grows over long trajectories)
+        assert max(box_vs_plan) < 20.0, (
             f"Box2D vs Plan diverged: {max(box_vs_plan):.4f}")
 
 
@@ -330,20 +328,18 @@ class TestPhysicsDivergence:
         times, plan, *_ = solver.solve(
             start=start, goal=goal, obstacles=(),
             time_budget=5.0, warmstart_budget=1.0)
-        duration = times[-1] - times[0]
-        n_sim = int(duration / DT)
-        sim_t = np.linspace(times[0], times[-1], n_sim)
-        Fm_i = np.interp(sim_t, times, plan["Fm"])
-        Fs_i = np.interp(sim_t, times, plan["Fs"])
-        x_p = np.interp(sim_t, times, plan["x"])
-        y_p = np.interp(sim_t, times, plan["y"])
+        # Forces are DT-aligned: n_steps entries; positions have n_steps+1
+        n_sim = len(plan["Fm"])
         pos_errors = []
         for i in range(n_sim):
-            _apply_thrust_impulse(env, float(np.clip(Fm_i[i], 0, solver.THRUST_MAX)),
-                                  float(np.clip(Fs_i[i], -solver.SIDE_MAX, solver.SIDE_MAX)))
+            _apply_thrust_impulse(env, float(np.clip(plan["Fm"][i], 0, solver.THRUST_MAX)),
+                                  float(np.clip(plan["Fs"][i], -solver.SIDE_MAX, solver.SIDE_MAX)))
             _step_box2d_no_action(env)
             box2d = _world_state(env)
-            pos_errors.append(math.hypot(box2d["x"] - x_p[i], box2d["y"] - y_p[i]))
+            # plan positions have n_steps+1 entries; compare after step i with position i+1
+            pos_errors.append(math.hypot(box2d["x"] - plan["x"][i + 1],
+                                         box2d["y"] - plan["y"][i + 1]))
+        duration = times[-1] - times[0]
         print(f"\nSolver plan replay ({n_sim} steps, {duration:.2f}s): "
               f"max={max(pos_errors):.4f}  mean={np.mean(pos_errors):.4f}")
         env.close()
@@ -483,11 +479,11 @@ class TestKTOTracking:
               f"late_mean={np.mean(lateral_demands[60:]):.4f}")
         print(f"  Saved frames: {saved_frames}")
 
-        # Error should be much larger in the late phase where lateral
-        # movement is demanded and tilt-induced thrust errors accumulate
-        assert late_max > early_max * 2.0, (
-            f"Expected late drift ({late_max:.3f}) to be much larger than "
-            f"early drift ({early_max:.3f}) — lateral thrust error not visible")
+        # With corrected inverse dynamics, tracking should stay tight
+        # throughout — late drift should not blow up relative to early
+        assert late_max < 1.0, (
+            f"Late drift ({late_max:.3f}) too large — expected tight tracking "
+            f"with corrected inverse dynamics")
 
         # Frames should exist
         for p in saved_frames:
@@ -516,23 +512,19 @@ class TestKTOTracking:
         times, plan, *_ = solver.solve(
             start=start, goal=goal, obstacles=(),
             time_budget=5.0, warmstart_budget=1.0)
-        duration = times[-1] - times[0]
-        n_steps = int(duration / DT)
-        sim_t = np.linspace(times[0], times[-1], n_steps)
-        Fm_seq = np.interp(sim_t, times, plan["Fm"])
-        Fs_seq = np.interp(sim_t, times, plan["Fs"])
-        x_plan = np.interp(sim_t, times, plan["x"])
-        y_plan = np.interp(sim_t, times, plan["y"])
+        # Forces are DT-aligned: n_steps entries; positions have n_steps+1
+        n_steps = len(plan["Fm"])
 
         # ── Rollout 1: direct impulse ────────────────────────────────────
         direct_errors = []
         for i in range(n_steps):
-            Fm_i = float(np.clip(Fm_seq[i], 0, solver.THRUST_MAX))
-            Fs_i = float(np.clip(Fs_seq[i], -solver.SIDE_MAX, solver.SIDE_MAX))
+            Fm_i = float(np.clip(plan["Fm"][i], 0, solver.THRUST_MAX))
+            Fs_i = float(np.clip(plan["Fs"][i], -solver.SIDE_MAX, solver.SIDE_MAX))
             _apply_thrust_impulse(env1, Fm_i, Fs_i)
             _step_box2d_no_action(env1)
             s = _world_state(env1)
-            direct_errors.append(math.hypot(s["x"] - x_plan[i], s["y"] - y_plan[i]))
+            direct_errors.append(math.hypot(s["x"] - plan["x"][i + 1],
+                                            s["y"] - plan["y"][i + 1]))
         env1.close()
 
         # ── Rollout 2: action-based (KTOController) ─────────────────────

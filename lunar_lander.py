@@ -757,15 +757,14 @@ class KTOController:
         self.plan = plan
         self.gains = solver.DEFAULT_GAINS
 
-        duration = times[-1] - times[0]
-        self.n_steps = int(duration / DT)
+        # Forces are DT-aligned: n_steps entries; positions have n_steps+1
+        self.n_steps = len(plan["Fm"])
         self.idx = 0
 
-        # Pre-interpolate plan positions for rendering/tests
-        sim_times = np.linspace(times[0], times[-1], self.n_steps)
-        self.plan_x = np.interp(sim_times, times, plan["x"])
-        self.plan_y = np.interp(sim_times, times, plan["y"])
-        self.plan_theta = np.interp(sim_times, times, plan["theta"])
+        # Plan positions for rendering/tests (direct from DT-aligned sampling)
+        self.plan_x = plan["x"]
+        self.plan_y = plan["y"]
+        self.plan_theta = plan["theta"]
 
         # Store trajectory for rendering: spline path (x,y) and knot points
         self.path_xy = np.column_stack([plan["x"], plan["y"]])
@@ -780,7 +779,7 @@ class KTOController:
         import solver
 
         if self.idx < self.n_steps:
-            t = self.idx * DT
+            i = self.idx
             self.idx += 1
 
             # Read actual state from Box2D
@@ -791,18 +790,17 @@ class KTOController:
             vx, vy = L.linearVelocity.x, L.linearVelocity.y
             omega = L.angularVelocity
 
-            # Interpolate reference
+            # Reference from DT-aligned plan (direct index)
             p = self.plan
-            pt = self.plan_times
-            x_ref = float(np.interp(t, pt, p["x"]))
-            y_ref = float(np.interp(t, pt, p["y"]))
-            th_ref = float(np.interp(t, pt, p["theta"]))
-            vx_ref = float(np.interp(t, pt, p["vx"]))
-            vy_ref = float(np.interp(t, pt, p["vy"]))
-            om_ref = float(np.interp(t, pt, p["omega"]))
-            ax_ref = float(np.interp(t, pt, p["ax"]))
-            ay_ref = float(np.interp(t, pt, p["ay"]))
-            al_ref = float(np.interp(t, pt, p["alpha"]))
+            x_ref = float(p["x"][i])
+            y_ref = float(p["y"][i])
+            th_ref = float(p["theta"][i])
+            vx_ref = float(p["vx"][i])
+            vy_ref = float(p["vy"][i])
+            om_ref = float(p["omega"][i])
+            ax_ref = float(p["ax"][i])
+            ay_ref = float(p["ay"][i])
+            al_ref = float(p["alpha"][i])
 
             Fm, Fs = solver._tracking_step(
                 x, y, theta, vx, vy, omega,

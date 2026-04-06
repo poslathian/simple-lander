@@ -14,10 +14,11 @@ Physics model (2D rigid-body rocket, constants from lunar_lander.py):
     x''  = (-Fm sin θ  +  Fs cos θ) / m
     y''  = ( Fm cos θ  -  Fs sin θ) / m  -  g
 
-Given (x'', y'', θ) we can invert for the required thrusts:
+The force directions are NOT orthogonal (dot = -sin2θ), so inversion
+requires solving the 2×2 system via Cramer's rule (det = -cos2θ):
 
-    Fm =  m * ( -x'' sin θ  + (y'' + g) cos θ )
-    Fs =  m * (  x'' cos θ  - (y'' + g) sin θ )
+    Fm =  m * ( x'' sin θ  + (y'' + g) cos θ ) / cos(2θ)
+    Fs =  m * ( x'' cos θ  + (y'' + g) sin θ ) / cos(2θ)
 
 Torque from the side engine applied at the Box2D impulse point:
 
@@ -457,12 +458,13 @@ def _add_dynamics_constraints(kto, prog, n_samples):
     Uses the lunar_lander.py torque model, validated at import time by
     _validate_torque_model().
 
-    Force directions (world frame):
-      Main: Fm · (-sinθ,  cosθ)   — body up
-      Side: Fs · ( cosθ, -sinθ)   — body right
+    Force directions (world frame, NOT orthogonal):
+      Main: Fm · (-sinθ,  cosθ)
+      Side: Fs · ( cosθ, -sinθ)
 
-    Torque from side engine at Box2D application point:
-      τ = Fs · (2·SIDE_AWAY·sinθ·cosθ + SIDE_ARM_A·sin²θ - SIDE_ARM_B·cos²θ)
+    Inverse dynamics solves the 2×2 system (Cramer's rule, det = -cos2θ):
+      Fm = m·(x''·sinθ + (y''+g)·cosθ) / cos(2θ)
+      Fs = m·(x''·cosθ + (y''+g)·sinθ) / cos(2θ)
 
     Outputs per sample:  [Fm, Fs, torque_error]
     Bounds:              [0, THRUST_MAX] x [-SIDE_MAX, SIDE_MAX] x {0}
@@ -489,8 +491,9 @@ def _add_dynamics_constraints(kto, prog, n_samples):
                 acc = P @ w_acc / dur ** 2
 
                 ct, st = np.cos(pos[2]), np.sin(pos[2])
-                Fm = MASS * (-acc[0] * st + (acc[1] + GRAVITY) * ct)
-                Fs = MASS * ( acc[0] * ct - (acc[1] + GRAVITY) * st)
+                c2t = ct * ct - st * st  # cos(2θ)
+                Fm = MASS * (acc[0] * st + (acc[1] + GRAVITY) * ct) / c2t
+                Fs = MASS * (acc[0] * ct + (acc[1] + GRAVITY) * st) / c2t
 
                 # Torque from side impulse at Box2D application point
                 torque_arm = (2 * SIDE_AWAY * st * ct
@@ -612,31 +615,41 @@ def _add_obstacle_constraints(kto, prog, obstacles, n_samples):
 # Trajectory sampling
 # ─────────────────────────────────────────────────────────────────────────
 
-def _sample(traj, n=300, n_constraint_pts=8):
-    """Sample the solved trajectory, computing thrusts via inverse dynamics.
+def _sample(traj, n_constraint_pts=8):
+    """Sample the solved trajectory at DT intervals, computing thrusts via
+    continuous inverse dynamics (consistent with solver constraints).
 
-    Returns (times, plan_dict, constraint_xy, knot_xy, control_xy) where:
-    - constraint_xy: (n_constraint_pts, 2) positions at dynamics sample points
-    - knot_xy: (n_knots, 2) positions at unique B-spline knot times
-    - control_xy: (n_cp, 2) B-spline control point positions
+    Returns (times, plan_dict, constraint_xy, knot_xy, control_xy) where
+    times has n_steps+1 entries, plan position/velocity fields have n_steps+1
+    entries, and force/acceleration fields have n_steps entries.
     """
-    times = np.linspace(traj.start_time(), traj.end_time(), n)
-    S = {k: np.empty(n) for k in
-         ("x", "y", "theta", "vx", "vy", "omega", "Fm", "Fs",
-          "ax", "ay", "alpha")}
+    t0, t1 = traj.start_time(), traj.end_time()
+    duration = t1 - t0
+    n_steps = int(duration / ll.DT)
 
+    # Sample n_steps+1 positions, velocities, and accelerations from B-spline
+    times = t0 + np.arange(n_steps + 1) * ll.DT
+    Q = np.empty((n_steps + 1, 3))    # positions [x, y, theta]
+    Qd = np.empty((n_steps + 1, 3))   # analytical velocities
+    Qdd = np.empty((n_steps + 1, 3))  # analytical accelerations
     for i, t in enumerate(times):
-        q   = traj.value(t).flatten()
-        qd  = traj.EvalDerivative(t, 1).flatten()
-        qdd = traj.EvalDerivative(t, 2).flatten()
+        Q[i] = traj.value(t).flatten()
+        Qd[i] = traj.EvalDerivative(t, 1).flatten()
+        Qdd[i] = traj.EvalDerivative(t, 2).flatten()
 
-        S["x"][i], S["y"][i], S["theta"][i] = q
-        S["vx"][i], S["vy"][i], S["omega"][i] = qd
-        S["ax"][i], S["ay"][i], S["alpha"][i] = qdd
+    # Inverse dynamics from continuous B-spline accelerations
+    S = {}
+    S["x"], S["y"], S["theta"] = Q[:, 0], Q[:, 1], Q[:, 2]
+    S["vx"], S["vy"], S["omega"] = Qd[:, 0], Qd[:, 1], Qd[:, 2]
+    S["ax"], S["ay"], S["alpha"] = Qdd[:n_steps, 0], Qdd[:n_steps, 1], Qdd[:n_steps, 2]
 
-        ct, st = np.cos(q[2]), np.sin(q[2])
-        S["Fm"][i] = MASS * (-qdd[0] * st + (qdd[1] + GRAVITY) * ct)
-        S["Fs"][i] = MASS * ( qdd[0] * ct - (qdd[1] + GRAVITY) * st)
+    S["Fm"] = np.empty(n_steps)
+    S["Fs"] = np.empty(n_steps)
+    for n in range(n_steps):
+        ct, st = np.cos(Q[n, 2]), np.sin(Q[n, 2])
+        c2t = ct * ct - st * st  # cos(2θ)
+        S["Fm"][n] = MASS * (Qdd[n, 0] * st + (Qdd[n, 1] + GRAVITY) * ct) / c2t
+        S["Fs"][n] = MASS * (Qdd[n, 0] * ct + (Qdd[n, 1] + GRAVITY) * st) / c2t
 
     t0, t1 = traj.start_time(), traj.end_time()
 
@@ -698,8 +711,8 @@ def track(plan_times, plan, gains=None, dt=None):
     """Track a planned trajectory using cascaded PD feedback control.
 
     Simulates through lander_step at the Box2D timestep.  At each step,
-    interpolates the reference trajectory and computes corrective thrust
-    commands via feedforward + PD feedback.
+    indexes the DT-aligned reference trajectory and computes corrective
+    thrust commands via feedforward + PD feedback.
 
     Controller architecture (cascaded):
 
@@ -742,8 +755,7 @@ def track(plan_times, plan, gains=None, dt=None):
         dt = ll.DT
 
     p = plan
-    t_end = plan_times[-1]
-    n_steps = int(t_end / dt)
+    n_steps = len(p["Fm"])  # force arrays have n_steps entries
 
     # Initial state from plan [x, y, theta, vx, vy, omega]
     state = [p["x"][0], p["y"][0], p["theta"][0],
@@ -758,16 +770,17 @@ def track(plan_times, plan, gains=None, dt=None):
         t = step * dt
         x, y, theta, vx, vy, omega = state
 
-        # ── Interpolate reference ───────────────────────────────────
-        x_ref = float(np.interp(t, plan_times, p["x"]))
-        y_ref = float(np.interp(t, plan_times, p["y"]))
-        th_ref = float(np.interp(t, plan_times, p["theta"]))
-        vx_ref = float(np.interp(t, plan_times, p["vx"]))
-        vy_ref = float(np.interp(t, plan_times, p["vy"]))
-        om_ref = float(np.interp(t, plan_times, p["omega"]))
-        ax_ref = float(np.interp(t, plan_times, p["ax"]))
-        ay_ref = float(np.interp(t, plan_times, p["ay"]))
-        al_ref = float(np.interp(t, plan_times, p["alpha"]))
+        # ── Reference from DT-aligned plan (direct index) ──────────
+        i = step
+        x_ref = float(p["x"][i])
+        y_ref = float(p["y"][i])
+        th_ref = float(p["theta"][i])
+        vx_ref = float(p["vx"][i])
+        vy_ref = float(p["vy"][i])
+        om_ref = float(p["omega"][i])
+        ax_ref = float(p["ax"][i])
+        ay_ref = float(p["ay"][i])
+        al_ref = float(p["alpha"][i])
 
         Fm, Fs = _tracking_step(
             x, y, theta, vx, vy, omega,
