@@ -61,6 +61,9 @@ SIDE_ARM_A = ll.SIDE_ARM_A
 SIDE_ARM_B = ll.SIDE_ARM_B
 SIDE_AWAY  = ll.SIDE_AWAY_SCALED
 
+# Leg spring angular damping coefficient
+LEG_DAMPING = ll.LEG_SPRING_DAMPING          # ~4.75
+
 # ── Default boundary conditions ──────────────────────────────────────────
 START = np.array([PAD_X + 4.0, H - 0.5, 0.0])
 GOAL = np.array([PAD_X, PAD_Y, 0.0])
@@ -184,6 +187,7 @@ def _sample_xy(traj, n=300):
 
 def solve(start=None, goal=None, obstacles=(),
           terrain=None,
+          goal_velocity=None,
           on_progress=None, max_iters=None,
           time_budget=0.25, warmstart_budget=0.10,
           strategy=None):
@@ -198,6 +202,8 @@ def solve(start=None, goal=None, obstacles=(),
     terrain : (txs, tys) tuple or None
         Terrain x/y arrays for ground-avoidance constraints.
         If None, only the global y-lower-bound is enforced.
+    goal_velocity : array-like (3,), optional
+        [vx, vy, omega] at the goal.  Defaults to [0, 0, 0].
     on_progress : callable(phase_str, frac) or None
         Called at milestones so callers can update a UI.
     max_iters : int or None
@@ -223,6 +229,8 @@ def solve(start=None, goal=None, obstacles=(),
     """
     start = np.asarray(start if start is not None else START, dtype=float)
     goal = np.asarray(goal if goal is not None else GOAL, dtype=float)
+    goal_vel = np.asarray(goal_velocity if goal_velocity is not None
+                          else [0.0, 0.0, 0.0], dtype=float)
 
     if strategy is None:
         strat = STRATEGIES["default"]
@@ -263,10 +271,11 @@ def solve(start=None, goal=None, obstacles=(),
         else:
             kto.AddPathPositionConstraint(goal, goal, 1.0)
 
-        # Velocity: always zero at endpoints
+        # Velocity: zero at start, goal_vel at end
         z = np.zeros((3, 1))
         kto.AddPathVelocityConstraint(z, z, 0.0)
-        kto.AddPathVelocityConstraint(z, z, 1.0)
+        gv = goal_vel.reshape(3, 1)
+        kto.AddPathVelocityConstraint(gv, gv, 1.0)
 
         kto.AddPositionBounds(
             np.array([0.0, PAD_Y - 1.0, -np.pi / 3]),
@@ -432,7 +441,7 @@ def _validate_torque_model():
 
     for theta in test_thetas:
         state = [10.0, 10.0, theta, 0.0, 0.0, 0.0]
-        # Main engine should produce zero angular acceleration
+        # Main engine should produce zero angular acceleration (omega=0)
         ax_m, ay_m, alpha_m = ll.lander_acceleration(state, THRUST_MAX * 0.9, 0.0)
         assert abs(alpha_m) < 1e-6, (
             f"Main engine torque non-zero at θ={theta}: {alpha_m}")
@@ -449,14 +458,22 @@ def _validate_torque_model():
                 f"Torque mismatch at θ={theta}, Fs={Fs:.2f}: "
                 f"physics={alpha_phys}, formula={alpha_formula}")
 
+        # Validate damping term with nonzero omega
+        for omega in [-1.0, 0.5, 1.5]:
+            state_w = [10.0, 10.0, theta, 0.0, 0.0, omega]
+            _, _, alpha_w = ll.lander_acceleration(state_w, 0.0, 0.0)
+            alpha_expected = -LEG_DAMPING * omega
+            assert abs(alpha_w - alpha_expected) < 1e-6, (
+                f"Damping mismatch at θ={theta}, ω={omega}: "
+                f"physics={alpha_w}, expected={alpha_expected}")
+
 _validate_torque_model()
 
 
 def _add_dynamics_constraints(kto, prog, n_samples):
     """Constrain implied thrusts to be within physical limits at each sample.
 
-    Uses the lunar_lander.py torque model, validated at import time by
-    _validate_torque_model().
+    Uses the pendulum model validated at import time by _validate_torque_model().
 
     Force directions (world frame, NOT orthogonal):
       Main: Fm · (-sinθ,  cosθ)
@@ -465,6 +482,9 @@ def _add_dynamics_constraints(kto, prog, n_samples):
     Inverse dynamics solves the 2×2 system (Cramer's rule, det = -cos2θ):
       Fm = m·(x''·sinθ + (y''+g)·cosθ) / cos(2θ)
       Fs = m·(x''·cosθ + (y''+g)·sinθ) / cos(2θ)
+
+    Angular dynamics include leg spring damping:
+      α = Fs·torque_arm/I - LEG_DAMPING·ω
 
     Outputs per sample:  [Fm, Fs, torque_error]
     Bounds:              [0, THRUST_MAX] x [-SIDE_MAX, SIDE_MAX] x {0}
@@ -481,13 +501,15 @@ def _add_dynamics_constraints(kto, prog, n_samples):
 
     for s in np.linspace(0, 1, n_samples):
         w_pos = _basis_weights(basis, s, deriv=0)
+        w_vel = _basis_weights(basis, s, deriv=1)
         w_acc = _basis_weights(basis, s, deriv=2)
 
-        def _make(w_pos, w_acc):
+        def _make(w_pos, w_vel, w_acc):
             def constraint(v):
                 P = v[:-1].reshape(3, n_cp)
                 dur = v[-1]
                 pos = P @ w_pos
+                vel = P @ w_vel / dur
                 acc = P @ w_acc / dur ** 2
 
                 ct, st = np.cos(pos[2]), np.sin(pos[2])
@@ -496,14 +518,16 @@ def _add_dynamics_constraints(kto, prog, n_samples):
                 Fs = MASS * (acc[0] * ct + (acc[1] + GRAVITY) * st) / c2t
 
                 # Torque from side impulse at Box2D application point
+                # plus leg spring damping
+                omega = vel[2]
                 torque_arm = (2 * SIDE_AWAY * st * ct
                               + SIDE_ARM_A * st * st
                               - SIDE_ARM_B * ct * ct)
-                torque_err = acc[2] - Fs * torque_arm / INERTIA
+                torque_err = acc[2] - Fs * torque_arm / INERTIA + LEG_DAMPING * omega
                 return np.array([Fm, Fs, torque_err])
             return constraint
 
-        prog.AddConstraint(_make(w_pos, w_acc), lb, ub, all_vars)
+        prog.AddConstraint(_make(w_pos, w_vel, w_acc), lb, ub, all_vars)
 
 
 def _smooth_terrain_height(x_val, txs, tys):
@@ -835,12 +859,13 @@ def _tracking_step(x, y, theta, vx, vy, omega,
     theta_target = 0.4 * theta_cmd + 0.6 * th_ref
 
     # ── Inner loop: attitude PD → side thrust via torque ────────
+    # α = Fs·torque_arm/I - c·ω  →  Fs = (α_des + c·ω)·I / torque_arm
     alpha_des = al_ref + gains.Kp_att * (theta_target - theta) + gains.Kd_att * (om_ref - omega)
     torque_arm = (2 * SIDE_AWAY * st * ct
                   + SIDE_ARM_A * st * st
                   - SIDE_ARM_B * ct * ct)
     if abs(torque_arm) > 1e-6:
-        Fs = alpha_des * INERTIA / torque_arm
+        Fs = (alpha_des + LEG_DAMPING * omega) * INERTIA / torque_arm
     else:
         Fs = 0.0
 

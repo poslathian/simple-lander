@@ -14,12 +14,24 @@
 - **Reward**: -dt per step. Crash/timeout -> total = -10s. Landing -> total ~ -elapsed_time
 - **Observation**: 9-dim `[x, y, vx, vy, angle, angular_vel, leg1, leg2, sim_t]`
 
-### Flight physics tweaks
+### Flight physics — leg spring damping
 
-- Leg joint motors **disabled during flight** — no torque on lander from legs
-- Leg density set to **0.001 during flight** — effectively massless, no drag on lander
-- Both restored on ground contact for landing shock absorption
-- This makes the lander behave as a clean single rigid body in flight
+- Leg joint motors **always enabled** (matching Gymnasium LunarLander-v3)
+- Legs kept at **full density** (1.0) throughout flight and landing
+- Joint motors (LEG_SPRING_TORQUE=40, motorSpeed=±0.3) + joint constraints
+  act as a linear angular damper on the lander body:
+  **α_spring ≈ -4.75 · ω** (R² = 0.9998)
+- This provides natural rotational stability, making keyboard control feel
+  like v3 and improving PD tracking controller performance
+- The damping is modelled as `LEG_SPRING_DAMPING = 4.75` in the surrogate
+- **Pendulum coupling insight**: the motor/joint coupling also absorbs ~93%
+  of side-thrust angular torque (effective G_side ≈ 0.037 vs bare 0.415,
+  with sign reversal). However, the bare torque_arm/I model is kept for
+  the solver/controller because:
+  (a) the PD tracking controller compensates for the mismatch
+  (b) the bare model produces well-scaled Fs values for translation
+  (c) the pendulum model makes attitude nearly uncontrollable by Fs,
+      requiring a fundamentally different control architecture
 
 ### Surrogate functions (in `lunar_lander.py`)
 
@@ -27,6 +39,10 @@
 - `lander_acceleration(state, Fm, Fs)` — just the `[ax, ay, alpha]` accelerations
 - `lander_step(state, Fm, Fs)` — one semi-implicit Euler step matching Box2D
 - All use `LANDER_BODY_MASS = 4.817` (not system mass 4.959)
+- Angular dynamics: `alpha = Fs * torque_arm / I - LEG_SPRING_DAMPING * omega`
+- **Known model mismatch**: the Fs·torque_arm/I term overpredicts the angular
+  effect of side thrust by ~15x (motors absorb most torque). The damping
+  term is the dominant and accurate component.
 
 ## Solver (`solver.py`)
 
@@ -34,7 +50,7 @@
 
 - Plans in `[x, y, theta]` space with cubic B-splines (15 control points)
 - Dynamics constraints at ~65 sample points verify thrust feasibility via inverse dynamics
-- Torque model **validated at import time** against `lander_acceleration()`
+- Torque model includes leg spring damping and is **validated at import time**
 - Two-phase solve: warm-start (no obstacles) -> obstacle phase
 - Default time budget: 5s total, 1s warm-start
 
@@ -43,6 +59,7 @@
 - `MASS = 4.817` (lander body), `INERTIA = 0.833`, `GRAVITY = 10.0`
 - `THRUST_MAX ~ 86.7 N` (main), `SIDE_MAX ~ 30.0 N` (side)
 - `SIDE_FORCE_MAX = 75.0 N` (action scaling for side engine)
+- `LEG_DAMPING = 4.75` (angular damping from leg joints + motors)
 
 ### Tracking controller (`track()` + `_tracking_step()`)
 
@@ -50,7 +67,7 @@ Cascaded PD feedback: outer loop (position) -> inner loop (attitude).
 
 - Gains: `Kp_pos=4, Kd_pos=4, Kp_att=50, Kd_att=10`
 - Blends commanded theta (from acceleration vector) with plan theta: 40/60 split
-- Achieves **0.09x** the tracking error of open-loop replay
+- Inner loop accounts for damping: `Fs = (α_des + c·ω) · I / torque_arm`
 
 ## KTOController (in `lunar_lander.py`)
 
@@ -72,7 +89,7 @@ python lunar_lander.py --keyboard             # manual control
 python lunar_lander.py --speedup 2.0          # 2x playback
 ```
 
-## Test suite (`tests.py` — 19 tests)
+## Test suite (`tests.py` — 24 tests)
 
 | Test class | Count | What it checks |
 |---|---|---|
@@ -82,4 +99,5 @@ python lunar_lander.py --speedup 2.0          # 2x playback
 | `TestKTOTracking` | 2 | Drift correlates with lateral demand, PD tracking vs direct impulse |
 | `TestThrustTriangles` | 2 | Rendering indicators |
 | `TestInitialState` | 2 | Spawn x uniform across display, y gaussian near top |
-| `TestKTOLanding` | 1 | 10 episodes, >=3 land, faster than realtime |
+| `TestKTOLanding` | 1 | 10 episodes, >=6 land, faster than realtime |
+| `TestLegSpringCharacterization` | 6 | Motor torque characterization, damping fits, total damping profile |

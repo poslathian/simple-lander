@@ -53,6 +53,17 @@ LANDER_BODY_MASS = 4.816667   # lander body only (impulses act on this mass)
 LANDER_INERTIA_CM = 0.833315
 LANDER_CM_LOCAL = (0.0, 0.101307)
 
+# Leg spring damping: empirically fitted from Box2D motor + joint behaviour.
+# With motors always enabled and full-mass legs, the joint motors + joint
+# constraints act as a linear angular damper on the lander body:
+#   alpha_spring ≈ -LEG_SPRING_DAMPING * omega   (R² ≈ 0.9998)
+#
+# The motor/joint coupling also reduces the effective angular gain from
+# side thrust (~15x weaker than bare model, with sign reversal), but for
+# the KTO solver we keep the bare torque_arm/I model since the PD tracking
+# controller compensates for the mismatch and the damping dominates.
+LEG_SPRING_DAMPING = 4.75      # rad/s² per rad/s (angular damping)
+
 # Derived torque-arm constants for the side engine (Box2D impulse application point)
 SIDE_ARM_A = 17.0 / SCALE - LANDER_CM_LOCAL[1]       # ≈ 0.465
 SIDE_ARM_B = SIDE_ENGINE_HEIGHT / SCALE - LANDER_CM_LOCAL[1]  # ≈ 0.365
@@ -71,8 +82,8 @@ def lander_dynamics(state, Fm, Fs):
         Main engine force (body up):   Fm * (-sin θ,  cos θ)
         Side engine force (body right): Fs * ( cos θ, -sin θ)
 
-        Torque from side engine at Box2D application point:
-            τ = Fs * (2*A*sinθ*cosθ + A_A*sin²θ - A_B*cos²θ) / I
+        Torque from side engine + leg spring damping:
+            α = Fs · torque_arm / I  -  LEG_SPRING_DAMPING · ω
     """
     x, y, theta, vx, vy, omega = state
     ct = math.cos(theta)
@@ -88,7 +99,7 @@ def lander_dynamics(state, Fm, Fs):
     torque_arm = (2 * SIDE_AWAY_SCALED * st * ct
                   + SIDE_ARM_A * st**2
                   - SIDE_ARM_B * ct**2)
-    alpha = Fs * torque_arm / I
+    alpha = Fs * torque_arm / I - LEG_SPRING_DAMPING * omega
 
     return [vx, vy, omega, ax, ay, alpha]
 
@@ -113,7 +124,7 @@ def lander_acceleration(state, Fm, Fs):
     torque_arm = (2 * SIDE_AWAY_SCALED * st * ct
                   + SIDE_ARM_A * st**2
                   - SIDE_ARM_B * ct**2)
-    alpha = Fs * torque_arm / I
+    alpha = Fs * torque_arm / I - LEG_SPRING_DAMPING * omega
 
     return ax, ay, alpha
 
@@ -348,7 +359,6 @@ class LunarLander(gym.Env, EzPickle):
                 rjd.lowerAngle = -0.9
                 rjd.upperAngle = -0.9 + 0.5
             leg.joint = self.world.CreateJoint(rjd)
-            leg.joint.motorEnabled = False  # disabled in flight, enabled on contact
             self.legs.append(leg)
 
         self._create_obstacles()
@@ -494,17 +504,8 @@ class LunarLander(gym.Env, EzPickle):
         self.world.Step(1.0 / FPS, 6, 2)
         self.world.ClearForces()
 
-        # During flight: disable leg motors and make legs nearly massless so they
-        # don't torque or drag the lander.  On ground contact: restore full mass
-        # and motor for shock absorption / stability.
-        any_contact = self.legs[0].ground_contact or self.legs[1].ground_contact
-        for leg in self.legs:
-            leg.joint.motorEnabled = any_contact
-            target_density = 1.0 if any_contact else 0.001
-            f = leg.fixtures[0]
-            if abs(f.density - target_density) > 0.01:
-                f.density = target_density
-                leg.ResetMassData()
+        # Leg joint motors stay enabled always (full-mass legs) — they provide
+        # passive angular damping modelled as LEG_SPRING_DAMPING in the surrogate.
 
         self.elapsed_s += DT
         state = self._build_obs()
@@ -738,9 +739,10 @@ class KTOController:
 
         pos = uw.lander.position
         start = np.array([pos.x, pos.y, uw.lander.angle])
-        # Target above the pad — heuristic handles final descent
-        goal_y = uw.helipad_y + LEG_DOWN / SCALE + 2.0
+        # Target close to the pad — heuristic handles final touchdown
+        goal_y = uw.helipad_y + LEG_DOWN / SCALE + 1.0
         goal = np.array([solver.PAD_X, goal_y, 0.0])
+        goal_vel = np.array([0.0, -0.5, 0.0])  # small downward velocity
 
         obstacle_tuples = []
         for obs_body, r in zip(uw.obstacles, getattr(uw, "obstacle_radii", [])):
@@ -748,6 +750,7 @@ class KTOController:
 
         times, plan, constraint_xy, warm_xy, knot_xy, control_xy, *_ = solver.solve(
             start=start, goal=goal,
+            goal_velocity=goal_vel,
             obstacles=tuple(obstacle_tuples),
             time_budget=time_budget,
             warmstart_budget=warmstart_budget,
