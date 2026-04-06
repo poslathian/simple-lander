@@ -45,4 +45,4 @@ class GuidanceController:
 
 def _has_active_keys(keyboard_action):
     """Check if the keyboard action differs from idle state [-1, 0]."""
-    return not (keyboard_action[0] == -1.0 and keyboard_action[1] == 0.0)
+    return not (keyboard_action[0] == 0.0 and keyboard_action[1] == 0.0)

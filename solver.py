@@ -277,8 +277,8 @@ def solve(start=None, goal=None, obstacles=(),
             np.array([W,   H + 1.0,      np.pi / 3]),
         )
         kto.AddVelocityBounds(
-            np.array([-5.0, -10.0, -3.0]),
-            np.array([ 5.0,   1.0,  3.0]),
+            np.array([-20.0, -20.0, -3.0]),
+            np.array([ 20.0,   1.0,  3.0]),
         )
         a_max = THRUST_MAX / MASS + GRAVITY
         alpha_max = SIDE_MAX * max(SIDE_ARM_A, SIDE_ARM_B) / INERTIA

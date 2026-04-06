@@ -454,6 +454,7 @@ class LunarLander(gym.Env, EzPickle):
         side = (-tip[1], tip[0])
 
         # Main engine — linear over [-1, 1]: action=-1 → off, action=1 → full
+        self._action_v = float(action[0]) if self.continuous else 0.0
         if self.continuous:
             self.m_power = float(np.clip((action[0] + 1.0) / 2.0, 0.0, 1.0))
         else:
@@ -519,8 +520,8 @@ class LunarLander(gym.Env, EzPickle):
         landed = (
             not self.game_over
             and both_legs
-            and speed < 0.5
-            and abs(self.lander.angularVelocity) < 0.3
+            and speed < 0.75
+            and abs(self.lander.angularVelocity) < 0.45
         )
         crashed = self.game_over or abs(state[0]) >= 1.0
         timed_out = self.elapsed_s >= TIMEOUT
@@ -649,9 +650,10 @@ class LunarLander(gym.Env, EzPickle):
         tri = [rot(-5, -14), rot(5, -14), rot(0, -14 - sz)]
         pygame.draw.polygon(surf, color, tri)
 
-        # Down indicator (above lander, never active)
+        # Down indicator (above lander, active when thrust suppressed)
+        color = ACTIVE if self.m_power < 0.05 and hasattr(self, '_action_v') and self._action_v < -0.5 else DIM
         tri = [rot(-5, 20), rot(5, 20), rot(0, 30)]
-        pygame.draw.polygon(surf, DIM, tri)
+        pygame.draw.polygon(surf, color, tri)
 
         # Left indicator
         active_left = self.s_power > 0.05 and self.s_dir < 0
@@ -738,8 +740,8 @@ class KTOController:
 
         pos = uw.lander.position
         start = np.array([pos.x, pos.y, uw.lander.angle])
-        # Target above the pad — heuristic handles final descent
-        goal_y = uw.helipad_y + LEG_DOWN / SCALE + 1.0
+        # Target the pad exactly (leg-height offset so feet touch surface)
+        goal_y = uw.helipad_y + LEG_DOWN / SCALE
         goal = np.array([solver.PAD_X, goal_y, 0.0])
 
         obstacle_tuples = []
@@ -751,7 +753,7 @@ class KTOController:
             obstacles=tuple(obstacle_tuples),
             time_budget=time_budget,
             warmstart_budget=warmstart_budget,
-            goal_velocity=np.array([0.0, -0.5, 0.0]),
+            goal_velocity=np.array([0.0, -0.1, 0.0]),
         )
 
         self.plan_times = times
@@ -870,7 +872,12 @@ if __name__ == "__main__":
             if event.type == pygame.KEYDOWN and event.key in (pygame.K_q, pygame.K_ESCAPE):
                 _kb["quit"] = True
         keys = pygame.key.get_pressed()
-        main = 1.0 if (keys[pygame.K_UP] or keys[pygame.K_w]) else -1.0
+        if keys[pygame.K_UP] or keys[pygame.K_w]:
+            main = 1.0
+        elif keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            main = -1.0
+        else:
+            main = 0.0
         side = 0.0
         if keys[pygame.K_LEFT] or keys[pygame.K_a]:
             side = -1.0
@@ -878,7 +885,7 @@ if __name__ == "__main__":
             side = 1.0
         _kb["action"] = np.array([main, side], dtype=np.float32)
 
-    if args.keyboard:
+    if args.keyboard or args.diffusion:
         print("KEYBOARD MODE: Up/W=thrust, Left-Right/A-D=rotate, Q/Esc=quit")
 
     if args.save_frames:
@@ -912,7 +919,11 @@ if __name__ == "__main__":
 
         while not done:
             if guidance_ctrl is not None:
-                kb_act = _kb["action"] if args.keyboard else None
+                poll_keyboard()
+                if _kb["quit"]:
+                    env.close()
+                    exit()
+                kb_act = _kb["action"]
                 at = guidance_ctrl.step(env, obs, keyboard_action=kb_act)
                 state = LanderState(
                     t_sim_lander=float(obs[8]),
@@ -968,6 +979,21 @@ if __name__ == "__main__":
         )
         status = "LANDED" if landed else "CRASHED/TIMEOUT"
         print(f"Ep {episode}: {status}  steps={steps}  t={uw.elapsed_s:.2f}s  reward={total_reward:.2f}")
+
+        # Show outcome indicator for 0.25s
+        if render_mode == "human":
+            import pygame, time as _time
+            screen = env.unwrapped.screen
+            cx, cy = VIEWPORT_W // 2, VIEWPORT_H // 3
+            r = 40
+            if landed:
+                pygame.draw.circle(screen, (0, 200, 0), (cx, cy), r, 5)
+            else:
+                pygame.draw.line(screen, (220, 0, 0), (cx - r, cy - r), (cx + r, cy + r), 6)
+                pygame.draw.line(screen, (220, 0, 0), (cx - r, cy + r), (cx + r, cy - r), 6)
+            pygame.display.flip()
+            _time.sleep(0.25)
+
         episode += 1
 
     env.close()
