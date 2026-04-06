@@ -49,8 +49,102 @@ VIEWPORT_H = 600
 
 # Derived Box2D constants (lander polygon density=5.0, two legs density=1.0)
 SYSTEM_MASS = 4.958889
+LANDER_BODY_MASS = 4.816667   # lander body only (impulses act on this mass)
 LANDER_INERTIA_CM = 0.833315
 LANDER_CM_LOCAL = (0.0, 0.101307)
+
+# Derived torque-arm constants for the side engine (Box2D impulse application point)
+SIDE_ARM_A = 17.0 / SCALE - LANDER_CM_LOCAL[1]       # ≈ 0.465
+SIDE_ARM_B = SIDE_ENGINE_HEIGHT / SCALE - LANDER_CM_LOCAL[1]  # ≈ 0.365
+SIDE_AWAY_SCALED = SIDE_ENGINE_AWAY / SCALE           # = 0.400
+
+
+def lander_dynamics(state, Fm, Fs):
+    """Continuous-time dynamics of the lander (no collisions).
+
+    State: [x, y, theta, vx, vy, omega]
+    Controls: Fm (main thrust, >= 0), Fs (side thrust, signed)
+
+    Returns: [dx/dt, dy/dt, dtheta/dt, dvx/dt, dvy/dt, domega/dt]
+
+    Physics model (2D rigid-body rocket):
+        Main engine force (body up):   Fm * (-sin θ,  cos θ)
+        Side engine force (body right): Fs * ( cos θ, -sin θ)
+
+        Torque from side engine at Box2D application point:
+            τ = Fs * (2*A*sinθ*cosθ + A_A*sin²θ - A_B*cos²θ) / I
+    """
+    x, y, theta, vx, vy, omega = state
+    ct = math.cos(theta)
+    st = math.sin(theta)
+
+    m = LANDER_BODY_MASS
+    g = abs(GRAVITY)
+    I = LANDER_INERTIA_CM
+
+    ax = (-Fm * st + Fs * ct) / m
+    ay = (Fm * ct - Fs * st) / m - g
+
+    torque_arm = (2 * SIDE_AWAY_SCALED * st * ct
+                  + SIDE_ARM_A * st**2
+                  - SIDE_ARM_B * ct**2)
+    alpha = Fs * torque_arm / I
+
+    return [vx, vy, omega, ax, ay, alpha]
+
+
+def lander_acceleration(state, Fm, Fs):
+    """Compute accelerations [ax, ay, alpha] from state and thrust.
+
+    Same physics as lander_dynamics but returns only the acceleration vector,
+    suitable for both continuous integration and discrete stepping.
+    """
+    x, y, theta, vx, vy, omega = state
+    ct = math.cos(theta)
+    st = math.sin(theta)
+
+    m = LANDER_BODY_MASS
+    g = abs(GRAVITY)
+    I = LANDER_INERTIA_CM
+
+    ax = (-Fm * st + Fs * ct) / m
+    ay = (Fm * ct - Fs * st) / m - g
+
+    torque_arm = (2 * SIDE_AWAY_SCALED * st * ct
+                  + SIDE_ARM_A * st**2
+                  - SIDE_ARM_B * ct**2)
+    alpha = Fs * torque_arm / I
+
+    return ax, ay, alpha
+
+
+def lander_step(state, Fm, Fs, dt=DT):
+    """One semi-implicit Euler step matching Box2D's integrator.
+
+    State: [x, y, theta, vx, vy, omega]
+    Returns: new state after dt.
+
+    Box2D integration order:
+      1. Compute acceleration from forces
+      2. v_new = v + a * dt           (velocity update)
+      3. x_new = x + v_new * dt       (position update with NEW velocity)
+
+    This gives x_new = x + v*dt + a*dt², which is O(dt) more position change
+    per step than exact integration (x + v*dt + 0.5*a*dt²).  Over many steps
+    the difference compounds — this function matches Box2D exactly.
+    """
+    x, y, theta, vx, vy, omega = state
+    ax, ay, alpha = lander_acceleration(state, Fm, Fs)
+
+    vx_new = vx + ax * dt
+    vy_new = vy + ay * dt
+    omega_new = omega + alpha * dt
+
+    x_new = x + vx_new * dt
+    y_new = y + vy_new * dt
+    theta_new = theta + omega_new * dt
+
+    return [x_new, y_new, theta_new, vx_new, vy_new, omega_new]
 
 
 class ContactDetector(contactListener):
@@ -255,6 +349,7 @@ class LunarLander(gym.Env, EzPickle):
                 rjd.lowerAngle = -0.9
                 rjd.upperAngle = -0.9 + 0.5
             leg.joint = self.world.CreateJoint(rjd)
+            leg.joint.motorEnabled = False  # disabled in flight, enabled on contact
             self.legs.append(leg)
 
         self._create_obstacles()
@@ -399,6 +494,18 @@ class LunarLander(gym.Env, EzPickle):
         # Physics step
         self.world.Step(1.0 / FPS, 6, 2)
         self.world.ClearForces()
+
+        # During flight: disable leg motors and make legs nearly massless so they
+        # don't torque or drag the lander.  On ground contact: restore full mass
+        # and motor for shock absorption / stability.
+        any_contact = self.legs[0].ground_contact or self.legs[1].ground_contact
+        for leg in self.legs:
+            leg.joint.motorEnabled = any_contact
+            target_density = 1.0 if any_contact else 0.001
+            f = leg.fixtures[0]
+            if abs(f.density - target_density) > 0.01:
+                f.density = target_density
+                leg.ResetMassData()
 
         self.elapsed_s += DT
         state = self._build_obs()
@@ -610,13 +717,15 @@ def heuristic(env, s):
 
 
 # ---------------------------------------------------------------------------
-# KTO open-loop controller
+# KTO tracking controller
 # ---------------------------------------------------------------------------
 
 class KTOController:
-    """KTO trajectory controller: solver plan + heuristic settle.
+    """KTO trajectory controller: PD tracking + heuristic settle.
 
-    Phase 1: Replay the KTO thrust plan (targets 2m above pad, zero end velocity).
+    Phase 1: Track the KTO plan with cascaded PD feedback control.
+              Outer loop corrects position/velocity → desired acceleration.
+              Inner loop corrects attitude → side thrust.
     Phase 2: Heuristic PD controller for final descent and landing.
     """
 
@@ -645,13 +754,19 @@ class KTOController:
             warmstart_budget=warmstart_budget,
         )
 
+        self.plan_times = times
+        self.plan = plan
+        self.gains = solver.DEFAULT_GAINS
+
         duration = times[-1] - times[0]
-        n_steps = int(duration / DT)
-        sim_times = np.linspace(times[0], times[-1], n_steps)
-        self.Fm = np.interp(sim_times, times, plan["Fm"])
-        self.Fs = np.interp(sim_times, times, plan["Fs"])
-        self.n_steps = n_steps
+        self.n_steps = int(duration / DT)
         self.idx = 0
+
+        # Pre-interpolate plan positions for rendering/tests
+        sim_times = np.linspace(times[0], times[-1], self.n_steps)
+        self.plan_x = np.interp(sim_times, times, plan["x"])
+        self.plan_y = np.interp(sim_times, times, plan["y"])
+        self.plan_theta = np.interp(sim_times, times, plan["theta"])
 
         # Store trajectory for rendering: spline path (x,y) and knot points
         self.path_xy = np.column_stack([plan["x"], plan["y"]])
@@ -662,19 +777,42 @@ class KTOController:
         uw._kto_knot_xy = self.knot_xy
 
     def step(self, env):
-        """Convert planned thrusts to actions for env.step()."""
+        """PD tracking controller: compute corrective actions from plan."""
+        import solver
+
         if self.idx < self.n_steps:
-            Fm = float(self.Fm[self.idx])
-            Fs = float(self.Fs[self.idx])
+            t = self.idx * DT
             self.idx += 1
 
-            # Main: m_power = (action[0]+1)/2, force = m_power * THRUST_MAX
-            THRUST_MAX = MAIN_ENGINE_POWER * MAIN_ENGINE_Y_LOCATION / (SCALE * DT)
-            a_main = np.clip(2.0 * Fm / THRUST_MAX - 1.0, -1.0, 1.0)
+            # Read actual state from Box2D
+            uw = env.unwrapped
+            L = uw.lander
+            x, y = L.position.x, L.position.y
+            theta = L.angle
+            vx, vy = L.linearVelocity.x, L.linearVelocity.y
+            omega = L.angularVelocity
 
-            # Side: force = action[1] * SIDE_ENGINE_POWER / DT
-            SIDE_FORCE_MAX = SIDE_ENGINE_POWER / DT
-            a_side = np.clip(Fs / SIDE_FORCE_MAX, -1.0, 1.0)
+            # Interpolate reference
+            p = self.plan
+            pt = self.plan_times
+            x_ref = float(np.interp(t, pt, p["x"]))
+            y_ref = float(np.interp(t, pt, p["y"]))
+            th_ref = float(np.interp(t, pt, p["theta"]))
+            vx_ref = float(np.interp(t, pt, p["vx"]))
+            vy_ref = float(np.interp(t, pt, p["vy"]))
+            om_ref = float(np.interp(t, pt, p["omega"]))
+            ax_ref = float(np.interp(t, pt, p["ax"]))
+            ay_ref = float(np.interp(t, pt, p["ay"]))
+            al_ref = float(np.interp(t, pt, p["alpha"]))
+
+            Fm, Fs = solver._tracking_step(
+                x, y, theta, vx, vy, omega,
+                x_ref, y_ref, th_ref, vx_ref, vy_ref, om_ref,
+                ax_ref, ay_ref, al_ref, self.gains)
+
+            # Convert to actions
+            a_main = float(np.clip(2.0 * Fm / solver.THRUST_MAX - 1.0, -1.0, 1.0))
+            a_side = float(np.clip(Fs / solver.SIDE_FORCE_MAX, -1.0, 1.0))
 
             return np.array([a_main, a_side], dtype=np.float32)
         else:

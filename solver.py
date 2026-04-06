@@ -44,9 +44,9 @@ H = VIEWPORT_H / SCALE  # 20.0  world units
 PAD_X = W / 2            # 15.0
 PAD_Y = H / 4            # 5.0
 
-# ── 2D rocket physics (derived from Box2D-matched physics.py) ───────────
+# ── 2D rocket physics (imported from lunar_lander surrogate) ───────────
 GRAVITY = abs(ll.GRAVITY)                    # 10.0
-MASS = ll.SYSTEM_MASS                        # ~4.959 (lander + legs)
+MASS = ll.LANDER_BODY_MASS                   # ~4.817 (lander body only; legs massless in flight)
 INERTIA = ll.LANDER_INERTIA_CM              # ~0.833
 
 # Max continuous force = peak impulse / dt
@@ -55,13 +55,10 @@ THRUST_MAX = (ll.MAIN_ENGINE_POWER
 SIDE_MAX   = (ll.SIDE_ENGINE_POWER
               * ll.SIDE_ENGINE_AWAY / (ll.SCALE * ll.DT))
 
-# Side-engine torque arm components (from Box2D impulse application point).
-# The application point offset from COM has three geometric terms whose
-# cross product with the force direction (cosθ, -sinθ) yields:
-#   τ = Fs · (2·A_AWAY·sinθ·cosθ + ARM_A·sin²θ - ARM_B·cos²θ) / I
-SIDE_ARM_A = 17.0 / ll.SCALE - ll.LANDER_CM_LOCAL[1]       # ≈ 0.465
-SIDE_ARM_B = ll.SIDE_ENGINE_HEIGHT / ll.SCALE - ll.LANDER_CM_LOCAL[1]  # ≈ 0.365
-SIDE_AWAY  = ll.SIDE_ENGINE_AWAY / ll.SCALE                 # = 0.400
+# Re-export torque arm constants from the canonical source in lunar_lander
+SIDE_ARM_A = ll.SIDE_ARM_A
+SIDE_ARM_B = ll.SIDE_ARM_B
+SIDE_AWAY  = ll.SIDE_AWAY_SCALED
 
 # ── Default boundary conditions ──────────────────────────────────────────
 START = np.array([PAD_X + 4.0, H - 0.5, 0.0])
@@ -422,8 +419,43 @@ def _add_goal_cost(kto, prog, goal, weight):
         prog.AddQuadraticCost(Q, b, c, row_vars)
 
 
+def _validate_torque_model():
+    """Verify the analytical torque formula matches lander_acceleration().
+
+    Called at import time.  If the impulse geometry in lunar_lander.py changes,
+    this will raise AssertionError, forcing the solver's dynamics model to be
+    updated to match.
+    """
+    test_thetas = [0.0, 0.3, -0.5, np.pi / 4, -np.pi / 6]
+    test_sides = [-0.8, -0.3, 0.3, 0.7]
+
+    for theta in test_thetas:
+        state = [10.0, 10.0, theta, 0.0, 0.0, 0.0]
+        # Main engine should produce zero angular acceleration
+        ax_m, ay_m, alpha_m = ll.lander_acceleration(state, THRUST_MAX * 0.9, 0.0)
+        assert abs(alpha_m) < 1e-6, (
+            f"Main engine torque non-zero at θ={theta}: {alpha_m}")
+
+        ct, st = np.cos(theta), np.sin(theta)
+        torque_arm = (2 * SIDE_AWAY * st * ct
+                      + SIDE_ARM_A * st * st
+                      - SIDE_ARM_B * ct * ct)
+        for s_frac in test_sides:
+            Fs = SIDE_MAX * s_frac
+            _, _, alpha_phys = ll.lander_acceleration(state, 0.0, Fs)
+            alpha_formula = Fs * torque_arm / INERTIA
+            assert abs(alpha_phys - alpha_formula) < 1e-6, (
+                f"Torque mismatch at θ={theta}, Fs={Fs:.2f}: "
+                f"physics={alpha_phys}, formula={alpha_formula}")
+
+_validate_torque_model()
+
+
 def _add_dynamics_constraints(kto, prog, n_samples):
     """Constrain implied thrusts to be within physical limits at each sample.
+
+    Uses the lunar_lander.py torque model, validated at import time by
+    _validate_torque_model().
 
     Force directions (world frame):
       Main: Fm · (-sinθ,  cosθ)   — body up
@@ -634,6 +666,174 @@ def _sample(traj, n=300, n_constraint_pts=8):
     return times, S, cpts, knot_xy, control_xy, control_points_3d, duration
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Feedback tracking controller
+# ─────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TrackingGains:
+    """PD gains for the cascaded tracking controller.
+
+    Outer loop (position → desired acceleration):
+        ax_des = ax_ff + Kp_pos*(x_ref - x) + Kd_pos*(vx_ref - vx)
+        ay_des = ay_ff + Kp_pos*(y_ref - y) + Kd_pos*(vy_ref - vy)
+
+    Inner loop (attitude → side thrust via torque):
+        alpha_des = alpha_ff + Kp_att*(theta_cmd - theta) + Kd_att*(omega_ref - omega)
+        Fs = alpha_des * I / torque_arm
+    """
+    Kp_pos: float = 4.0     # position proportional
+    Kd_pos: float = 4.0     # velocity derivative
+    Kp_att: float = 50.0    # attitude proportional
+    Kd_att: float = 10.0    # attitude derivative
+
+
+DEFAULT_GAINS = TrackingGains()
+
+# Side engine force → action scale (not SIDE_MAX; this is the raw impulse/dt)
+SIDE_FORCE_MAX = ll.SIDE_ENGINE_POWER / ll.DT
+
+
+def track(plan_times, plan, gains=None, dt=None):
+    """Track a planned trajectory using cascaded PD feedback control.
+
+    Simulates through lander_step at the Box2D timestep.  At each step,
+    interpolates the reference trajectory and computes corrective thrust
+    commands via feedforward + PD feedback.
+
+    Controller architecture (cascaded):
+
+    1. **Outer loop** — position/velocity PD computes desired world-frame
+       accelerations (ax_des, ay_des).
+
+    2. **Thrust computation** — inverse dynamics maps desired accelerations
+       at the *current* theta to main engine thrust Fm.
+
+    3. **Attitude command** — desired theta is computed from the desired
+       acceleration vector: theta_cmd = atan2(-ax_des, ay_des + g).
+       Blended with the plan's theta_ref to avoid overcorrection.
+
+    4. **Inner loop** — attitude PD computes desired angular acceleration,
+       which maps to side thrust Fs via the torque equation.
+
+    Parameters
+    ----------
+    plan_times : (n,) ndarray
+        Sample times from the planner.
+    plan : dict
+        Plan arrays with keys: x, y, theta, vx, vy, omega,
+        ax, ay, alpha, Fm, Fs.
+    gains : TrackingGains, optional
+    dt : float, optional
+        Simulation timestep.  Defaults to ll.DT (0.02 s).
+
+    Returns
+    -------
+    history : dict
+        Tracked trajectory with keys:
+        - t, x, y, theta, vx, vy, omega : actual state
+        - x_ref, y_ref, theta_ref       : reference state
+        - Fm_cmd, Fs_cmd                : commanded thrusts
+        - main_action, side_action      : clipped actions sent to physics
+    """
+    if gains is None:
+        gains = DEFAULT_GAINS
+    if dt is None:
+        dt = ll.DT
+
+    p = plan
+    t_end = plan_times[-1]
+    n_steps = int(t_end / dt)
+
+    # Initial state from plan [x, y, theta, vx, vy, omega]
+    state = [p["x"][0], p["y"][0], p["theta"][0],
+             p["vx"][0], p["vy"][0], p["omega"][0]]
+
+    keys = ("t", "x", "y", "theta", "vx", "vy", "omega",
+            "x_ref", "y_ref", "theta_ref",
+            "Fm_cmd", "Fs_cmd", "main_action", "side_action")
+    H = {k: np.empty(n_steps) for k in keys}
+
+    for step in range(n_steps):
+        t = step * dt
+        x, y, theta, vx, vy, omega = state
+
+        # ── Interpolate reference ───────────────────────────────────
+        x_ref = float(np.interp(t, plan_times, p["x"]))
+        y_ref = float(np.interp(t, plan_times, p["y"]))
+        th_ref = float(np.interp(t, plan_times, p["theta"]))
+        vx_ref = float(np.interp(t, plan_times, p["vx"]))
+        vy_ref = float(np.interp(t, plan_times, p["vy"]))
+        om_ref = float(np.interp(t, plan_times, p["omega"]))
+        ax_ref = float(np.interp(t, plan_times, p["ax"]))
+        ay_ref = float(np.interp(t, plan_times, p["ay"]))
+        al_ref = float(np.interp(t, plan_times, p["alpha"]))
+
+        Fm, Fs = _tracking_step(
+            x, y, theta, vx, vy, omega,
+            x_ref, y_ref, th_ref, vx_ref, vy_ref, om_ref,
+            ax_ref, ay_ref, al_ref, gains)
+
+        # ── Convert to actions and clip ─────────────────────────────
+        main_action = float(np.clip(2.0 * Fm / THRUST_MAX - 1.0, -1.0, 1.0))
+        side_action = float(np.clip(Fs / SIDE_FORCE_MAX, -1.0, 1.0))
+
+        # ── Record ──────────────────────────────────────────────────
+        H["t"][step] = t
+        H["x"][step], H["y"][step], H["theta"][step] = x, y, theta
+        H["vx"][step], H["vy"][step], H["omega"][step] = vx, vy, omega
+        H["x_ref"][step], H["y_ref"][step], H["theta_ref"][step] = x_ref, y_ref, th_ref
+        H["Fm_cmd"][step], H["Fs_cmd"][step] = Fm, Fs
+        H["main_action"][step] = main_action
+        H["side_action"][step] = side_action
+
+        # ── Step physics ────────────────────────────────────────────
+        state = ll.lander_step(state, Fm, Fs, dt)
+
+    return H
+
+
+def _tracking_step(x, y, theta, vx, vy, omega,
+                   x_ref, y_ref, th_ref, vx_ref, vy_ref, om_ref,
+                   ax_ref, ay_ref, al_ref, gains):
+    """One step of the cascaded PD tracking controller.
+
+    Returns (Fm, Fs) in force units (not actions).
+    """
+    import math
+    ct = math.cos(theta)
+    st = math.sin(theta)
+
+    # ── Outer loop: position/velocity PD → desired acceleration ─
+    ax_des = ax_ref + gains.Kp_pos * (x_ref - x) + gains.Kd_pos * (vx_ref - vx)
+    ay_des = ay_ref + gains.Kp_pos * (y_ref - y) + gains.Kd_pos * (vy_ref - vy)
+
+    # ── Main engine thrust (inverse dynamics at current theta) ──
+    Fm = MASS * (-ax_des * st + (ay_des + GRAVITY) * ct)
+
+    # ── Attitude command from desired acceleration vector ───────
+    # theta_cmd points the rocket so main thrust aligns with (ax_des, ay_des+g)
+    thrust_y = ay_des + GRAVITY
+    thrust_x = ax_des
+    theta_cmd = math.atan2(-thrust_x, thrust_y)
+
+    # Blend plan theta with commanded theta (avoid oversteering
+    # when position errors are small)
+    theta_target = 0.4 * theta_cmd + 0.6 * th_ref
+
+    # ── Inner loop: attitude PD → side thrust via torque ────────
+    alpha_des = al_ref + gains.Kp_att * (theta_target - theta) + gains.Kd_att * (om_ref - omega)
+    torque_arm = (2 * SIDE_AWAY * st * ct
+                  + SIDE_ARM_A * st * st
+                  - SIDE_ARM_B * ct * ct)
+    if abs(torque_arm) > 1e-6:
+        Fs = alpha_des * INERTIA / torque_arm
+    else:
+        Fs = 0.0
+
+    return Fm, Fs
+
+
 if __name__ == "__main__":
     times, s, *_ = solve()
     print(f"Duration     : {times[-1]:.2f} s")
@@ -641,3 +841,13 @@ if __name__ == "__main__":
     print(f"Final vel    : ({s['vx'][-1]:.3f}, {s['vy'][-1]:.3f})")
     print(f"Thrust  Fm   : [{s['Fm'].min():.2f}, {s['Fm'].max():.2f}]")
     print(f"Thrust  Fs   : [{s['Fs'].min():.2f}, {s['Fs'].max():.2f}]")
+
+    print("\n── Feedback tracking ──")
+    H = track(times, s)
+    pos_err = np.hypot(H["x"] - H["x_ref"], H["y"] - H["y_ref"])
+    th_err = np.abs(H["theta"] - H["theta_ref"])
+    print(f"Position RMS : {np.sqrt(np.mean(pos_err**2)):.4f} m")
+    print(f"Position max : {pos_err.max():.4f} m")
+    print(f"Theta RMS    : {np.degrees(np.sqrt(np.mean(th_err**2))):.2f} deg")
+    print(f"Final pos    : ({H['x'][-1]:.3f}, {H['y'][-1]:.3f})")
+    print(f"Final vel    : ({H['vx'][-1]:.3f}, {H['vy'][-1]:.3f})")
