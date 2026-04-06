@@ -135,6 +135,7 @@ STRATEGIES = {
         goal_cost_weight=0.0,
         energy_cost=1.0,
         duration_cost=5.0,
+        num_control_points=15,
     ),
     "region_goal": Strategy(
         name="region_goal",
@@ -283,7 +284,7 @@ def solve(start=None, goal=None, obstacles=(),
             np.array([-a_max, -a_max, -alpha_max]),
             np.array([ a_max,  a_max,  alpha_max]),
         )
-        kto.AddDurationConstraint(1.5, 3.5)
+        kto.AddDurationConstraint(1.5, 5.0)
 
         # Costs
         if strat.duration_cost > 0:

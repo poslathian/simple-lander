@@ -191,7 +191,8 @@ class LunarLander(gym.Env, EzPickle):
         self.moon.color2 = (0, 0, 0)
 
         # Lander — small gaussian around center-top, no impulse
-        initial_x = float(np.clip(W / 2 + self.np_random.normal(0, 1.0), 1.0, W - 1.0))
+        pad_cx = W / 2
+        initial_x = float(self.np_random.uniform(pad_cx - W * 0.125, pad_cx + W * 0.125))
         initial_y = float(np.clip(H * 0.85 + self.np_random.normal(0, 0.3), H * 0.6, H - 0.5))
 
         self.lander = self.world.CreateDynamicBody(
@@ -358,14 +359,11 @@ class LunarLander(gym.Env, EzPickle):
         tip = (math.sin(self.lander.angle), math.cos(self.lander.angle))
         side = (-tip[1], tip[0])
 
-        # Main engine
-        self.m_power = 0.0
+        # Main engine — linear over [-1, 1]: action=-1 → off, action=1 → full
         if self.continuous:
-            if action[0] > 0.0:
-                self.m_power = (np.clip(action[0], 0.0, 1.0) + 1.0) * 0.5
+            self.m_power = float(np.clip((action[0] + 1.0) / 2.0, 0.0, 1.0))
         else:
-            if action == 2:
-                self.m_power = 1.0
+            self.m_power = 1.0 if action == 2 else 0.0
 
         if self.m_power > 0.0:
             ox = tip[0] * MAIN_ENGINE_Y_LOCATION / SCALE
@@ -375,17 +373,17 @@ class LunarLander(gym.Env, EzPickle):
             fy = float(-oy * MAIN_ENGINE_POWER * self.m_power)
             self.lander.ApplyLinearImpulse((fx, fy), impulse_pos, True)
 
-        # Side engines
-        self.s_power = 0.0
-        self.s_dir = 0.0
+        # Side engines — linear over [-1, 1]: sign = direction, magnitude = power
         if self.continuous:
-            if np.abs(action[1]) > 0.5:
-                self.s_dir = float(np.sign(action[1]))
-                self.s_power = float(np.clip(np.abs(action[1]), 0.5, 1.0))
+            self.s_dir = float(np.sign(action[1])) if abs(float(action[1])) > 1e-6 else 0.0
+            self.s_power = float(np.clip(np.abs(action[1]), 0.0, 1.0))
         else:
             if action in [1, 3]:
                 self.s_dir = float(action - 2)
                 self.s_power = 1.0
+            else:
+                self.s_dir = 0.0
+                self.s_power = 0.0
 
         if self.s_power > 0.0:
             ox = side[0] * SIDE_ENGINE_AWAY / SCALE
@@ -482,6 +480,21 @@ class LunarLander(gym.Env, EzPickle):
                 self.surf, (204, 204, 0),
                 [(x, flagy2), (x, flagy2 - 10), (x + 25, flagy2 - 5)],
             )
+
+        # KTO planned trajectory (spline + knots)
+        if hasattr(self, '_kto_path_xy') and self._kto_path_xy is not None:
+            path = self._kto_path_xy
+            knots = self._kto_knot_xy
+            # Draw spline as a line (cyan)
+            if len(path) > 1:
+                pts = [(float(p[0] * SCALE), float(p[1] * SCALE)) for p in path]
+                pygame.draw.aalines(self.surf, (0, 200, 200), False, pts)
+            # Draw knot points as dots (magenta)
+            for kx, ky in knots:
+                sx, sy = int(kx * SCALE), int(ky * SCALE)
+                if 0 <= sx < VIEWPORT_W and 0 <= sy < VIEWPORT_H:
+                    gfxdraw.aacircle(self.surf, sx, sy, 3, (255, 0, 255))
+                    gfxdraw.filled_circle(self.surf, sx, sy, 3, (255, 0, 255))
 
         # Thrust triangles (4 indicators: up, down, left, right)
         if self.lander is not None:
@@ -619,7 +632,7 @@ class KTOController:
         for obs_body, r in zip(uw.obstacles, getattr(uw, "obstacle_radii", [])):
             obstacle_tuples.append((obs_body.position.x, obs_body.position.y, r))
 
-        times, plan, *_ = solver.solve(
+        times, plan, constraint_xy, warm_xy, knot_xy, control_xy, *_ = solver.solve(
             start=start, goal=goal,
             obstacles=tuple(obstacle_tuples),
             time_budget=time_budget,
@@ -634,50 +647,32 @@ class KTOController:
         self.n_steps = n_steps
         self.idx = 0
 
+        # Store trajectory for rendering: spline path (x,y) and knot points
+        self.path_xy = np.column_stack([plan["x"], plan["y"]])
+        self.knot_xy = knot_xy
+
+        # Attach to env so render() can draw it
+        uw._kto_path_xy = self.path_xy
+        uw._kto_knot_xy = self.knot_xy
+
     def step(self, env):
-        """Apply this frame's thrust and return a no-op action for env.step()."""
+        """Convert planned thrusts to actions for env.step()."""
         if self.idx < self.n_steps:
             Fm = float(self.Fm[self.idx])
             Fs = float(self.Fs[self.idx])
             self.idx += 1
 
-            uw = env.unwrapped
-            lander = uw.lander
-            theta = lander.angle
-            ct, st = math.cos(theta), math.sin(theta)
+            # Main: m_power = (action[0]+1)/2, force = m_power * THRUST_MAX
+            THRUST_MAX = MAIN_ENGINE_POWER * MAIN_ENGINE_Y_LOCATION / (SCALE * DT)
+            a_main = np.clip(2.0 * Fm / THRUST_MAX - 1.0, -1.0, 1.0)
 
-            # Main engine impulse at the engine application point
-            if Fm > 0:
-                ox = st * MAIN_ENGINE_Y_LOCATION / SCALE
-                oy = -ct * MAIN_ENGINE_Y_LOCATION / SCALE
-                impulse_pos = (lander.position[0] + ox, lander.position[1] + oy)
-                lander.ApplyLinearImpulse(
-                    (Fm * DT * (-st), Fm * DT * ct), impulse_pos, True)
-                uw.m_power = min(1.0, Fm / (MAIN_ENGINE_POWER * MAIN_ENGINE_Y_LOCATION / (SCALE * DT)))
-            else:
-                uw.m_power = 0.0
+            # Side: force = action[1] * SIDE_ENGINE_POWER / DT
+            SIDE_FORCE_MAX = SIDE_ENGINE_POWER / DT
+            a_side = np.clip(Fs / SIDE_FORCE_MAX, -1.0, 1.0)
 
-            # Side engine impulse at the engine application point
-            if abs(Fs) > 1e-6:
-                side_x, side_y = -ct, st
-                ox = side_x * SIDE_ENGINE_AWAY / SCALE
-                oy = -side_y * SIDE_ENGINE_AWAY / SCALE
-                impulse_pos = (
-                    lander.position[0] + ox - st * 17 / SCALE,
-                    lander.position[1] + oy + ct * SIDE_ENGINE_HEIGHT / SCALE,
-                )
-                lander.ApplyLinearImpulse(
-                    (Fs * DT * ct, Fs * DT * (-st)), impulse_pos, True)
-                uw.s_power = min(1.0, abs(Fs) / (SIDE_ENGINE_POWER / DT))
-                uw.s_dir = 1.0 if Fs > 0 else -1.0
-            else:
-                uw.s_power = 0.0
-                uw.s_dir = 0.0
+            return np.array([a_main, a_side], dtype=np.float32)
         else:
-            # Plan exhausted — fall back to heuristic for final settle
             return heuristic(env, env.unwrapped._build_obs())
-
-        return np.array([0.0, 0.0], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
