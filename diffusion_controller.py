@@ -319,8 +319,8 @@ def DiffusionController(
     """Run diffusion model inference and return a ThrustSpline.
 
     Builds the 131-dim conditioning vector from ICD inputs, runs DDIM
-    sampling with classifier-free guidance, and converts the 20-dim
-    output (10 B-spline CPs × 2) into a callable spline.
+    sampling with classifier-free guidance, and converts the 30-dim
+    output (15 B-spline CPs × 2) into a callable spline.
     """
     # If no waypoint goals provided, default to landing pad
     if not waypoint_goals:
@@ -329,7 +329,7 @@ def DiffusionController(
             lander_state.q[0], lander_state.q[1]
         )
         # Waypoint: pad center, relative to lander
-        pad_rel_x = PAD_CX - lander_wx
+        pad_rel_x = PAD_CX - lander_wx  # pad position in lander-relative world coords
         pad_rel_y = PAD_Y - lander_wy
         remaining_t = timeout - lander_state.t_sim_lander
         waypoint_goals = [
@@ -383,7 +383,7 @@ def DiffusionController(
         guidance_scale=2.0,
         device="cpu",
         norm_stats=norm_stats,
-        action_horizon=action_horizon,
+        action_horizon=action_horizon,  # only used by _project_action_boxes (unused)
     )
 
     # Denormalize control points
@@ -394,6 +394,10 @@ def DiffusionController(
     # Build spline from model output: (30,) flat → (15, 2) control points
     n_cps = X_DIM // 2
     cps = np.column_stack([x_raw[:n_cps], x_raw[n_cps:]])
+
+    # Pin first CP to current thrust so spline(0) == observed thrust
+    cps[0, 0] = float(lander_state.thrust[0])
+    cps[0, 1] = float(lander_state.thrust[1])
     spline = _ThrustSplineImpl.from_control_points(cps, t_start=0.0, t_end=action_horizon)
 
     # Capture guidance actions for post-inference clamping

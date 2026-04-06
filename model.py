@@ -1,7 +1,7 @@
 """DiffusionMLP with CosineSchedule, DDIMSampler, and CFG for thrust B-spline planning.
 
 Adapted from lunar-remote's diffusion/thrust/model.py.
-x_dim=20 (10 B-spline CPs x 2), cond_dim=131, action_horizon is an input (not predicted).
+x_dim=30 (15 B-spline CPs x 2), cond_dim=131, action_horizon is an input (not predicted).
 """
 
 from __future__ import annotations
