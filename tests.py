@@ -176,20 +176,18 @@ class TestPhysicsDivergence:
         times, plan, *_ = solver.solve(
             start=start, goal=goal, obstacles=(),
             time_budget=5.0, warmstart_budget=1.0)
-        duration = times[-1] - times[0]
-        n_sim = int(duration / DT)
-        sim_t = np.linspace(times[0], times[-1], n_sim)
-        Fm_i = np.interp(sim_t, times, plan["Fm"])
-        Fs_i = np.interp(sim_t, times, plan["Fs"])
-        x_p = np.interp(sim_t, times, plan["x"])
-        y_p = np.interp(sim_t, times, plan["y"])
+        # Forces are already at DT intervals from discrete inverse dynamics
+        n_sim = len(plan["Fm"])
         pos_errors = []
         for i in range(n_sim):
-            _apply_thrust_impulse(env, float(np.clip(Fm_i[i], 0, solver.THRUST_MAX)),
-                                  float(np.clip(Fs_i[i], -solver.SIDE_MAX, solver.SIDE_MAX)))
+            _apply_thrust_impulse(env, float(np.clip(plan["Fm"][i], 0, solver.THRUST_MAX)),
+                                  float(np.clip(plan["Fs"][i], -solver.SIDE_MAX, solver.SIDE_MAX)))
             _step_box2d_no_action(env)
             box2d = _world_state(env)
-            pos_errors.append(math.hypot(box2d["x"] - x_p[i], box2d["y"] - y_p[i]))
+            # plan positions have n_steps+1 entries; compare after step i with position i+1
+            pos_errors.append(math.hypot(box2d["x"] - plan["x"][i + 1],
+                                         box2d["y"] - plan["y"][i + 1]))
+        duration = times[-1] - times[0]
         print(f"\nSolver plan replay ({n_sim} steps, {duration:.2f}s): "
               f"max={max(pos_errors):.4f}  mean={np.mean(pos_errors):.4f}")
         env.close()
