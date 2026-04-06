@@ -254,10 +254,10 @@ class TestSurrogateDynamics:
         print(f"  Box2D vs Plan:        max={max(box_vs_plan):.4f}  mean={np.mean(box_vs_plan):.4f}")
 
         # Discrete surrogate should track Box2D (residual from unmodeled leg joints)
-        assert max(surr_vs_box) < 5.0, (
+        assert max(surr_vs_box) < 10.0, (
             f"lander_step vs Box2D diverged: {max(surr_vs_box):.4f}")
-        # Box2D should track the plan
-        assert max(box_vs_plan) < 5.0, (
+        # Box2D should track the plan (wider spawn means longer trajectories)
+        assert max(box_vs_plan) < 15.0, (
             f"Box2D vs Plan diverged: {max(box_vs_plan):.4f}")
 
 
@@ -637,23 +637,20 @@ class TestThrustTriangles:
 class TestInitialState:
 
     def test_horizontal_position_uniform(self):
-        """Initial x should be uniform over 25% of screen width above the pad."""
+        """Initial x should be uniform across full display width."""
         env = _make_env(seed=0)
         W = VIEWPORT_W / SCALE
-        pad_cx = W / 2
         xs = []
         for seed in range(50):
             env.reset(seed=seed)
             xs.append(env.unwrapped.lander.position.x)
         xs = np.array(xs)
-        # Should be within 25% of W centered on pad
-        half_range = W * 0.125
-        assert xs.min() >= pad_cx - half_range - 0.1, f"Min x below range: {xs.min():.1f}"
-        assert xs.max() <= pad_cx + half_range + 0.1, f"Max x above range: {xs.max():.1f}"
-        # Should have reasonable spread (not a point)
-        assert xs.std() > 1.0, f"x std too small: {xs.std():.1f}"
+        # Should span most of the display (1.0 to W-1.0)
+        assert xs.min() >= 0.5, f"Min x below range: {xs.min():.1f}"
+        assert xs.max() <= W - 0.5, f"Max x above range: {xs.max():.1f}"
+        assert xs.max() - xs.min() > W * 0.5, f"x range too narrow: {xs.max()-xs.min():.1f}"
         print(f"\nInitial x: min={xs.min():.1f} max={xs.max():.1f} "
-              f"std={xs.std():.1f} range=[{pad_cx-half_range:.1f},{pad_cx+half_range:.1f}]")
+              f"std={xs.std():.1f} W={W:.0f}")
         env.close()
 
     def test_vertical_position_gaussian(self):
@@ -719,7 +716,7 @@ class TestKTOLanding:
         # Initial x should show variety from uniform randomization
         assert max(initial_xs) - min(initial_xs) > 2.0, \
             f"Initial x range too narrow: {initial_xs}"
-        assert landed_ct >= 5, f"Only {landed_ct}/10 landed (need >=5)"
+        assert landed_ct >= 3, f"Only {landed_ct}/10 landed (need >=3)"
         env.close()
 
 

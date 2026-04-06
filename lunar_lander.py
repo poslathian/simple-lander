@@ -284,9 +284,8 @@ class LunarLander(gym.Env, EzPickle):
         self.moon.color1 = (0, 0, 0)
         self.moon.color2 = (0, 0, 0)
 
-        # Lander — small gaussian around center-top, no impulse
-        pad_cx = W / 2
-        initial_x = float(self.np_random.uniform(pad_cx - W * 0.125, pad_cx + W * 0.125))
+        # Lander — uniform across full display width, near top
+        initial_x = float(self.np_random.uniform(1.0, W - 1.0))
         initial_y = float(np.clip(H * 0.85 + self.np_random.normal(0, 0.3), H * 0.6, H - 0.5))
 
         self.lander = self.world.CreateDynamicBody(
