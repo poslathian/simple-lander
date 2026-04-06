@@ -513,7 +513,7 @@ class LunarLander(gym.Env, EzPickle):
         ca, sa = math.cos(a), math.sin(a)
 
         def rot(dx, dy):
-            return (lx + dx * ca - dy * sa, ly + dx * sa + dy * ca)
+            return (float(lx + dx * ca - dy * sa), float(ly + dx * sa + dy * ca))
 
         ACTIVE = (255, 140, 0)
         DIM = (60, 60, 60)
