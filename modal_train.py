@@ -30,7 +30,7 @@ image = (
 
 @app.function(
     image=image,
-    gpu="T4",
+    gpu="A10G",
     timeout=7200,
 )
 def train_remote(
