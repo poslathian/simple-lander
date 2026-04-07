@@ -851,6 +851,10 @@ if __name__ == "__main__":
                         help="Min landed episodes for --collect")
     parser.add_argument("--target-total", type=int, default=100,
                         help="Total episodes to store for --collect")
+    parser.add_argument("--margin-center", type=float, default=0.2,
+                        help="Center of guidance margin distribution for --collect")
+    parser.add_argument("--margin-sigma", type=float, default=0.1,
+                        help="Std dev of guidance margin distribution for --collect")
     args = parser.parse_args()
 
     if args.collect:
@@ -937,7 +941,7 @@ if __name__ == "__main__":
             uw.lander.angularVelocity = 0.0
 
             # Per-episode guidance margin: N(0.2, 0.1) clamped [0.01, 1.0]
-            margin = float(np.clip(rng.normal(0.2, 0.1), 0.01, 1.0))
+            margin = float(np.clip(rng.normal(args.margin_center, args.margin_sigma), 0.01, 1.0))
 
             # Create KTO controller
             kto_ctrl = KTOController(env, time_budget=5.0)
