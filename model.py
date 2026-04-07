@@ -1,47 +1,29 @@
-"""DiffusionMLP with CosineSchedule, DDIMSampler, and CFG for thrust B-spline planning.
+"""DiffusionMLP for position B-spline planning.
 
-Adapted from lunar-remote's diffusion/thrust/model.py.
-x_dim=30 (15 B-spline CPs x 2), cond_dim=131, action_horizon is an input (not predicted).
+x_dim=30 (10 CPs x 3: x, y, theta), cond_dim=21 (20 state + 1 CFG).
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+# ── Conditioning vector layout ────────────────────────────────────────────
+STATE_DIM = 20
+CFG_DIM = 1
+COND_DIM = STATE_DIM + CFG_DIM  # 21
+X_DIM = 30  # 10 CPs x 3
+N_CPS = 10
+N_CHANNELS = 3
 
-# ---------------------------------------------------------------------------
-# World constants (from _private/lunar_lander.py)
-# ---------------------------------------------------------------------------
-W = 30.0
-H = 20.0
-PAD_CX = 15.0
-PAD_Y = 5.0
-OBS_RADIUS = 0.75
-DT = 0.02
-OBS_X_NORM_OFFSET = 15.0
-OBS_X_NORM_SCALE = 15.0
-OBS_Y_NORM_OFFSET = 5.6
-OBS_Y_NORM_SCALE = 10.0
-
-# Conditioning vector layout
-STATE_DIM = 119
-CFG_DIM = 12
-COND_DIM = STATE_DIM + CFG_DIM  # 131
-X_DIM = 30  # 15 CPs x 2
-
-# CFG conditioning indices (last 12 dims of cond vector)
 CFG_START = STATE_DIM
 CFG_END = COND_DIM
 
 
-# ---------------------------------------------------------------------------
-# Model components
-# ---------------------------------------------------------------------------
+# ── Model components ─────────────────────────────────────────────────────
 
 class SinusoidalEmbedding(nn.Module):
     def __init__(self, dim: int = 64):
@@ -71,16 +53,13 @@ class ResidualBlock(nn.Module):
 
 
 class DiffusionMLP(nn.Module):
-    """MLP denoiser for thrust B-spline diffusion.
-
-    Predicts noise epsilon given noisy x, conditioning, and timestep.
-    """
+    """MLP denoiser for position B-spline diffusion."""
 
     def __init__(
         self,
         x_dim: int = X_DIM,
         cond_dim: int = COND_DIM,
-        hidden: int = 512,
+        hidden: int = 256,
         n_blocks: int = 6,
         t_embed_dim: int = 64,
     ):
@@ -104,9 +83,7 @@ class DiffusionMLP(nn.Module):
         return self.output_proj(h)
 
 
-# ---------------------------------------------------------------------------
-# Cosine noise schedule
-# ---------------------------------------------------------------------------
+# ── Cosine noise schedule ────────────────────────────────────────────────
 
 class CosineSchedule:
     def __init__(self, T: int = 100, s: float = 0.008):
@@ -120,14 +97,9 @@ class CosineSchedule:
         return self.alpha_bar[t]
 
 
-# ---------------------------------------------------------------------------
-# DDIM sampler with CFG and guidance-action projection
-# ---------------------------------------------------------------------------
+# ── DDIM sampler with CFG ────────────────────────────────────────────────
 
 class DDIMSampler:
-    """Deterministic DDIM sampler with classifier-free guidance and
-    optional action bounding-box projection."""
-
     def __init__(self, model: DiffusionMLP, schedule: CosineSchedule,
                  n_steps: int = 10, eta: float = 0.0):
         self.model = model
@@ -158,45 +130,17 @@ class DDIMSampler:
         return x
 
     @torch.no_grad()
-    def sample(self, cond: torch.Tensor, device: str = "cpu") -> torch.Tensor:
-        B = cond.shape[0]
-        x_dim = self.model.output_proj.out_features
-        x = torch.randn(B, x_dim, device=device)
-
-        for i in range(len(self.timesteps)):
-            t_cur = self.timesteps[i]
-            t_prev = self.timesteps[i + 1] if i + 1 < len(self.timesteps) else 0
-            t_batch = torch.full((B,), t_cur, device=device, dtype=torch.long)
-            eps_pred = self.model(x, cond, t_batch)
-            x = self._ddim_step(x, eps_pred, t_cur, t_prev, device)
-
-        return x
-
-    @torch.no_grad()
     def sample_cfg(
         self,
         cond: torch.Tensor,
         guidance_scale: float = 2.0,
         device: str = "cpu",
-        action_boxes: torch.Tensor | None = None,
-        action_horizon: float | None = None,
-        norm_stats: dict | None = None,
     ) -> torch.Tensor:
-        """Sample with classifier-free guidance.
-
-        Args:
-            cond: (B, 131) full conditioning vector.
-            guidance_scale: CFG weight w.
-            action_boxes: (B, n_boxes, 6) [thrust_v, thrust_v_margin, thrust_h,
-                          thrust_h_margin, thrust_t, thrust_t_margin] for projection.
-            action_horizon: spline duration (needed for projection).
-            norm_stats: dict with x_mean, x_std for denorm/renorm during projection.
-        """
+        """Sample with classifier-free guidance on the outcome dim."""
         B = cond.shape[0]
         x_dim = self.model.output_proj.out_features
         x = torch.randn(B, x_dim, device=device)
 
-        # Unconditional cond: zero the CFG dims (last 12)
         cond_uncond = cond.clone()
         cond_uncond[:, CFG_START:CFG_END] = 0.0
 
@@ -211,58 +155,4 @@ class DDIMSampler:
 
             x = self._ddim_step(x, eps_pred, t_cur, t_prev, device)
 
-            # Project CPs to satisfy action bounding boxes after each step
-            if action_boxes is not None and norm_stats is not None and action_horizon is not None:
-                x = _project_action_boxes(x, action_boxes, action_horizon, norm_stats, device)
-
         return x
-
-
-def _project_action_boxes(
-    x_norm: torch.Tensor,
-    action_boxes: torch.Tensor,
-    action_horizon: float,
-    norm_stats: dict,
-    device: str,
-) -> torch.Tensor:
-    """Project normalized CPs so the resulting spline satisfies action bounding boxes.
-
-    This is a soft projection: for each box, evaluate the spline at thrust_t,
-    clamp to the box, then adjust the nearest CP.
-    """
-    x_mean = torch.tensor(norm_stats["x_mean"], device=device)
-    x_std = torch.tensor(norm_stats["x_std"], device=device)
-    x_raw = x_norm * x_std + x_mean  # (B, 20)
-
-    B = x_raw.shape[0]
-    n_cps = 15
-
-    for b in range(B):
-        cps_v = x_raw[b, :n_cps].clone()  # vertical CPs
-        cps_h = x_raw[b, n_cps:2*n_cps].clone()  # horizontal CPs
-
-        for box in action_boxes[b]:
-            tv, tv_m, th, th_m, tt, tt_m = box.tolist()
-            if tt_m == 0 and tv_m == 0 and th_m == 0:
-                continue  # masked
-
-            # Find nearest CP index to thrust_t
-            frac = tt / action_horizon if action_horizon > 0 else 0.5
-            cp_idx = int(round(frac * (n_cps - 1)))
-            cp_idx = max(0, min(n_cps - 1, cp_idx))
-
-            # Clamp vertical CP
-            if tv_m > 0:
-                lo_v, hi_v = tv - tv_m, tv + tv_m
-                cps_v[cp_idx] = cps_v[cp_idx].clamp(lo_v, hi_v)
-
-            # Clamp horizontal CP
-            if th_m > 0:
-                lo_h, hi_h = th - th_m, th + th_m
-                cps_h[cp_idx] = cps_h[cp_idx].clamp(lo_h, hi_h)
-
-        x_raw[b, :n_cps] = cps_v
-        x_raw[b, n_cps:2*n_cps] = cps_h
-
-    return (x_raw - x_mean) / x_std
-

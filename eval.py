@@ -1,75 +1,102 @@
-"""Evaluate diffusion model across guidance margin strengths.
+"""Evaluate trained diffusion model across guidance margin strengths.
 
-Runs 100 random seeds as baseline (guidance margin 0.001), then
-10 rollouts each at margins [0.1, 0.2, ..., 1.0] to measure how
-the model performs as guidance loosens.
+Runs KTO baseline first, then sweeps margins [0.001, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0].
+Success = any margin with more landings than 0.001 baseline.
 """
 
-import numpy as np
+import sys
+import time
+
 import gymnasium as gym
+import numpy as np
 import torch
 
 from lunar_lander import LunarLander, KTOController, DT, TIMEOUT
 from diffusion_controller import (
-    DiffusionController, LanderState, ActionTarget, _build_cond,
-    WaypointTarget, WaypointResult, _obs_to_world,
+    KTODiffusionController, NoiseModel, Outcome,
+    N_CPS, N_CHANNELS, COND_DIM, STATE_DIM,
+    _build_cond, ObstacleRelative, WaypointTarget,
 )
-from guidance_controller import GuidanceController, GUIDANCE_MARGIN
-from model import PAD_CX, PAD_Y
+from model import DiffusionMLP, CosineSchedule, DDIMSampler, CFG_START, CFG_END
+import solver
 
 
-def obs_to_lander_state(obs, action=(0.0, 0.0)):
-    return LanderState(
-        t_sim_lander=float(obs[8]),
-        q=(float(obs[0]), float(obs[1]), float(obs[4])),
-        q_prime=(float(obs[2]), float(obs[3]), float(obs[5])),
-        thrust=(float(action[0]), float(action[1])),
-        contacts=(bool(obs[6]), bool(obs[7]), False),
-    )
+# ── Trained model wrapper ─────────────────────────────────────────────────
+
+class TrainedModel:
+    """Wraps trained DiffusionMLP for use with KTODiffusionController."""
+
+    def __init__(self, checkpoint_path: str):
+        checkpoint = torch.load(checkpoint_path, weights_only=False)
+        self.model = DiffusionMLP()
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()
+
+        T = checkpoint.get("T", 100)
+        schedule = CosineSchedule(T=T)
+        self.sampler = DDIMSampler(self.model, schedule, n_steps=10)
+
+        self.x_mean = torch.tensor(checkpoint["x_mean"], dtype=torch.float32)
+        self.x_std = torch.tensor(checkpoint["x_std"], dtype=torch.float32)
+
+    def predict(self, cond, outcome, guidance_scale=2.0):
+        # Build full 21-dim conditioning
+        full_cond = np.zeros(COND_DIM, dtype=np.float32)
+        full_cond[:STATE_DIM] = cond[:STATE_DIM]
+        full_cond[CFG_START] = float(outcome)  # +1 for success
+
+        cond_tensor = torch.tensor(full_cond, dtype=torch.float32).unsqueeze(0)
+        x_norm = self.sampler.sample_cfg(cond_tensor, guidance_scale=guidance_scale)
+
+        # Denormalize
+        x_raw = (x_norm * self.x_std + self.x_mean).squeeze(0).numpy()
+
+        # Reshape to (10, 3)
+        cps = x_raw.reshape(N_CPS, N_CHANNELS)
+        cps[0] = [0.0, 0.0, 0.0]  # Pin first CP to origin
+        return cps
 
 
-def rollout_with_margin(env, seed, margin, model_path=None):
-    """Run one episode with KTO guidance at the given margin.
+# ── Run episode ───────────────────────────────────────────────────────────
 
-    If model_path is provided, loads trained weights. Otherwise uses
-    random weights (the post-inference clamping still applies).
-    """
+def run_episode(env, seed, model, margin, kto_cache=None):
+    """Run one episode with KTODiffusionController."""
     obs, _ = env.reset(seed=seed)
     uw = env.unwrapped
     uw.lander.linearVelocity = (0.0, 0.0)
     uw.lander.angularVelocity = 0.0
 
-    kto_ctrl = KTOController(env, time_budget=5.0)
-    total_reward, done = 0.0, False
-    prev_action = np.array([0.0, 0.0], dtype=np.float32)
+    ctrl = KTODiffusionController(
+        env, model=model, target_frequency=3.0,
+        action_horizon=1.5, outcome=Outcome.SUCCESS,
+    )
+    ctrl.warm_start(time_budget=5.0)
+
+    # Cache KTO plan for reuse across margins
+    if kto_cache is not None and seed not in kto_cache:
+        kto_cache[seed] = {
+            "plan": ctrl._kto.plan,
+            "n_steps": ctrl._kto.n_steps,
+            "t0": ctrl._kto_t0,
+        }
+
+    total_reward = 0.0
+    done = False
+    step_idx = 0
+    last_inference_step = -999
+    steps_per_inference = max(1, int(round(1.0 / (ctrl.target_frequency * DT))))
 
     while not done:
-        action = kto_ctrl.step(env)
+        if step_idx - last_inference_step >= steps_per_inference:
+            ctrl.inference()
+            last_inference_step = step_idx
 
-        at = ActionTarget(
-            thrust_v=float(action[0]), thrust_v_margin=margin,
-            thrust_h=float(action[1]), thrust_h_margin=margin,
-            thrust_t=DT, thrust_t_margin=0.001,
-        )
-        state = obs_to_lander_state(obs, prev_action)
-        spline = DiffusionController(
-            timeout=TIMEOUT,
-            t_obs_cmd_latency=DT,
-            obstacles=[],
-            lander_state=state,
-            waypoint_goals=[],
-            guidance_actions=[at],
-            classifier_free_guidance=[WaypointResult(outcome=1, alpha=1.0)],
-            action_horizon=0.1,
-            target_frequency=50.0,
-        )
-        tv, th = spline(DT)
+        tv, th = ctrl.get_action(guidance_margin=margin)
         action_out = np.array([tv, th], dtype=np.float32)
-
         obs, reward, term, trunc, _ = env.step(action_out)
         total_reward += reward
-        prev_action = action_out
         done = term or trunc
+        step_idx += 1
 
     landed = (
         not uw.game_over
@@ -78,82 +105,97 @@ def rollout_with_margin(env, seed, margin, model_path=None):
     return total_reward, landed
 
 
-def evaluate(model_path=None, n_baseline=100, n_per_margin=10, seed_offset=1000):
-    """Run evaluation across margin strengths."""
-    gym.register(id="LL-eval", entry_point="lunar_lander:LunarLander",
-                 max_episode_steps=1000)
+# ── Main ──────────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True, help="Path to position_model.pt")
+    parser.add_argument("--episodes", type=int, default=50)
+    parser.add_argument("--seed-offset", type=int, default=8000)
+    args = parser.parse_args()
+
+    gym.register(
+        id="LL-eval",
+        entry_point="lunar_lander:LunarLander",
+        max_episode_steps=1000,
+    )
     env = gym.make("LL-eval", render_mode=None, continuous=True)
+    seeds = [args.seed_offset + i for i in range(args.episodes)]
+    kto_cache = {}
 
-    # Load trained model if provided
-    if model_path:
-        from model import DiffusionMLP, CosineSchedule, DDIMSampler, X_DIM
-        from diffusion_controller import _MODEL_CACHE
-        checkpoint = torch.load(model_path, weights_only=False)
-        model = DiffusionMLP()
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
-        schedule = CosineSchedule(T=100)
-        sampler = DDIMSampler(model, schedule, n_steps=10)
-        norm_stats = {
-            "x_mean": checkpoint["x_mean"],
-            "x_std": checkpoint["x_std"],
-        }
-        _MODEL_CACHE["sampler"] = sampler
-        _MODEL_CACHE["norm_stats"] = norm_stats
-        print(f"Loaded model from {model_path}")
+    # Load trained model
+    trained = TrainedModel(args.model)
+    print(f"Loaded model from {args.model}")
 
+    # ── KTO baseline (no diffusion) ──
+    print(f"\nRunning KTO baseline ({args.episodes} episodes)...")
+    kto_lands = 0
+    for seed in seeds:
+        obs, _ = env.reset(seed=seed)
+        uw = env.unwrapped
+        uw.lander.linearVelocity = (0.0, 0.0)
+        uw.lander.angularVelocity = 0.0
+        kto = KTOController(env, time_budget=5.0)
+        done = False
+        while not done:
+            action = kto.step(env)
+            obs, reward, term, trunc, _ = env.step(action)
+            done = term or trunc
+        landed = not uw.game_over and (uw.legs[0].ground_contact or uw.legs[1].ground_contact)
+        kto_lands += landed
+    kto_rate = kto_lands / args.episodes
+    print(f"  KTO baseline: {kto_lands}/{args.episodes} = {kto_rate:.0%}")
+
+    # ── Margin sweep with NoiseModel (0.001 baseline) ──
+    print(f"\nRunning NoiseModel baseline (margin=0.001)...")
+    noise_model = NoiseModel()
+    noise_lands = 0
+    for seed in seeds:
+        _, landed = run_episode(env, seed, noise_model, 0.001, kto_cache)
+        noise_lands += landed
+    noise_rate = noise_lands / args.episodes
+    print(f"  NoiseModel m=0.001: {noise_lands}/{args.episodes} = {noise_rate:.0%}")
+
+    # ── Trained model at various margins ──
+    margins = [0.001, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]
     results = {}
 
-    # Baseline: tight guidance (0.001)
-    print(f"\nBaseline (margin=0.001, {n_baseline} episodes)...")
-    rewards, lands = [], []
-    for i in range(n_baseline):
-        r, landed = rollout_with_margin(env, seed_offset + i, 0.001, model_path)
-        rewards.append(r)
-        lands.append(landed)
-    results["baseline"] = {
-        "margin": 0.001,
-        "n": n_baseline,
-        "land_rate": np.mean(lands),
-        "mean_reward": np.mean(rewards),
-    }
-    print(f"  land_rate={np.mean(lands):.0%}  reward={np.mean(rewards):.2f}")
-
-    # Sweep margins
-    margins = [0.1 * i for i in range(1, 11)]
     for margin in margins:
-        print(f"\nMargin={margin:.1f} ({n_per_margin} episodes)...")
-        rewards, lands = [], []
-        for i in range(n_per_margin):
-            r, landed = rollout_with_margin(env, seed_offset + i, margin, model_path)
-            rewards.append(r)
-            lands.append(landed)
-        results[f"margin_{margin:.1f}"] = {
-            "margin": margin,
-            "n": n_per_margin,
-            "land_rate": np.mean(lands),
-            "mean_reward": np.mean(rewards),
-        }
-        print(f"  land_rate={np.mean(lands):.0%}  reward={np.mean(rewards):.2f}")
+        t0 = time.time()
+        lands = 0
+        for seed in seeds:
+            _, landed = run_episode(env, seed, trained, margin, kto_cache)
+            lands += landed
+        elapsed = time.time() - t0
+        rate = lands / args.episodes
+        results[margin] = {"lands": lands, "rate": rate}
+        print(f"  Trained m={margin:.3f}: {lands}/{args.episodes} = {rate:.0%}  ({elapsed:.1f}s)")
 
     env.close()
 
-    # Summary table
-    print(f"\n{'Margin':>8}  {'N':>4}  {'Land%':>6}  {'Reward':>8}")
-    print("-" * 32)
-    for key, v in results.items():
-        print(f"{v['margin']:8.3f}  {v['n']:4d}  {v['land_rate']:5.0%}  {v['mean_reward']:8.2f}")
+    # ── Summary ──
+    print(f"\n{'='*60}")
+    print(f"{'Margin':>8}  {'Lands':>6}  {'Rate':>6}  {'vs baseline':>12}")
+    print(f"{'='*60}")
+    print(f"{'KTO':>8}  {kto_lands:>6}  {kto_rate:>5.0%}  {'(reference)':>12}")
+    print(f"{'noise':>8}  {noise_lands:>6}  {noise_rate:>5.0%}  {'(m=0.001)':>12}")
+    for margin, r in results.items():
+        delta = r["lands"] - noise_lands
+        sign = "+" if delta >= 0 else ""
+        print(f"{margin:>8.3f}  {r['lands']:>6}  {r['rate']:>5.0%}  {sign}{delta:>11}")
+    print(f"{'='*60}")
 
-    return results
+    # Check success: any margin beats noise baseline
+    best_margin = max(results.keys(), key=lambda m: results[m]["lands"])
+    best = results[best_margin]
+    if best["lands"] > noise_lands:
+        print(f"\nSUCCESS: margin={best_margin} lands {best['lands']} > noise baseline {noise_lands}")
+        return 0
+    else:
+        print(f"\nNo margin beat the noise baseline ({noise_lands} lands)")
+        return 1
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=None, help="Path to trained model.pt")
-    parser.add_argument("--n-baseline", type=int, default=100)
-    parser.add_argument("--n-per-margin", type=int, default=10)
-    parser.add_argument("--seed-offset", type=int, default=1000)
-    args = parser.parse_args()
-
-    evaluate(args.model, args.n_baseline, args.n_per_margin, args.seed_offset)
+    sys.exit(main())
