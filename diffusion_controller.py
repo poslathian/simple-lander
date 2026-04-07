@@ -387,12 +387,20 @@ def DiffusionController(
     sampler, norm_stats = _get_model()
     cond_tensor = torch.tensor(cond, dtype=torch.float32).unsqueeze(0)
 
+    # Build action_boxes (1, n_guidance, 6) for per-step CP projection
+    action_boxes = torch.tensor(
+        [[ga.thrust_v, ga.thrust_v_margin, ga.thrust_h, ga.thrust_h_margin,
+          ga.thrust_t, ga.thrust_t_margin] for ga in guidance_actions],
+        dtype=torch.float32,
+    ).unsqueeze(0)  # (1, n_guidance, 6)
+
     x_norm = sampler.sample_cfg(
         cond_tensor,
         guidance_scale=2.0,
         device="cpu",
         norm_stats=norm_stats,
-        action_horizon=action_horizon,  # only used by _project_action_boxes (unused)
+        action_boxes=action_boxes,
+        action_horizon=action_horizon,
     )
 
     # Denormalize control points
