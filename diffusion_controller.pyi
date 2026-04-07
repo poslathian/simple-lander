@@ -37,11 +37,13 @@ class LanderState(NamedTuple):
     q_now: Position       # current position at t0
     q_prev: Position      # position at t0 - dt (implies velocity)
 
-class PadRelative(NamedTuple):
-    """Landing pad position relative to current observation."""
-    dx: float             # pad.x - q_now.x
-    dy: float             # pad.y - q_now.y
-    r: float              # pad radius
+class ObstacleRelative(NamedTuple):
+    """Nearest collision geometry relative to current observation.
+    Wired to (0, 0, 0) until obstacles are implemented.
+    """
+    dx: float             # obstacle.x - q_now.x
+    dy: float             # obstacle.y - q_now.y
+    r: float              # obstacle radius
 
 class WaypointTarget(NamedTuple):
     """Single waypoint: position and velocity error relative to current obs."""
@@ -149,7 +151,7 @@ def DiffusionController(
     timeout: float,
     t_obs_cmd_latency: float,
     lander_state: LanderState,
-    pad: PadRelative,
+    obstacle: ObstacleRelative,
     waypoint: WaypointTarget,
     guidance: GuidanceAction,
     guidance_margin: float,
@@ -164,7 +166,7 @@ def DiffusionController(
         timeout:             Episode timeout (seconds remaining).
         t_obs_cmd_latency:   Observation-to-command delay.
         lander_state:        q_now + q_prev (two observations for C2 continuity).
-        pad:                 Landing pad relative to current obs.
+        obstacle:            Nearest collision geometry relative to obs (zeros for now).
         waypoint:            Target position/velocity error relative to obs.
         guidance:            Caller's suggested position at next step.
         guidance_margin:     [0, 1] how tightly to follow guidance.

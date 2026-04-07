@@ -41,7 +41,7 @@ ternary outcome. Output switches from thrust CPs to position CPs with PD trackin
 | 0     | 1    | t_obs_cmd_latency | Observation-to-command delay |
 | 1-3   | 3    | q_now (x, y, theta) | Current position at t0, origin of output spline |
 | 4-6   | 3    | q_prev (x, y, theta) | Position at t0 - dt; with q_now implies velocity for C2 continuity |
-| 7-9   | 3    | pad_rel (dx, dy, r) | Landing pad relative to q_now: (pad.x - q.x, pad.y - q.y, pad_radius) |
+| 7-9   | 3    | obstacle (dx, dy, r) | Nearest collision geometry relative to q_now. Wired to (0,0,0) until obstacles are implemented |
 | 10-15 | 6    | waypoint: delta_q (3) + delta_q' (3) | Target position/velocity error relative to current obs |
 | 16-18 | 3    | guidance_q (x, y, theta) | Caller's suggested position at t_obs_cmd_latency |
 | 19    | 1    | action_horizon | Duration of output spline (default 1.5s) |
