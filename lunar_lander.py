@@ -843,9 +843,19 @@ if __name__ == "__main__":
                         help="Run without rendering")
     parser.add_argument("--diffusion", action="store_true",
                         help="Route actions through DiffusionController pipeline")
+    parser.add_argument("--collect", action="store_true",
+                        help="Collect KTO rollouts to DB for training")
+    parser.add_argument("--db", type=str, default="rollouts.db",
+                        help="Database path for --collect")
+    parser.add_argument("--target-landed", type=int, default=80,
+                        help="Min landed episodes for --collect")
+    parser.add_argument("--target-total", type=int, default=100,
+                        help="Total episodes to store for --collect")
     args = parser.parse_args()
 
-    if args.headless:
+    if args.collect:
+        render_mode = None  # collect always headless
+    elif args.headless:
         render_mode = None
     elif args.save_frames:
         render_mode = "rgb_array"
@@ -891,6 +901,240 @@ if __name__ == "__main__":
     if args.save_frames:
         import os
         os.makedirs(args.save_frames, exist_ok=True)
+
+    # ── Collect mode: KTO rollouts → DB ─────────────────────────────────
+    if args.collect:
+        import time as _time
+        from rollout_db import RolloutDB
+        from diffusion_controller import (
+            _build_cond, LanderState, WaypointTarget, ActionTarget,
+            WaypointResult, Obstacle, _obs_to_world,
+        )
+        from model import PAD_CX, PAD_Y
+        from thrust_spline import ThrustSpline, RolloutWindow
+
+        ACTION_HORIZON = 3.0
+        TARGET_FREQ = 5.0
+        CALL_INTERVAL = int(1.0 / TARGET_FREQ / DT)  # 10 steps
+        PAD_SECONDS = 3.0
+
+        db = RolloutDB(args.db)
+        rng = np.random.default_rng(args.seed)
+        saved = 0
+        landed_count = 0
+        discarded = 0
+        seed_idx = 0
+
+        while (saved < args.target_total or landed_count < args.target_landed):
+            seed = args.seed + seed_idx
+            seed_idx += 1
+
+            obs, _ = env.reset(seed=seed)
+            uw = env.unwrapped
+
+            # Zero initial velocity for KTO
+            uw.lander.linearVelocity = (0.0, 0.0)
+            uw.lander.angularVelocity = 0.0
+
+            # Per-episode guidance margin: N(0.2, 0.1) clamped [0.01, 1.0]
+            margin = float(np.clip(rng.normal(0.2, 0.1), 0.01, 1.0))
+
+            # Create KTO controller
+            kto_ctrl = KTOController(env, time_budget=5.0)
+
+            # Grab terrain/obstacle info
+            terrain_x = list(uw.chunk_x) if hasattr(uw, 'chunk_x') else None
+            terrain_y = list(uw.smooth_y) if hasattr(uw, 'smooth_y') else None
+            obs_centers = []
+            for ob in uw.obstacles:
+                obs_centers.append([
+                    float(ob.position[0]), float(ob.position[1]),
+                    float(ob.bounding_radius),
+                ])
+
+            all_obs = [obs.copy()]
+            all_actions = []
+            call_steps_list = []
+            call_conds_list = []
+            call_wp_ts_list = []
+            step = 0
+            done = False
+            t0 = _time.monotonic()
+
+            while not done:
+                action = kto_ctrl.step(env)
+
+                # Build conditioning at model-call timesteps
+                if step % CALL_INTERVAL == 0:
+                    t_sim = step * DT
+                    remaining_t = TIMEOUT - t_sim
+
+                    lander_wx, lander_wy = _obs_to_world(float(obs[0]), float(obs[1]))
+                    state = LanderState(
+                        t_sim_lander=t_sim,
+                        q=(float(obs[0]), float(obs[1]), float(obs[4])),
+                        q_prime=(float(obs[2]), float(obs[3]), float(obs[5])),
+                        thrust=(float(action[0]), float(action[1])),
+                        contacts=(bool(obs[6]), bool(obs[7]), False),
+                    )
+
+                    obstacles = []
+                    for ob in uw.obstacles:
+                        dx = ob.position[0] - lander_wx
+                        dy = ob.position[1] - lander_wy
+                        obstacles.append(Obstacle(dx=dx, dy=dy, r=ob.bounding_radius))
+
+                    pad_rel_x = PAD_CX - lander_wx
+                    pad_rel_y = PAD_Y - lander_wy
+                    wp = WaypointTarget(
+                        t=remaining_t, t_margin=2.0,
+                        q=(pad_rel_x, pad_rel_y, 0.0),
+                        q_margin=(1.0, 1.0, 1.0),
+                        q_prime=(0.0, -0.5, 0.0),
+                        q_prime_margin=(2.0, 2.0, 2.0),
+                    )
+
+                    guidance = ActionTarget(
+                        thrust_v=float(action[0]), thrust_v_margin=margin,
+                        thrust_h=float(action[1]), thrust_h_margin=margin,
+                        thrust_t=DT, thrust_t_margin=0.001,
+                    )
+
+                    cond = _build_cond(
+                        t_obs_cmd_latency=DT,
+                        lander_state=state,
+                        obstacles=obstacles,
+                        waypoint_goals=[wp],
+                        guidance_actions=[guidance],
+                        classifier_free_guidance=[WaypointResult(outcome=1, alpha=1.0)],
+                        action_horizon=ACTION_HORIZON,
+                        target_frequency=TARGET_FREQ,
+                    )
+
+                    call_steps_list.append(step)
+                    call_conds_list.append(cond)
+                    call_wp_ts_list.append(remaining_t)
+
+                obs, reward, term, trunc, _ = env.step(action)
+                all_obs.append(obs.copy())
+                all_actions.append(np.array([float(action[0]), float(action[1])], dtype=np.float32))
+                step += 1
+                done = term or trunc
+
+            wall_time_ms = (_time.monotonic() - t0) * 1000.0
+            raw_length = step
+            sim_time = uw.elapsed_s
+
+            # Determine outcome
+            both_legs = uw.legs[0].ground_contact and uw.legs[1].ground_contact
+            vel = uw.lander.linearVelocity
+            speed = math.sqrt(vel.x ** 2 + vel.y ** 2)
+            landed = (
+                not uw.game_over
+                and both_legs
+                and speed < 0.75
+                and abs(uw.lander.angularVelocity) < 0.45
+            )
+            if landed:
+                outcome = "landed"
+            elif uw.game_over:
+                outcome = "crash"
+            elif abs(all_obs[-1][0]) >= 1.0:
+                outcome = "flyaway"
+            else:
+                outcome = "timeout"
+
+            # Discard failed episodes shorter than action_horizon
+            if outcome != "landed" and sim_time < ACTION_HORIZON:
+                discarded += 1
+                print(f"  seed={seed}: DISCARDED ({outcome}, {sim_time:.2f}s < {ACTION_HORIZON}s)")
+                continue
+
+            # Pad landed episodes: +3s zero-order-hold obs, 0 thrust
+            if outcome == "landed":
+                pad_steps = int(PAD_SECONDS / DT)
+                last_obs = all_obs[-1].copy()
+                for _ in range(pad_steps):
+                    all_obs.append(last_obs)
+                    all_actions.append(np.array([0.0, 0.0], dtype=np.float32))
+
+            # Build arrays
+            obs_arr = np.array(all_obs[1:], dtype=np.float32)
+            act_arr = np.array(all_actions, dtype=np.float32)
+            ep_len = len(act_arr)
+            times = np.arange(ep_len, dtype=np.float64) * DT
+
+            # Fit target CPs (15 CPs clamped B-spline) for each model call
+            call_outputs = []
+            for cs in call_steps_list:
+                t_start = cs * DT
+                t_end_window = t_start + ACTION_HORIZON
+                mask = (times >= t_start) & (times < t_end_window)
+                if mask.sum() < 15:
+                    call_outputs.append(np.zeros(30, dtype=np.float32))
+                    continue
+                window = RolloutWindow.from_arrays(
+                    times[mask] - t_start,
+                    np.column_stack([act_arr[mask, 0], act_arr[mask, 1]]),
+                    t_start=0.0,
+                    horizon=ACTION_HORIZON,
+                )
+                spline = ThrustSpline.fit(window)
+                cps = spline.control_points  # (15, 2)
+                call_outputs.append(np.concatenate([cps[:, 0], cps[:, 1]]).astype(np.float32))
+
+            # CFG annotations
+            n_calls = len(call_steps_list)
+            cfg_wp = np.full(n_calls, 1 if outcome == "landed" else -1, dtype=np.int8)
+            t_end_real = raw_length * DT
+            if outcome != "landed":
+                cfg_crash = np.array(
+                    [t_end_real - cs * DT for cs in call_steps_list], dtype=np.float32
+                )
+            else:
+                cfg_crash = np.zeros(n_calls, dtype=np.float32)
+
+            # Save to DB
+            row_id = db.save_episode(
+                seed=seed,
+                outcome=outcome,
+                episode_length=ep_len,
+                raw_length=raw_length,
+                sim_time=sim_time,
+                wall_time_ms=wall_time_ms,
+                obs_trajectory=obs_arr,
+                action_trajectory=act_arr,
+                call_steps=np.array(call_steps_list, dtype=np.int32),
+                call_cond=np.array(call_conds_list, dtype=np.float32),
+                call_output=np.array(call_outputs, dtype=np.float32),
+                call_wp_t=np.array(call_wp_ts_list, dtype=np.float32),
+                cfg_wp_outcome=cfg_wp,
+                cfg_crash_t=cfg_crash,
+                dt=DT,
+                action_horizon=ACTION_HORIZON,
+                target_frequency=TARGET_FREQ,
+                num_obstacles=args.obstacles,
+                guidance_margin=margin,
+                terrain_x=terrain_x,
+                terrain_y=terrain_y,
+                obstacle_centers=obs_centers if obs_centers else None,
+            )
+
+            if outcome == "landed":
+                landed_count += 1
+            saved += 1
+            print(f"  seed={seed}: {outcome.upper()}  steps={raw_length}  "
+                  f"t={sim_time:.2f}s  calls={n_calls}  margin={margin:.3f}  "
+                  f"row={row_id}  [{landed_count}L/{saved}T]")
+
+        print(f"\nDone: {saved} saved, {discarded} discarded → {args.db}")
+        summary = db.summary()
+        for outcome, stats in summary.items():
+            print(f"  {outcome}: {stats['count']} episodes, "
+                  f"avg_t={stats['avg_sim_time']}s, avg_len={stats['avg_episode_length']}")
+        db.close()
+        env.close()
+        exit()
 
     episode = 0
     while args.episodes == 0 or episode < args.episodes:
@@ -938,10 +1182,10 @@ if __name__ == "__main__":
                     t_obs_cmd_latency=DT,
                     obstacles=[],
                     lander_state=state,
-                    waypoint_goals=[],
+                    waypoint_goals=[], # need to set a waypoint goal that matches the KTO target position and time, adjusted for the change in time reference - when in the future does KTO plannreach target? the margin should be set to the right value to include the entire landing pad. 
                     guidance_actions=[at],
                     classifier_free_guidance=[],
-                    action_horizon=0.1,
+                    action_horizon=0.1, # this should be [1.5,3] clipped to how much longer is left in the KTO plan, this way we get denser knot coverage closer to goals. 
                     target_frequency=50.0,
                 )
                 tv, th = spline(DT)
