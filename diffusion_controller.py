@@ -136,21 +136,30 @@ _MODEL_CACHE: dict = {}
 
 
 def _get_model():
-    """Initialize model with random weights, cache for reuse."""
+    """Load model from DIFFUSION_MODEL_PATH checkpoint, or random weights as fallback."""
     if "sampler" in _MODEL_CACHE:
         return _MODEL_CACHE["sampler"], _MODEL_CACHE["norm_stats"]
 
     model = DiffusionMLP()
-    model.eval()
 
+    ckpt_path = os.environ.get("DIFFUSION_MODEL_PATH", "")
+    if ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(ckpt["model_state_dict"])
+        norm_stats = {
+            "x_mean": np.asarray(ckpt["x_mean"], dtype=np.float32),
+            "x_std":  np.asarray(ckpt["x_std"],  dtype=np.float32),
+        }
+    else:
+        # Fallback: identity normalization with random weights (for testing only)
+        norm_stats = {
+            "x_mean": np.zeros(X_DIM, dtype=np.float32),
+            "x_std":  np.ones(X_DIM,  dtype=np.float32),
+        }
+
+    model.eval()
     schedule = CosineSchedule(T=100)
     sampler = DDIMSampler(model, schedule, n_steps=10)
-
-    # Identity normalization (no trained stats)
-    norm_stats = {
-        "x_mean": np.zeros(X_DIM, dtype=np.float32),
-        "x_std": np.ones(X_DIM, dtype=np.float32),
-    }
 
     _MODEL_CACHE["sampler"] = sampler
     _MODEL_CACHE["norm_stats"] = norm_stats
