@@ -1,9 +1,38 @@
 # Plan: Position Diffusion Controller
 
-DiffusionController exports just DiffusionController but defines three modules:
-0. **DiffusionController** — The thing we wire up in lunar_lander.py
-1. **DiffusionModel** — The actual neural network (conditioning -> position CPs)
-2. **DiffusionAction** — Wraps the neural network with a PD tracking controller that enforces guidance margin
+## Architecture: KTODiffusionController
+
+Single class that owns both the KTO warm-start and the diffusion model.
+One PD tracking loop over a blended position spline.
+
+- **`warm_start(waypoint, action_horizon, q0, q0_prime)`** — Solves KTO
+  to produce a guidance spline `kto_spline(t_kto)` where `t_kto_0 = t_sim`
+  at warm-start time.
+- **`inference(obs)`** — Runs diffusion model to produce `diff_spline(t_diff)`
+  where `t_diff_0 = t_sim` at inference time. Called at `target_frequency`
+  (default 3 Hz). On the first call, `q_prev` is set to 0 (no prior inference).
+- **`get_action(obs, margin)`** — Evaluates both splines at current `t_sim`,
+  blends them via guidance margin, and PD-tracks the result. Returns thrust.
+  After KTO plan is exhausted, outputs zero thrust (gravity settles the lander;
+  eventually the diffusion model will learn to continue from here).
+
+### Spline Time Alignment (CRITICAL)
+
+The KTO and diffusion splines have **different time origins**:
+- `kto_spline(t)` is sampled from `t_kto_0 = t_sim` at warm-start time
+- `diff_spline(t)` is sampled from `t_diff_0 = t_sim` at inference time
+
+When blending at current `t_sim`:
+- KTO index: `t_kto = t_sim - t_kto_0` (offset from warm-start)
+- Diff index: `t_diff = t_sim - t_diff_0` (offset from last inference)
+- Both must be converted to the same world-frame position before blending
+
+### Spline Merging
+
+Use least-squares B-spline fitting (same technique as thrust_spline.py) to
+merge the two splines into a single blended spline. The blend weights come
+from guidance_margin: `q_blend(t) = (1-m)*kto(t) + m*diff(t)` evaluated at
+collocation points, then fit to a new B-spline for smooth PD tracking.
 
 ## Summary
 
@@ -117,28 +146,51 @@ learning path.
 - If this fails, the bug is in PD/wiring, not the neural network
 - Establishes the performance ceiling: this is the best DiffusionController
   can ever do (it's literally running KTO with extra steps)
-- **Result: PASS** — 69% vs 71% KTO baseline (-2%), tracking RMS 0.258m
+- **Result: PASS** — 71% vs 71% KTO baseline (+0%), tracking RMS 0.258m
+- Zero thrust after KTO plan exhausted works — gravity settles the lander
 
-### Step 1: Interface
-1. **diffusion_controller.pyi** — Simplified interface stub (3 modules)
+### Step 1: KTODiffusionController
 
-### Step 2: Implementation
-2. **diffusion_controller.py** — Rewrite implementation:
-   - `_build_cond` produces 21-dim vector
-   - `DiffusionModel` class wrapping MLP + DDIM
-   - `DiffusionAction` class with PD tracking + guidance margin
-   - `DiffusionController` function wiring it together
+Refactor into a stateful `KTODiffusionController` class that owns both
+the KTO warm-start and the diffusion model. One PD tracking loop.
 
-### Step 3: Model
-3. **model.py** — Update dimensions:
-   - `COND_DIM = 21`, `STATE_DIM = 20`, `CFG_DIM = 1`
-   - `X_DIM = 30` (10 CPs x 3, not 15 CPs x 2)
-   - Can try hidden=256 first given 21-dim conditioning
+1. **`warm_start(waypoint, action_horizon, q0, q0_prime)`**
+   - Calls `solver.solve()` to get KTO plan
+   - Stores as `kto_spline` with `t_kto_0 = t_sim` at solve time
+   - Records `kto_n_steps` so we know when the plan runs out
+   - After plan exhausts: zero thrust (not heuristic)
 
-### Step 4: Training + Eval
-4. **train.py** — Update dataset to produce 21-dim cond vectors
-5. **eval.py** — Update to use new interface
-6. **guidance_controller.py** — Simplify: outputs position guidance, not thrust
+2. **`inference(obs)`** — called at `target_frequency` (default 3 Hz)
+   - Builds 21-dim conditioning from current obs + class state
+   - Runs DiffusionModel to get 30-dim position CPs
+   - Stores as `diff_spline` with `t_diff_0 = t_sim` at inference time
+   - First call: `q_prev = 0`; subsequent: `q_prev` from last inference obs
+
+3. **`get_action(obs, margin)`** — called every sim step (50 Hz)
+   - Evaluates `kto_spline(t_sim - t_kto_0)` → world-frame position
+   - Evaluates `diff_spline(t_sim - t_diff_0)` → world-frame position
+   - Blends: `q_ref = (1-margin)*kto + margin*diff`
+   - PD tracks `q_ref` using `solver._tracking_step`
+   - If `t_sim - t_kto_0 > kto_duration`: zero thrust
+
+4. **Spline time alignment (CRITICAL)**
+   - KTO spline: `t_kto = t_sim - t_kto_0`, valid for `[0, kto_duration]`
+   - Diff spline: `t_diff = t_sim - t_diff_0`, valid for `[0, action_horizon]`
+   - These have **different time origins** — KTO starts at warm-start,
+     diff starts at each inference call
+   - Both evaluated in their own time frame, converted to world coords before blend
+   - Must track `t_kto_0` and `t_diff_0` separately as class state
+
+### Step 2: Model
+- **model.py** — Update dimensions:
+  - `COND_DIM = 21`, `STATE_DIM = 20`, `CFG_DIM = 1`
+  - `X_DIM = 30` (10 CPs x 3, not 15 CPs x 2)
+  - Can try hidden=256 first given 21-dim conditioning
+
+### Step 3: Training + Eval
+- **train.py** — Update dataset to produce 21-dim cond vectors
+- **eval.py** — Update to use KTODiffusionController
+- Remove **guidance_controller.py** (guidance is now internal to KTODiffusionController)
 
 ## Why This Works
 
@@ -147,3 +199,5 @@ learning path.
 - q_now + q_prev gives implicit velocity without dedicating 5 conditioning dims
 - GuidanceMargin is runtime, not learned — keeps model simple
 - PD controller handles closed-loop stability; diffusion only plans trajectory shape
+- KTO warm-start gives the diffusion model a strong initial plan to refine
+- Zero thrust after KTO works because KTO already brings the lander near the pad

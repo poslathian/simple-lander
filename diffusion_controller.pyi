@@ -1,16 +1,14 @@
-"""Simplified diffusion controller — position splines + PD tracking.
+"""KTODiffusionController — KTO warm-start + diffusion refinement with PD tracking.
 
-Three modules:
-  DiffusionController — Top-level wiring, the thing lunar_lander.py imports.
-  DiffusionModel      — Neural network: 21-dim conditioning -> 30-dim position CPs.
-  DiffusionAction     — PD tracking controller that enforces guidance margin.
+Stateful controller that owns both the KTO guidance spline and the diffusion
+model. One PD tracking loop over a blended position spline.
 
 Conditioning: 21 dims (20 state + 1 CFG).
 Model output: 30 dims (10 CPs x 3 channels: x, y, theta).
 """
 
 from enum import IntEnum
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
@@ -31,12 +29,6 @@ class Outcome(IntEnum):
 
 # ── Input types ───────────────────────────────────────────────────────────
 
-class LanderState(NamedTuple):
-    """Two consecutive position observations for C2 continuity."""
-    t_sim: float
-    q_now: Position       # current position at t0
-    q_prev: Position      # position at t0 - dt (implies velocity)
-
 class ObstacleRelative(NamedTuple):
     """Nearest collision geometry relative to current observation.
     Wired to (0, 0, 0) until obstacles are implemented.
@@ -49,12 +41,6 @@ class WaypointTarget(NamedTuple):
     """Single waypoint: position and velocity error relative to current obs."""
     dq: Position          # (q_target - q_now): where to go
     dq_prime: Velocity    # (q'_target - q'_now): desired velocity delta
-
-class GuidanceAction(NamedTuple):
-    """Caller's suggested state at t_obs_cmd_latency."""
-    q: Position           # suggested (x, y, theta) at next control step
-    q_prime: Velocity     # suggested velocity (vx, vy, omega)
-    q_double_prime: tuple[float, float, float]  # feedforward acceleration (ax, ay, alpha)
 
 # ── Output types ──────────────────────────────────────────────────────────
 
@@ -75,6 +61,15 @@ N_CPS: int            # 10
 N_CHANNELS: int       # 3 (x, y, theta)
 
 # ── DiffusionModel ────────────────────────────────────────────────────────
+
+class ModelProtocol(Protocol):
+    """Interface for the diffusion model (or NoiseModel stub)."""
+    def predict(
+        self,
+        cond: NDArray[np.float32],
+        outcome: Outcome,
+        guidance_scale: float,
+    ) -> NDArray[np.float64]: ...
 
 class DiffusionModel:
     """Neural network: 21-dim conditioning -> 30-dim position CPs.
@@ -104,80 +99,98 @@ class DiffusionModel:
         """
         ...
 
-# ── DiffusionAction ───────────────────────────────────────────────────────
+class NoiseModel:
+    """Drop-in for DiffusionModel that returns random CPs. For testing."""
+    def predict(
+        self,
+        cond: NDArray[np.float32],
+        outcome: Outcome,
+        guidance_scale: float = ...,
+    ) -> NDArray[np.float64]: ...
 
-class DiffusionAction:
-    """PD tracking controller over a position spline.
+# ── KTODiffusionController ────────────────────────────────────────────────
 
-    Evaluates the position spline at current time, computes position error,
-    applies PD control to produce thrust commands. Enforces guidance margin
-    by blending diffusion output with the caller's guidance suggestion.
+class KTODiffusionController:
+    """Stateful controller: KTO warm-start + diffusion refinement + PD tracking.
+
+    Lifecycle:
+        1. __init__: create with env, model, config
+        2. warm_start(): solve KTO, store guidance spline
+        3. Loop:
+           a. inference() at target_frequency (3 Hz) — run diffusion model
+           b. get_action() every sim step (50 Hz) — blend splines, PD track
+
+    Spline time alignment:
+        kto_spline(t_kto) sampled from t_kto_0 = t_sim at warm_start time.
+        diff_spline(t_diff) sampled from t_diff_0 = t_sim at inference time.
+        These have DIFFERENT time origins. Both converted to world frame before blending.
     """
 
     def __init__(
         self,
-        control_points: NDArray[np.float64],
-        action_horizon: float,
-        guidance: GuidanceAction,
-        guidance_margin: float,
+        env: ...,
+        model: ModelProtocol | None = ...,
+        target_frequency: float = ...,
+        action_horizon: float = ...,
+        outcome: Outcome = ...,
     ) -> None:
         """
         Args:
-            control_points: (10, 3) from DiffusionModel.predict().
-            action_horizon:  spline duration in seconds (default 1.5).
-            guidance:        caller's suggested position at next step.
-            guidance_margin: [0, 1] how far the model may deviate from guidance.
-                             0 = ignore model, track guidance exactly.
-                             1 = ignore guidance, trust model fully.
+            env:              Gymnasium LunarLander env.
+            model:            DiffusionModel or NoiseModel. None = NoiseModel.
+            target_frequency: How often to call inference(), in Hz (default 3).
+            action_horizon:   Duration of diffusion spline in seconds (default 1.5).
+            outcome:          Desired outcome for CFG guidance.
         """
         ...
 
-    def step(self, t: float, q_now: Position, v_now: Velocity) -> ThrustVec:
-        """Compute thrust command for current timestep.
+    def warm_start(
+        self,
+        waypoint: WaypointTarget,
+        time_budget: float = ...,
+    ) -> None:
+        """Solve KTO to produce guidance spline.
+
+        Stores kto_spline with t_kto_0 = current t_sim.
+        After plan exhausts: get_action returns zero thrust.
 
         Args:
-            t: time since spline start.
-            q_now: current (x, y, theta) in world frame.
-            v_now: current (vx, vy, omega) in world frame.
+            waypoint:     Target relative to current position.
+            time_budget:  Solver time budget in seconds.
+        """
+        ...
+
+    def inference(self) -> None:
+        """Run diffusion model at current observation.
+
+        Builds 21-dim conditioning from class state, runs model.predict(),
+        stores diff_spline with t_diff_0 = current t_sim.
+
+        Should be called at target_frequency (default 3 Hz).
+        """
+        ...
+
+    def get_action(self, guidance_margin: float = ...) -> ThrustVec:
+        """Blend KTO + diffusion splines, PD track the result.
+
+        Called every sim step (50 Hz).
+
+        Evaluates:
+          kto_ref  = kto_spline(t_sim - t_kto_0)   → world position
+          diff_ref = diff_spline(t_sim - t_diff_0)  → world position
+          q_ref    = (1 - margin) * kto_ref + margin * diff_ref
+
+        PD tracks q_ref using solver._tracking_step.
+
+        If KTO plan is exhausted (t_sim - t_kto_0 > kto_duration),
+        returns zero thrust (0, 0).
+
+        Args:
+            guidance_margin: [0, 1] how far model may deviate from KTO.
+                             0 = ignore model, track KTO exactly.
+                             1 = ignore KTO, trust model fully.
 
         Returns:
             (thrust_v, thrust_h) each in [-1, 1].
         """
         ...
-
-    def position_ref(self, t: float) -> PositionRef:
-        """Evaluate the position spline at time t (before PD)."""
-        ...
-
-# ── DiffusionController (top-level wiring) ────────────────────────────────
-
-def DiffusionController(
-    timeout: float,
-    t_obs_cmd_latency: float,
-    lander_state: LanderState,
-    obstacle: ObstacleRelative,
-    waypoint: WaypointTarget,
-    guidance: GuidanceAction,
-    guidance_margin: float,
-    outcome: Outcome,
-    action_horizon: float = ...,
-) -> DiffusionAction:
-    """Build conditioning, run DiffusionModel, return DiffusionAction.
-
-    This is the single callable that lunar_lander.py imports.
-
-    Args:
-        timeout:             Episode timeout (seconds remaining).
-        t_obs_cmd_latency:   Observation-to-command delay.
-        lander_state:        q_now + q_prev (two observations for C2 continuity).
-        obstacle:            Nearest collision geometry relative to obs (zeros for now).
-        waypoint:            Target position/velocity error relative to obs.
-        guidance:            Caller's suggested position at next step.
-        guidance_margin:     [0, 1] how far model may deviate from guidance (0=track guidance, 1=trust model).
-        outcome:             Desired outcome for CFG (SUCCESS/FAIL/UNKNOWN).
-        action_horizon:      Spline duration in seconds (default 1.5).
-
-    Returns:
-        DiffusionAction — call .step(t, q_now) each timestep for thrust.
-    """
-    ...
