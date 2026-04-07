@@ -121,8 +121,8 @@ def run_episode(env, seed, noise_model, save_frames=False, frame_dir=None):
             )
             tracking_errors.append(pos_err)
         else:
-            # KTO exhausted plan — use heuristic directly (same as KTOController)
-            action_out = kto_action
+            # KTO exhausted plan — zero thrust, let gravity settle the lander
+            action_out = np.array([0.0, 0.0], dtype=np.float32)
 
         # Save frame if requested
         if save_frames and hasattr(env, 'render'):
@@ -196,25 +196,28 @@ def main():
 
     # ── Diffusion pipeline test ──
     print(f"\nRunning DiffusionController with NoiseModel + guidance_margin={GUIDANCE_MARGIN}")
-    print(f"Saving frames for seed={SAVE_FRAMES_SEED}\n")
+    print(f"(zero thrust after KTO plan exhausted)\n")
 
     results = []
 
-    # First run: save frames
+    # Save frames for a few seeds to validate visually
+    FRAME_SEEDS = [SEED_OFFSET, SEED_OFFSET + 1, SEED_OFFSET + 2]
     frame_env = gym.make("LL-test-noise", render_mode="rgb_array", continuous=True)
-    reward, landed, rms = run_episode(
-        frame_env, SAVE_FRAMES_SEED, noise_model,
-        save_frames=True, frame_dir="./frames",
-    )
+    for fs in FRAME_SEEDS:
+        reward, landed, rms = run_episode(
+            frame_env, fs, noise_model,
+            save_frames=True, frame_dir=f"./frames/seed_{fs}",
+        )
+        results.append((reward, landed, rms))
+        status = "LANDED" if landed else "FAILED"
+        print(f"  Seed {fs}: {status}  reward={reward:.2f}  rms={rms:.3f}m")
     frame_env.close()
-    results.append((reward, landed, rms))
-    status = "LANDED" if landed else "FAILED"
-    print(f"  Seed {SAVE_FRAMES_SEED}: {status}  reward={reward:.2f}  rms={rms:.3f}m")
 
     # Remaining episodes headless
     env = gym.make("LL-test-noise", render_mode=None, continuous=True)
     t0 = time.time()
-    for i in range(1, N_EPISODES):
+    already_done = len(FRAME_SEEDS)
+    for i in range(already_done, N_EPISODES):
         seed = seeds[i]
         reward, landed, rms = run_episode(env, seed, noise_model)
         results.append((reward, landed, rms))
