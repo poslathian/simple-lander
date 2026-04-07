@@ -51,8 +51,10 @@ class WaypointTarget(NamedTuple):
     dq_prime: Velocity    # (q'_target - q'_now): desired velocity delta
 
 class GuidanceAction(NamedTuple):
-    """Caller's suggested position at t_obs_cmd_latency."""
+    """Caller's suggested state at t_obs_cmd_latency."""
     q: Position           # suggested (x, y, theta) at next control step
+    q_prime: Velocity     # suggested velocity (vx, vy, omega)
+    q_double_prime: tuple[float, float, float]  # feedforward acceleration (ax, ay, alpha)
 
 # ── Output types ──────────────────────────────────────────────────────────
 
@@ -130,12 +132,13 @@ class DiffusionAction:
         """
         ...
 
-    def step(self, t: float, q_now: Position) -> ThrustVec:
+    def step(self, t: float, q_now: Position, v_now: Velocity) -> ThrustVec:
         """Compute thrust command for current timestep.
 
         Args:
             t: time since spline start.
-            q_now: current (x, y, theta) observation.
+            q_now: current (x, y, theta) in world frame.
+            v_now: current (vx, vy, omega) in world frame.
 
         Returns:
             (thrust_v, thrust_h) each in [-1, 1].

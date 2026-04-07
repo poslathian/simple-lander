@@ -1,417 +1,319 @@
-"""DiffusionController — Diffusion-model-based thrust controller for Lunar Lander.
+"""DiffusionController — position-spline diffusion with PD tracking.
 
-Loads a DiffusionMLP checkpoint and builds the 131-dim conditioning vector
-from the ICD interface inputs, runs DDIM sampling with CFG, then converts
-the 20-dim B-spline control points into a callable ThrustSpline.
+Three modules:
+  DiffusionModel  — Neural network (or NoiseModel stub) -> position CPs.
+  DiffusionAction — PD tracking controller + guidance margin enforcement.
+  DiffusionController — Top-level wiring function.
+
+Conditioning: 21 dims (20 state + 1 CFG).
+Model output: 30 dims (10 CPs x 3 channels: x, y, theta).
 """
 
 import math
-import os
-from typing import Annotated, Callable, Literal, NamedTuple
+from enum import IntEnum
+from typing import NamedTuple, Protocol
 
 import numpy as np
-import torch
+from scipy.interpolate import BSpline
 
-from model import (
-    DiffusionMLP, CosineSchedule, DDIMSampler,
-    W, H, PAD_CX, PAD_Y, OBS_RADIUS,
-    OBS_X_NORM_OFFSET, OBS_X_NORM_SCALE,
-    OBS_Y_NORM_OFFSET, OBS_Y_NORM_SCALE,
-    STATE_DIM, CFG_DIM, COND_DIM, X_DIM, CFG_START,
-)
-from thrust_spline import ThrustSpline as _ThrustSplineImpl
+import solver
 
+# ── Constants ─────────────────────────────────────────────────────────────
 
-# ── Coordinate types (mirror .pyi) ──────────────────────────────────────────
+DT = 0.02  # simulation timestep (50 Hz)
+STATE_DIM = 20
+CFG_DIM = 1
+COND_DIM = STATE_DIM + CFG_DIM  # 21
+N_CPS = 10
+N_CHANNELS = 3  # x, y, theta
+X_DIM = N_CPS * N_CHANNELS  # 30
+DEGREE = 3  # cubic B-spline
+
+# ── Coordinate types ──────────────────────────────────────────────────────
 
 Position = tuple[float, float, float]      # (x, y, theta)
 Velocity = tuple[float, float, float]      # (x', y', theta')
 ThrustVec = tuple[float, float]            # (v, h) each in [-1, 1]
-Contacts = tuple[bool, bool, bool]         # (left_leg, right_leg, body)
 
+# ── Outcome ───────────────────────────────────────────────────────────────
 
-class MaxLen:
-    def __init__(self, n: int) -> None:
-        self.n = n
+class Outcome(IntEnum):
+    FAIL = -1
+    UNKNOWN = 0
+    SUCCESS = 1
 
+# ── Input types ───────────────────────────────────────────────────────────
 
-# ── Input types ─────────────────────────────────────────────────────────────
+class LanderState(NamedTuple):
+    t_sim: float
+    q_now: Position
+    q_prev: Position
 
-class Obstacle(NamedTuple):
+class ObstacleRelative(NamedTuple):
     dx: float
     dy: float
     r: float
 
-
-class LanderState(NamedTuple):
-    t_sim_lander: float
-    q: Position
-    q_prime: Velocity
-    thrust: ThrustVec
-    contacts: Contacts
-
-
 class WaypointTarget(NamedTuple):
-    t: float
-    t_margin: float
-    q: Position
-    q_margin: Position
-    q_prime: Velocity
-    q_prime_margin: Velocity
+    dq: Position
+    dq_prime: Velocity
+
+class GuidanceAction(NamedTuple):
+    q: Position           # suggested (x, y, theta) at next control step
+    q_prime: Velocity     # suggested velocity (vx, vy, omega)
+    q_double_prime: tuple[float, float, float]  # feedforward acceleration (ax, ay, alpha)
+
+# ── Output types ──────────────────────────────────────────────────────────
+
+class PositionRef(NamedTuple):
+    x: float
+    y: float
+    theta: float
 
 
-class ActionTarget(NamedTuple):
-    thrust_v: float
-    thrust_v_margin: float
-    thrust_h: float
-    thrust_h_margin: float
-    thrust_t: float
-    thrust_t_margin: float
+# ── Model protocol ────────────────────────────────────────────────────────
+
+class ModelProtocol(Protocol):
+    def predict(
+        self,
+        cond: np.ndarray,
+        outcome: Outcome,
+        guidance_scale: float,
+    ) -> np.ndarray: ...
 
 
-class WaypointResult(NamedTuple):
-    outcome: Literal[-1, 0, 1]
-    alpha: float
+# ── NoiseModel (Step 0 stub) ─────────────────────────────────────────────
+
+class NoiseModel:
+    """Drop-in for DiffusionModel that returns random CPs."""
+
+    def predict(
+        self,
+        cond: np.ndarray,
+        outcome: Outcome,
+        guidance_scale: float = 2.0,
+    ) -> np.ndarray:
+        return np.random.randn(N_CPS, N_CHANNELS) * 0.1
 
 
-class ActionResult(NamedTuple):
-    outcome: Literal[-1, 0, 1]
-    alpha: float
+# ── Position B-spline helper ─────────────────────────────────────────────
+
+def _make_position_spline(
+    cps: np.ndarray,
+    action_horizon: float,
+) -> tuple[BSpline, BSpline, BSpline]:
+    """Build 3 clamped cubic B-splines (x, y, theta) from (N_CPS, 3) CPs.
+
+    Returns a tuple of (spline_x, spline_y, spline_theta).
+    """
+    n = cps.shape[0]
+    # Clamped knot vector: first/last (degree+1) repeated
+    n_internal = n - DEGREE + 1
+    internal = np.linspace(0, action_horizon, n_internal)
+    knots = np.concatenate([
+        np.full(DEGREE, 0.0),
+        internal,
+        np.full(DEGREE, action_horizon),
+    ])
+    return (
+        BSpline(knots, cps[:, 0], DEGREE, extrapolate=False),
+        BSpline(knots, cps[:, 1], DEGREE, extrapolate=False),
+        BSpline(knots, cps[:, 2], DEGREE, extrapolate=False),
+    )
 
 
-class ContactGuidance(NamedTuple):
-    t_contact: float
-    alpha: float
-
-
-class CrashGuidance(NamedTuple):
-    t_crash: float
-    alpha: float
-
-
-CFGItem = WaypointResult | ActionResult | ContactGuidance | CrashGuidance
-
-ThrustSpline = Callable[[float], ThrustVec]
-
-DT = 0.02  # simulation timestep (1/FPS)
-
-
-# ── Normalization helpers (matching adapter.py) ─────────────────────────────
-
-_COND_BOUNDS = {
-    "dx": (-W, W),
-    "dy": (-H, H),
-    "theta": (-math.pi, math.pi),
-    "vx": (-5.0, 5.0),
-    "vy": (-5.0, 5.0),
-    "omega": (-5.0, 5.0),
-    "thrust_v": (-1.0, 1.0),
-    "thrust_h": (-1.0, 1.0),
-    "contact": (0.0, 1.0),
-    "obs_dx": (-W, W),
-    "obs_dy": (-H, H),
-    "obs_r": (0.0, 2.0),
-    "action_horizon": (0.0, 10.0),
-    "target_freq": (0.0, 50.0),
-    "wp_pos": (-W, W),
-    "wp_vel": (-5.0, 5.0),
-    "wp_t": (0.0, 10.0),
-    "wp_margin": (0.0, W),
-    "act_thrust": (-1.0, 1.0),
-    "act_margin": (0.0, 2.0),
-    "act_t": (0.0, 10.0),
-    "act_t_margin": (0.0, 1.0),
-}
-
-
-def _norm_clip(val: float, lo: float, hi: float) -> float:
-    if hi == lo:
-        return 0.0
-    return float(np.clip(2.0 * (val - lo) / (hi - lo) - 1.0, -1.0, 1.0))
-
-
-# ── Lazy-loaded model singleton ─────────────────────────────────────────────
-
-_MODEL_CACHE: dict = {}
-
-
-def _get_model():
-    """Initialize model with random weights, cache for reuse."""
-    if "sampler" in _MODEL_CACHE:
-        return _MODEL_CACHE["sampler"], _MODEL_CACHE["norm_stats"]
-
-    model = DiffusionMLP()
-    model.eval()
-
-    schedule = CosineSchedule(T=100)
-    sampler = DDIMSampler(model, schedule, n_steps=10)
-
-    # Identity normalization (no trained stats)
-    norm_stats = {
-        "x_mean": np.zeros(X_DIM, dtype=np.float32),
-        "x_std": np.ones(X_DIM, dtype=np.float32),
-    }
-
-    _MODEL_CACHE["sampler"] = sampler
-    _MODEL_CACHE["norm_stats"] = norm_stats
-    return sampler, norm_stats
-
-
-# ── Conditioning vector builder ─────────────────────────────────────────────
+# ── Conditioning vector builder ───────────────────────────────────────────
 
 def _build_cond(
     t_obs_cmd_latency: float,
     lander_state: LanderState,
-    obstacles: list[Obstacle],
-    waypoint_goals: list[WaypointTarget],
-    guidance_actions: list[ActionTarget],
-    classifier_free_guidance: list[CFGItem],
+    obstacle: ObstacleRelative,
+    waypoint: WaypointTarget,
+    guidance: GuidanceAction,
     action_horizon: float,
-    target_frequency: float,
 ) -> np.ndarray:
-    """Build the 131-dim conditioning vector matching adapter.py layout."""
-    cond = np.zeros(COND_DIM, dtype=np.float32)
+    """Build the 20-dim state conditioning vector."""
+    cond = np.zeros(STATE_DIM, dtype=np.float32)
     idx = 0
 
     # t_obs_cmd_latency (1)
-    cond[idx] = _norm_clip(t_obs_cmd_latency, 0.0, 0.5)
+    cond[idx] = t_obs_cmd_latency
     idx += 1
 
-    # Q (x, y, theta) — lander-relative (always 0,0,0 at observation time) (3)
-    cond[idx] = _norm_clip(lander_state.q[0], *_COND_BOUNDS["dx"])
-    cond[idx + 1] = _norm_clip(lander_state.q[1], *_COND_BOUNDS["dy"])
-    cond[idx + 2] = _norm_clip(lander_state.q[2], *_COND_BOUNDS["theta"])
+    # q_now (3)
+    cond[idx:idx + 3] = lander_state.q_now
     idx += 3
 
-    # Q' (vx, vy, omega) (3)
-    cond[idx] = _norm_clip(lander_state.q_prime[0], *_COND_BOUNDS["vx"])
-    cond[idx + 1] = _norm_clip(lander_state.q_prime[1], *_COND_BOUNDS["vy"])
-    cond[idx + 2] = _norm_clip(lander_state.q_prime[2], *_COND_BOUNDS["omega"])
+    # q_prev (3)
+    cond[idx:idx + 3] = lander_state.q_prev
     idx += 3
 
-    # Thrust (v, h) (2)
-    cond[idx] = _norm_clip(lander_state.thrust[0], -1.0, 1.0)
-    cond[idx + 1] = _norm_clip(lander_state.thrust[1], -1.0, 1.0)
-    idx += 2
-
-    # Contacts (left_leg, right_leg, body) (3)
-    cond[idx] = float(lander_state.contacts[0])
-    cond[idx + 1] = float(lander_state.contacts[1])
-    cond[idx + 2] = float(lander_state.contacts[2])
+    # obstacle (3) — zeros for now
+    cond[idx] = obstacle.dx
+    cond[idx + 1] = obstacle.dy
+    cond[idx + 2] = obstacle.r
     idx += 3
 
-    # Obstacles: 5 × (dx, dy, r), zero-padded (15)
-    for i in range(5):
-        if i < len(obstacles):
-            cond[idx] = _norm_clip(obstacles[i].dx, *_COND_BOUNDS["obs_dx"])
-            cond[idx + 1] = _norm_clip(obstacles[i].dy, *_COND_BOUNDS["obs_dy"])
-            cond[idx + 2] = _norm_clip(obstacles[i].r, *_COND_BOUNDS["obs_r"])
-        idx += 3
+    # waypoint: delta_q (3) + delta_q' (3)
+    cond[idx:idx + 3] = waypoint.dq
+    idx += 3
+    cond[idx:idx + 3] = waypoint.dq_prime
+    idx += 3
 
-    # Waypoint goals: 5 × 12, zero-padded (60)
-    for i in range(5):
-        if i < len(waypoint_goals):
-            wp = waypoint_goals[i]
-            cond[idx] = _norm_clip(wp.t, *_COND_BOUNDS["wp_t"])
-            cond[idx + 1] = _norm_clip(wp.t_margin, *_COND_BOUNDS["wp_margin"])
-            cond[idx + 2] = _norm_clip(wp.q[0], *_COND_BOUNDS["wp_pos"])
-            cond[idx + 3] = _norm_clip(wp.q[1], *_COND_BOUNDS["wp_pos"])
-            cond[idx + 4] = _norm_clip(wp.q[2], -math.pi, math.pi)
-            cond[idx + 5] = _norm_clip(wp.q_margin[0], *_COND_BOUNDS["wp_margin"])
-            cond[idx + 6] = _norm_clip(wp.q_margin[1], *_COND_BOUNDS["wp_margin"])
-            cond[idx + 7] = _norm_clip(wp.q_margin[2], *_COND_BOUNDS["wp_margin"])
-            cond[idx + 8] = _norm_clip(wp.q_prime[0], *_COND_BOUNDS["wp_vel"])
-            cond[idx + 9] = _norm_clip(wp.q_prime[1], *_COND_BOUNDS["wp_vel"])
-            cond[idx + 10] = _norm_clip(wp.q_prime[2], *_COND_BOUNDS["wp_vel"])
-            cond[idx + 11] = _norm_clip(wp.q_prime_margin[0], *_COND_BOUNDS["wp_margin"])
-        idx += 12
-
-    # Guidance actions: 5 × 6, zero-padded (30)
-    for i in range(5):
-        if i < len(guidance_actions):
-            ga = guidance_actions[i]
-            cond[idx] = _norm_clip(ga.thrust_v, *_COND_BOUNDS["act_thrust"])
-            cond[idx + 1] = _norm_clip(ga.thrust_v_margin, *_COND_BOUNDS["act_margin"])
-            cond[idx + 2] = _norm_clip(ga.thrust_h, *_COND_BOUNDS["act_thrust"])
-            cond[idx + 3] = _norm_clip(ga.thrust_h_margin, *_COND_BOUNDS["act_margin"])
-            cond[idx + 4] = _norm_clip(ga.thrust_t, *_COND_BOUNDS["act_t"])
-            cond[idx + 5] = _norm_clip(ga.thrust_t_margin, *_COND_BOUNDS["act_t_margin"])
-        idx += 6
+    # guidance_q (3)
+    cond[idx:idx + 3] = guidance.q
+    idx += 3
 
     # action_horizon (1)
-    cond[idx] = _norm_clip(action_horizon, *_COND_BOUNDS["action_horizon"])
+    cond[idx] = action_horizon
     idx += 1
 
-    # target_frequency (1)
-    cond[idx] = _norm_clip(target_frequency, *_COND_BOUNDS["target_freq"])
-    idx += 1
-
-    assert idx == STATE_DIM, f"State dims: {idx} vs {STATE_DIM}"
-
-    # ── CFG dims (12) ───────────────────────────────────────────────
-    cfg_idx = STATE_DIM
-
-    # waypoint_results: 5 slots (5)
-    for i in range(5):
-        for cfg in classifier_free_guidance:
-            if isinstance(cfg, WaypointResult):
-                # Match by index: first WaypointResult → slot 0, etc.
-                cond[cfg_idx + i] = float(cfg.outcome) * cfg.alpha
-                break
-        # Only fill slot 0 from the first WaypointResult, rest stay 0
-        if i == 0:
-            for cfg in classifier_free_guidance:
-                if isinstance(cfg, WaypointResult):
-                    cond[cfg_idx] = float(cfg.outcome) * cfg.alpha
-                    break
-    cfg_idx += 5
-
-    # action_results: 5 slots (5)
-    for i in range(5):
-        if i == 0:
-            for cfg in classifier_free_guidance:
-                if isinstance(cfg, ActionResult):
-                    cond[cfg_idx] = float(cfg.outcome) * cfg.alpha
-                    break
-    cfg_idx += 5
-
-    # t_contact (1)
-    for cfg in classifier_free_guidance:
-        if isinstance(cfg, ContactGuidance):
-            cond[cfg_idx] = _norm_clip(cfg.t_contact * cfg.alpha, -10.0, 10.0)
-            break
-    cfg_idx += 1
-
-    # t_crash (1)
-    for cfg in classifier_free_guidance:
-        if isinstance(cfg, CrashGuidance):
-            cond[cfg_idx] = _norm_clip(cfg.t_crash * cfg.alpha, -10.0, 10.0)
-            break
-    cfg_idx += 1
-
-    assert cfg_idx == COND_DIM, f"CFG dims: {cfg_idx} vs {COND_DIM}"
+    assert idx == STATE_DIM, f"Expected {STATE_DIM}, got {idx}"
     return cond
 
 
-# ── Obs-space to world-space conversion ─────────────────────────────────────
+# ── DiffusionAction ───────────────────────────────────────────────────────
 
-def _obs_to_world(obs_x: float, obs_y: float) -> tuple[float, float]:
-    """Convert observation-space (x, y) to world coords."""
-    return (
-        obs_x * OBS_X_NORM_SCALE + OBS_X_NORM_OFFSET,
-        obs_y * OBS_Y_NORM_SCALE + OBS_Y_NORM_OFFSET,
-    )
+class DiffusionAction:
+    """PD tracking controller over a position spline + guidance margin."""
+
+    def __init__(
+        self,
+        control_points: np.ndarray,
+        action_horizon: float,
+        guidance: GuidanceAction,
+        guidance_margin: float,
+        q_now_world: Position,
+        q_prev_world: Position,
+    ):
+        """
+        Args:
+            control_points: (10, 3) position CPs in lander-relative coords.
+            action_horizon: spline duration in seconds.
+            guidance: caller's suggested position at next step.
+            guidance_margin: [0, 1]. 0=track guidance exactly, 1=trust model.
+            q_now_world: current world-frame position (for converting refs).
+            q_prev_world: previous world-frame position (for velocity estimate).
+        """
+        self.action_horizon = action_horizon
+        self.guidance = guidance
+        self.guidance_margin = np.clip(guidance_margin, 0.0, 1.0)
+        self.q_now_world = np.array(q_now_world)
+        self.q_prev_world = np.array(q_prev_world)
+        self.gains = solver.DEFAULT_GAINS
+
+        self._spline_x, self._spline_y, self._spline_theta = \
+            _make_position_spline(control_points, action_horizon)
+
+    def position_ref(self, t: float) -> PositionRef:
+        """Evaluate position spline at time t (lander-relative)."""
+        t_clamp = float(np.clip(t, 0.0, self.action_horizon))
+        return PositionRef(
+            x=float(self._spline_x(t_clamp)),
+            y=float(self._spline_y(t_clamp)),
+            theta=float(self._spline_theta(t_clamp)),
+        )
+
+    def step(
+        self,
+        t: float,
+        q_now: Position,
+        v_now: Velocity,
+    ) -> ThrustVec:
+        """Compute thrust via PD tracking of the blended position reference.
+
+        Args:
+            t: time since spline start.
+            q_now: current (x, y, theta) in world frame.
+            v_now: current (vx, vy, omega) in world frame.
+
+        Returns:
+            (thrust_v, thrust_h) each in [-1, 1].
+        """
+        # Model reference: spline is lander-relative, convert to world
+        model_ref = self.position_ref(t)
+        model_world = (
+            self.q_now_world[0] + model_ref.x,
+            self.q_now_world[1] + model_ref.y,
+            self.q_now_world[2] + model_ref.theta,
+        )
+
+        # Guidance reference: already in world frame
+        guide_world = self.guidance.q
+
+        # Blend: margin=0 → guidance, margin=1 → model
+        m = self.guidance_margin
+        x_ref = (1 - m) * guide_world[0] + m * model_world[0]
+        y_ref = (1 - m) * guide_world[1] + m * model_world[1]
+        th_ref = (1 - m) * guide_world[2] + m * model_world[2]
+
+        # Current state
+        x, y, theta = q_now
+        vx, vy, omega = v_now
+
+        # Reference velocity and feedforward from guidance
+        vx_ref = self.guidance.q_prime[0]
+        vy_ref = self.guidance.q_prime[1]
+        om_ref = self.guidance.q_prime[2]
+
+        ax_ref = self.guidance.q_double_prime[0]
+        ay_ref = self.guidance.q_double_prime[1]
+        al_ref = self.guidance.q_double_prime[2]
+
+        Fm, Fs = solver._tracking_step(
+            x, y, theta, vx, vy, omega,
+            x_ref, y_ref, th_ref, vx_ref, vy_ref, om_ref,
+            ax_ref, ay_ref, al_ref, self.gains,
+        )
+
+        a_main = float(np.clip(2.0 * Fm / solver.THRUST_MAX - 1.0, -1.0, 1.0))
+        a_side = float(np.clip(Fs / solver.SIDE_FORCE_MAX, -1.0, 1.0))
+
+        return (a_main, a_side)
 
 
-# ── Main entry point ────────────────────────────────────────────────────────
+# ── DiffusionController (top-level wiring) ────────────────────────────────
+
+_model_cache: dict = {}
+
 
 def DiffusionController(
     timeout: float,
     t_obs_cmd_latency: float,
-    obstacles: Annotated[list[Obstacle], MaxLen(5)],
     lander_state: LanderState,
-    waypoint_goals: Annotated[list[WaypointTarget], MaxLen(5)],
-    guidance_actions: Annotated[list[ActionTarget], MaxLen(5)],
-    classifier_free_guidance: Annotated[list[CFGItem], MaxLen(10)],
-    action_horizon: float,
-    target_frequency: float,
-) -> ThrustSpline:
-    """Run diffusion model inference and return a ThrustSpline.
+    obstacle: ObstacleRelative,
+    waypoint: WaypointTarget,
+    guidance: GuidanceAction,
+    guidance_margin: float,
+    outcome: Outcome,
+    action_horizon: float = 1.5,
+    model: ModelProtocol | None = None,
+) -> DiffusionAction:
+    """Build conditioning, run model, return DiffusionAction."""
+    if model is None:
+        if "model" not in _model_cache:
+            _model_cache["model"] = NoiseModel()
+        model = _model_cache["model"]
 
-    Builds the 131-dim conditioning vector from ICD inputs, runs DDIM
-    sampling with classifier-free guidance, and converts the 30-dim
-    output (15 B-spline CPs × 2) into a callable spline.
-    """
-    # If no waypoint goals provided, default to landing pad
-    if not waypoint_goals:
-        # Convert current lander obs-space position to world frame
-        lander_wx, lander_wy = _obs_to_world(
-            lander_state.q[0], lander_state.q[1]
-        )
-        # Waypoint: pad center, relative to lander
-        pad_rel_x = PAD_CX - lander_wx  # pad position in lander-relative world coords
-        pad_rel_y = PAD_Y - lander_wy
-        remaining_t = timeout - lander_state.t_sim_lander
-        waypoint_goals = [
-            WaypointTarget(
-                t=remaining_t,
-                t_margin=2.0,
-                q=(pad_rel_x, pad_rel_y, 0.0),
-                q_margin=(1.0, 1.0, 1.0),
-                q_prime=(0.0, -0.5, 0.0),     # slight downward velocity
-                q_prime_margin=(2.0, 2.0, 2.0),
-            )
-        ]
-
-    # If no guidance actions provided, add a neutral one
-    if not guidance_actions:
-        guidance_actions = [
-            ActionTarget(
-                thrust_v=0.0,
-                thrust_v_margin=2.0,
-                thrust_h=0.0,
-                thrust_h_margin=2.0,
-                thrust_t=t_obs_cmd_latency,
-                thrust_t_margin=0.5,
-            )
-        ]
-
-    # If no CFG provided, add success guidance for first waypoint
-    if not classifier_free_guidance:
-        classifier_free_guidance = [
-            WaypointResult(outcome=1, alpha=1.0),
-        ]
-
-    # Build conditioning
     cond = _build_cond(
         t_obs_cmd_latency=t_obs_cmd_latency,
         lander_state=lander_state,
-        obstacles=obstacles,
-        waypoint_goals=waypoint_goals,
-        guidance_actions=guidance_actions,
-        classifier_free_guidance=classifier_free_guidance,
+        obstacle=obstacle,
+        waypoint=waypoint,
+        guidance=guidance,
         action_horizon=action_horizon,
-        target_frequency=target_frequency,
     )
 
-    # Run inference
-    sampler, norm_stats = _get_model()
-    cond_tensor = torch.tensor(cond, dtype=torch.float32).unsqueeze(0)
+    cps = model.predict(cond, outcome, guidance_scale=2.0)
 
-    x_norm = sampler.sample_cfg(
-        cond_tensor,
-        guidance_scale=2.0,
-        device="cpu",
-        norm_stats=norm_stats,
-        action_horizon=action_horizon,  # only used by _project_action_boxes (unused)
+    # Pin first CP to origin (C0 continuity: we are at our own position)
+    cps[0] = [0.0, 0.0, 0.0]
+
+    return DiffusionAction(
+        control_points=cps,
+        action_horizon=action_horizon,
+        guidance=guidance,
+        guidance_margin=guidance_margin,
+        q_now_world=lander_state.q_now,
+        q_prev_world=lander_state.q_prev,
     )
-
-    # Denormalize control points
-    x_mean = torch.tensor(norm_stats["x_mean"])
-    x_std = torch.tensor(norm_stats["x_std"])
-    x_raw = (x_norm * x_std + x_mean).squeeze(0).numpy()
-
-    # Build spline from model output: (30,) flat → (15, 2) control points
-    n_cps = X_DIM // 2
-    cps = np.column_stack([x_raw[:n_cps], x_raw[n_cps:]])
-
-    # Pin first CP to current thrust so spline(0) == observed thrust
-    cps[0, 0] = float(lander_state.thrust[0])
-    cps[0, 1] = float(lander_state.thrust[1])
-    spline = _ThrustSplineImpl.from_control_points(cps, t_start=0.0, t_end=action_horizon)
-
-    # Capture guidance actions for post-inference clamping
-    _guidance = list(guidance_actions)
-
-    def thrust_fn(t: float) -> ThrustVec:
-        tv_val = spline(t)
-        v, h = float(np.clip(tv_val.v, -1, 1)), float(np.clip(tv_val.h, -1, 1))
-        for at in _guidance:
-            if abs(t - at.thrust_t) <= at.thrust_t_margin:
-                v = float(np.clip(v, at.thrust_v - at.thrust_v_margin,
-                                  at.thrust_v + at.thrust_v_margin))
-                h = float(np.clip(h, at.thrust_h - at.thrust_h_margin,
-                                  at.thrust_h + at.thrust_h_margin))
-        return (v, h)
-
-    return thrust_fn

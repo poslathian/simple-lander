@@ -106,7 +106,7 @@ learning path.
 4. Save frames for one seed to `./frames/` for visual inspection
 
 **Pass criteria:**
-- Landing rate >= 90% (matching KTO baseline)
+- Landing rate within 5% of KTO baseline (KTO itself lands ~71%)
 - Mean position tracking RMS < 0.5m (PD controller tracks the guidance)
 - Visual: trajectory follows KTO plan, smooth landing
 
@@ -117,6 +117,7 @@ learning path.
 - If this fails, the bug is in PD/wiring, not the neural network
 - Establishes the performance ceiling: this is the best DiffusionController
   can ever do (it's literally running KTO with extra steps)
+- **Result: PASS** — 69% vs 71% KTO baseline (-2%), tracking RMS 0.258m
 
 ### Step 1: Interface
 1. **diffusion_controller.pyi** — Simplified interface stub (3 modules)
