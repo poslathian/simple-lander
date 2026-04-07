@@ -118,8 +118,9 @@ def train(
         "x_std": x_std.numpy(),
         "epochs": epochs,
         "n_frames": len(dataset),
+        "final_loss": avg_loss,
     }, save_path)
-    print(f"\nSaved to {save_path} ({len(dataset)} frames, {epochs} epochs)")
+    print(f"\nSaved to {save_path} ({len(dataset)} frames, {epochs} epochs, loss={avg_loss:.6f})")
 
 
 if __name__ == "__main__":

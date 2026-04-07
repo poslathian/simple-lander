@@ -55,7 +55,7 @@ def collect(seed_start, margin_center):
         "--target-landed", str(LANDED_PER_BATCH),
         "--margin-center", str(margin_center),
         "--margin-sigma", "0.1",
-    ], timeout=600)
+    ], timeout=1800)
 
 
 def train(model_path, epochs):
@@ -65,7 +65,7 @@ def train(model_path, epochs):
         "--db", DB_PATH,
         "--epochs", str(epochs),
         "--save", model_path,
-    ], timeout=600)
+    ], timeout=3600)
 
 
 def evaluate(model_path):
@@ -73,10 +73,10 @@ def evaluate(model_path):
     output = run([
         PYTHON, "eval.py",
         "--model", model_path,
-        "--n-baseline", "20",
-        "--n-per-margin", "5",
+        "--n-baseline", "50",
+        "--n-per-margin", "50",
         "--seed-offset", str(EVAL_SEEDS),
-    ], timeout=1800)
+    ], timeout=7200)
 
     results = {}
     for line in output.strip().split("\n"):

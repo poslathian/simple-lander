@@ -730,7 +730,7 @@ class KTOController:
     Phase 2: Heuristic PD controller for final descent and landing.
     """
 
-    def __init__(self, env, time_budget=5.0, warmstart_budget=1.0):
+    def __init__(self, env, time_budget=2.5, warmstart_budget=0.5):
         import solver
 
         uw = env.unwrapped
@@ -944,7 +944,7 @@ if __name__ == "__main__":
             margin = float(np.clip(rng.normal(args.margin_center, args.margin_sigma), 0.01, 1.0))
 
             # Create KTO controller
-            kto_ctrl = KTOController(env, time_budget=5.0)
+            kto_ctrl = KTOController(env)
 
             # Grab terrain/obstacle info
             terrain_x = list(uw.chunk_x) if hasattr(uw, 'chunk_x') else None
@@ -1161,7 +1161,7 @@ if __name__ == "__main__":
         elif args.kto:
             import time as _time
             t0 = _time.monotonic()
-            kto_ctrl = KTOController(env, time_budget=5.0)
+            kto_ctrl = KTOController(env)
             print(f"  KTO solve: {_time.monotonic() - t0:.2f}s, "
                   f"{kto_ctrl.n_steps} steps planned")
 
