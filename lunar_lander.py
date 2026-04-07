@@ -919,11 +919,12 @@ if __name__ == "__main__":
 
         while not done:
             if guidance_ctrl is not None:
-                poll_keyboard()
-                if _kb["quit"]:
-                    env.close()
-                    exit()
-                kb_act = _kb["action"]
+                if render_mode == "human":
+                    poll_keyboard()
+                    if _kb["quit"]:
+                        env.close()
+                        exit()
+                kb_act = _kb["action"] if render_mode == "human" else None
                 at = guidance_ctrl.step(env, obs, keyboard_action=kb_act)
                 state = LanderState(
                     t_sim_lander=float(obs[8]),

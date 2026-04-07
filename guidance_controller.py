@@ -6,7 +6,7 @@ from lunar_lander import KTOController, DT
 from diffusion_controller import ActionTarget
 
 
-GUIDANCE_MARGIN = 0.001
+GUIDANCE_MARGIN = 0.1
 
 
 class GuidanceController:
