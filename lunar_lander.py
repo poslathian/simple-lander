@@ -310,10 +310,16 @@ class LunarLander(gym.Env, EzPickle):
         )
         self.lander.color1 = (128, 102, 230)
         self.lander.color2 = (77, 77, 128)
-        self.lander.linearVelocity = (
-            float(self.np_random.normal(0, 0.3)),
-            float(self.np_random.normal(0, 0.3)),
-        )
+        # initial_vx/vy are in observation space; convert to Box2D world units/s
+        if options is not None and "initial_vx" in options:
+            vx = float(options["initial_vx"]) * FPS / (VIEWPORT_W / SCALE / 2)
+        else:
+            vx = float(self.np_random.normal(0, 0.3))
+        if options is not None and "initial_vy" in options:
+            vy = float(options["initial_vy"]) * FPS / (VIEWPORT_H / SCALE / 2)
+        else:
+            vy = float(self.np_random.normal(0, 0.3))
+        self.lander.linearVelocity = (vx, vy)
         self.lander.angularVelocity = float(self.np_random.normal(0, 0.1))
 
         if self.enable_wind:
@@ -357,46 +363,55 @@ class LunarLander(gym.Env, EzPickle):
             leg.joint.motorEnabled = False  # disabled in flight, enabled on contact
             self.legs.append(leg)
 
-        self._create_obstacles()
+        self._create_obstacles(fixed_obstacles=options.get("fixed_obstacles") if options else None)
         self.drawlist = [self.lander] + self.legs + self.obstacles
 
         if self.render_mode == "human":
             self.render()
         return self._build_obs(), {}
 
-    def _create_obstacles(self):
-        """Create satellite obstacles as static Box2D bodies."""
+    def _create_obstacles(self, fixed_obstacles=None):
+        """Create satellite obstacles as static Box2D bodies.
+
+        fixed_obstacles: list of (x, y, r) in world coords, placed exactly.
+        """
         self.obstacles = []
         self.obstacle_radii = []
-        if self.num_obstacles == 0:
-            return
-
-        W = VIEWPORT_W / SCALE
-        H = VIEWPORT_H / SCALE
-        pad_cx = (self.helipad_x1 + self.helipad_x2) / 2
         BASE_BOUNDING_RADIUS = 0.75
 
         positions, scales = [], []
-        for _ in range(self.num_obstacles):
-            r = float(self.np_random.uniform(0.5, 2.0))
-            for _attempt in range(50):
-                x = self.np_random.uniform(1.0, W - 1.0)
-                obs_y_lo = self.helipad_y + 2.0
-                obs_y_hi = H - 2.0
-                shift = 0.20 * (obs_y_hi - obs_y_lo)
-                y = self.np_random.uniform(obs_y_lo + shift, obs_y_hi)
-                if (x - pad_cx) ** 2 + (y - self.helipad_y) ** 2 < 3.0 ** 2:
-                    continue
-                sep = 2.0 * BASE_BOUNDING_RADIUS * r + 1.0
-                too_close = any(
-                    (x - px) ** 2 + (y - py) ** 2 < (sep + BASE_BOUNDING_RADIUS * sr) ** 2
-                    for (px, py), sr in zip(positions, scales)
-                )
-                if too_close:
-                    continue
-                positions.append((x, y))
-                scales.append(r)
-                break
+
+        # Fixed obstacles (from options) placed first, exactly as specified
+        for (fx, fy, fr) in (fixed_obstacles or []):
+            positions.append((float(fx), float(fy)))
+            scales.append(float(fr))
+
+        # Random obstacles (--obstacles N)
+        if self.num_obstacles > 0:
+            W = VIEWPORT_W / SCALE
+            H = VIEWPORT_H / SCALE
+            pad_cx = (self.helipad_x1 + self.helipad_x2) / 2
+
+            for _ in range(self.num_obstacles):
+                r = float(self.np_random.uniform(0.5, 2.0))
+                for _attempt in range(50):
+                    x = self.np_random.uniform(1.0, W - 1.0)
+                    obs_y_lo = self.helipad_y + 2.0
+                    obs_y_hi = H - 2.0
+                    shift = 0.20 * (obs_y_hi - obs_y_lo)
+                    y = self.np_random.uniform(obs_y_lo + shift, obs_y_hi)
+                    if (x - pad_cx) ** 2 + (y - self.helipad_y) ** 2 < 3.0 ** 2:
+                        continue
+                    sep = 2.0 * BASE_BOUNDING_RADIUS * r + 1.0
+                    too_close = any(
+                        (x - px) ** 2 + (y - py) ** 2 < (sep + BASE_BOUNDING_RADIUS * sr) ** 2
+                        for (px, py), sr in zip(positions, scales)
+                    )
+                    if too_close:
+                        continue
+                    positions.append((x, y))
+                    scales.append(r)
+                    break
 
         obs_fix = dict(categoryBits=0x0002, maskBits=0x0030)
         for (ox, oy), r in zip(positions, scales):
@@ -740,7 +755,10 @@ class KTOController:
         import solver
 
         uw = env.unwrapped
-        # Zero initial velocity to match solver boundary conditions
+        # Save actual initial velocity, zero it for the solver (which plans
+        # from rest), then restore it so the episode starts correctly.
+        actual_vx, actual_vy = uw.lander.linearVelocity
+        actual_omega = uw.lander.angularVelocity
         uw.lander.linearVelocity = (0.0, 0.0)
         uw.lander.angularVelocity = 0.0
 
@@ -761,6 +779,10 @@ class KTOController:
             warmstart_budget=warmstart_budget,
             goal_velocity=np.array([0.0, -0.1, 0.0]),
         )
+
+        # Restore actual initial velocity now that the solve is complete
+        uw.lander.linearVelocity = (actual_vx, actual_vy)
+        uw.lander.angularVelocity = actual_omega
 
         self.plan_times = times
         self.plan = plan
@@ -849,6 +871,8 @@ if __name__ == "__main__":
                         help="Run without rendering")
     parser.add_argument("--diffusion", action="store_true",
                         help="Route actions through DiffusionController pipeline")
+    parser.add_argument("--no-guidance", action="store_true",
+                        help="Skip KTO solve when using --diffusion (run diffusion with no guidance actions)")
     parser.add_argument("--collect", action="store_true",
                         help="Collect KTO rollouts to DB for training")
     parser.add_argument("--db", type=str, default="rollouts.db",
@@ -861,6 +885,13 @@ if __name__ == "__main__":
                         help="Fixed spawn X in world units (0–30, helipad center ≈ 15)")
     parser.add_argument("--spawn-y", type=float, default=None,
                         help="Fixed spawn Y in world units (0–20, default spawn ≈ 17)")
+    parser.add_argument("--spawn-vx", type=float, default=None,
+                        help="Fixed initial horizontal velocity in observation units (obs bounds: ±10)")
+    parser.add_argument("--spawn-vy", type=float, default=None,
+                        help="Fixed initial vertical velocity in observation units (obs bounds: ±10)")
+    parser.add_argument("--obstacle", type=str, action="append", default=[],
+                        metavar="x,y,r",
+                        help="Place a fixed obstacle at world position x,y with scale r (repeatable)")
     args = parser.parse_args()
 
     if args.collect:
@@ -873,13 +904,27 @@ if __name__ == "__main__":
         render_mode = "human"
 
     # Build fixed spawn options (world coords) if requested
+    _fixed_obstacles = []
+    for obs_str in args.obstacle:
+        try:
+            ox, oy, or_ = [float(v) for v in obs_str.split(",")]
+            _fixed_obstacles.append((ox, oy, or_))
+        except ValueError:
+            parser.error(f"--obstacle must be x,y,r (got {obs_str!r})")
+
     _spawn_options = None
-    if args.spawn_x is not None or args.spawn_y is not None:
+    if any(v is not None for v in [args.spawn_x, args.spawn_y, args.spawn_vx, args.spawn_vy]) or _fixed_obstacles:
         _spawn_options = {}
         if args.spawn_x is not None:
             _spawn_options["initial_x"] = args.spawn_x
         if args.spawn_y is not None:
             _spawn_options["initial_y"] = args.spawn_y
+        if args.spawn_vx is not None:
+            _spawn_options["initial_vx"] = args.spawn_vx
+        if args.spawn_vy is not None:
+            _spawn_options["initial_vy"] = args.spawn_vy
+        if _fixed_obstacles:
+            _spawn_options["fixed_obstacles"] = _fixed_obstacles
 
     gym.register(
         id="LunarLander-simple",
@@ -1167,12 +1212,13 @@ if __name__ == "__main__":
             from diffusion_controller import (
                 DiffusionController, LanderState, ActionTarget,
             )
-            from guidance_controller import GuidanceController
-            import time as _time
-            t0 = _time.monotonic()
-            guidance_ctrl = GuidanceController(env, time_budget=5.0)
-            print(f"  KTO solve: {_time.monotonic() - t0:.2f}s, "
-                  f"{guidance_ctrl.kto.n_steps} steps planned")
+            if not args.no_guidance:
+                from guidance_controller import GuidanceController
+                import time as _time
+                t0 = _time.monotonic()
+                guidance_ctrl = GuidanceController(env, time_budget=5.0)
+                print(f"  KTO solve: {_time.monotonic() - t0:.2f}s, "
+                      f"{guidance_ctrl.kto.n_steps} steps planned")
         elif args.kto:
             import time as _time
             t0 = _time.monotonic()
@@ -1181,14 +1227,18 @@ if __name__ == "__main__":
                   f"{kto_ctrl.n_steps} steps planned")
 
         while not done:
-            if guidance_ctrl is not None:
+            if args.diffusion:
                 if render_mode == "human":
                     poll_keyboard()
                     if _kb["quit"]:
                         env.close()
                         exit()
                 kb_act = _kb["action"] if render_mode == "human" else None
-                at = guidance_ctrl.step(env, obs, keyboard_action=kb_act)
+                if guidance_ctrl is not None:
+                    at = guidance_ctrl.step(env, obs, keyboard_action=kb_act)
+                    guidance_actions = [at]
+                else:
+                    guidance_actions = []
                 state = LanderState(
                     t_sim_lander=float(obs[8]),
                     q=(float(obs[0]), float(obs[1]), float(obs[4])),
@@ -1201,10 +1251,10 @@ if __name__ == "__main__":
                     t_obs_cmd_latency=DT,
                     obstacles=[],
                     lander_state=state,
-                    waypoint_goals=[], # need to set a waypoint goal that matches the KTO target position and time, adjusted for the change in time reference - when in the future does KTO plannreach target? the margin should be set to the right value to include the entire landing pad. 
-                    guidance_actions=[at],
+                    waypoint_goals=[],
+                    guidance_actions=guidance_actions,
                     classifier_free_guidance=[],
-                    action_horizon=0.1, # this should be [1.5,3] clipped to how much longer is left in the KTO plan, this way we get denser knot coverage closer to goals. 
+                    action_horizon=0.1,
                     target_frequency=50.0,
                 )
                 tv, th = spline(DT)
