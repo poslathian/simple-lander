@@ -124,8 +124,9 @@ class DiffusionAction:
             control_points: (10, 3) from DiffusionModel.predict().
             action_horizon:  spline duration in seconds (default 1.5).
             guidance:        caller's suggested position at next step.
-            guidance_margin: [0, 1] blend factor.
-                             0 = pure diffusion, 1 = hard clamp to guidance.
+            guidance_margin: [0, 1] how far the model may deviate from guidance.
+                             0 = ignore model, track guidance exactly.
+                             1 = ignore guidance, trust model fully.
         """
         ...
 
@@ -169,7 +170,7 @@ def DiffusionController(
         obstacle:            Nearest collision geometry relative to obs (zeros for now).
         waypoint:            Target position/velocity error relative to obs.
         guidance:            Caller's suggested position at next step.
-        guidance_margin:     [0, 1] how tightly to follow guidance.
+        guidance_margin:     [0, 1] how far model may deviate from guidance (0=track guidance, 1=trust model).
         outcome:             Desired outcome for CFG (SUCCESS/FAIL/UNKNOWN).
         action_horizon:      Spline duration in seconds (default 1.5).
 

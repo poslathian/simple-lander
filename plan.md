@@ -70,9 +70,9 @@ ternary outcome. Output switches from thrust CPs to position CPs with PD trackin
 - Wraps DiffusionModel output into a closed-loop controller
 - Evaluates PositionSpline at current time to get reference (x, y, theta)
 - PD tracking controller converts position error to thrust commands
-- Enforces GuidanceMargin [0, 1]: blends diffusion output with guidance_q
-  - margin=0: pure diffusion (ignore guidance)
-  - margin=1: hard clamp to guidance suggestion
+- Enforces GuidanceMargin [0, 1]: how far model may deviate from guidance
+  - margin=0: ignore model, track guidance exactly
+  - margin=1: ignore guidance, trust model fully
 - Returns ThrustVec (v, h) each step
 
 ### DiffusionController
@@ -99,8 +99,8 @@ learning path.
    - Create a `KTOController` (the expert)
    - Each step: extract `q_now` from Box2D state, compute `q_prev` from last step
    - Build `GuidanceAction` from KTO's plan reference position at `t + dt`
-   - Call `DiffusionController` with `NoiseModel`, `guidance_margin=0.999`
-   - The tight margin means DiffusionAction should hard-clamp to KTO guidance
+   - Call `DiffusionController` with `NoiseModel`, `guidance_margin=0.001`
+   - Near-zero margin means DiffusionAction ignores the model, tracks KTO guidance
    - Record per-step tracking error: `|q_actual - q_ref|`
 3. Collect: landing rate, mean reward, per-episode position tracking RMS
 4. Save frames for one seed to `./frames/` for visual inspection
@@ -112,7 +112,7 @@ learning path.
 
 **Why this first:**
 - Validates DiffusionAction's PD controller works before any training
-- Validates guidance_margin clamp logic (margin ≈ 1 → pure KTO passthrough)
+- Validates guidance_margin clamp logic (margin ≈ 0 → pure KTO passthrough)
 - Proves the new interface wires into lunar_lander.py correctly
 - If this fails, the bug is in PD/wiring, not the neural network
 - Establishes the performance ceiling: this is the best DiffusionController
