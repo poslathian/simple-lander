@@ -73,10 +73,10 @@ def evaluate(model_path):
     output = run([
         PYTHON, "eval.py",
         "--model", model_path,
-        "--n-baseline", "50",
-        "--n-per-margin", "10",
+        "--n-baseline", "20",
+        "--n-per-margin", "5",
         "--seed-offset", str(EVAL_SEEDS),
-    ], timeout=600)
+    ], timeout=1800)
 
     results = {}
     for line in output.strip().split("\n"):
@@ -113,62 +113,85 @@ def main():
     print("=" * 60)
 
     all_results = []
+    round_idx = 0
+    MAX_ATTEMPTS_PER_MARGIN = 5  # max batches before forced advance
 
-    for round_idx, margin_center in enumerate(MARGIN_SCHEDULE):
-        model_path = f"model_round{round_idx:02d}.pt"
+    for margin_center in MARGIN_SCHEDULE:
+        attempt = 0
+        mastered = False
 
-        print(f"\n{'='*60}")
-        print(f"ROUND {round_idx}: margin_center={margin_center:.1f}")
-        print(f"{'='*60}")
+        while not mastered and attempt < MAX_ATTEMPTS_PER_MARGIN:
+            model_path = f"model_round{round_idx:02d}.pt"
 
-        # 1. Collect
-        print(f"\n--- Collecting {EPISODES_PER_BATCH} episodes ---")
-        seed_start = seed_counter
-        seed_counter += 200
-        collect(seed_start, margin_center)
+            print(f"\n{'='*60}")
+            print(f"ROUND {round_idx}: margin={margin_center:.1f} (attempt {attempt+1})")
+            print(f"{'='*60}")
 
-        from rollout_db import RolloutDB
-        db = RolloutDB(DB_PATH)
-        total = db.count()
-        summary = db.summary()
-        db.close()
-        print(f"Total episodes in DB: {total}")
-        for outcome, stats in summary.items():
-            print(f"  {outcome}: {stats['count']}")
+            # 1. Collect at this margin
+            print(f"\n--- Collecting {EPISODES_PER_BATCH} episodes (margin={margin_center:.1f}) ---")
+            seed_start = seed_counter
+            seed_counter += 200
+            collect(seed_start, margin_center)
 
-        # 2. Train on ALL accumulated data
-        print(f"\n--- Training ({EPOCHS_PER_ROUND} epochs on {total} episodes) ---")
-        train(model_path, EPOCHS_PER_ROUND)
+            from rollout_db import RolloutDB
+            db = RolloutDB(DB_PATH)
+            total = db.count()
+            summary = db.summary()
+            db.close()
+            print(f"Total episodes in DB: {total}")
+            for outcome, stats in summary.items():
+                print(f"  {outcome}: {stats['count']}")
 
-        # 3. Evaluate
-        print(f"\n--- Evaluating {model_path} ---")
-        results = evaluate(model_path)
-        all_results.append({"round": round_idx, "margin_center": margin_center, **results})
+            # 2. Train on ALL accumulated data
+            print(f"\n--- Training ({EPOCHS_PER_ROUND} epochs on {total} episodes) ---")
+            train(model_path, EPOCHS_PER_ROUND)
 
-        baseline = results.get(0.001, {}).get("land_rate", 0)
-        at_1_0 = results.get(1.0, {}).get("land_rate", 0)
-        at_center = results.get(round(margin_center, 1), {}).get("land_rate", 0)
+            # 3. Evaluate
+            print(f"\n--- Evaluating {model_path} ---")
+            results = evaluate(model_path)
+            all_results.append({"round": round_idx, "margin_center": margin_center,
+                                "attempt": attempt, **results})
 
-        print(f"\n--- Round {round_idx} Summary ---")
-        print(f"  Baseline (0.001): {baseline:.0%}")
-        print(f"  At center ({margin_center:.1f}): {at_center:.0%}")
-        print(f"  At 1.0: {at_1_0:.0%}")
+            baseline = results.get(0.001, {}).get("land_rate", 0)
+            at_1_0 = results.get(1.0, {}).get("land_rate", 0)
+            at_center = results.get(round(margin_center, 1), {}).get("land_rate", 0)
 
-        # Copy best model
-        shutil.copy(model_path, "model_latest.pt")
+            print(f"\n--- Round {round_idx} Summary ---")
+            print(f"  Baseline (0.001): {baseline:.0%}")
+            print(f"  At margin ({margin_center:.1f}): {at_center:.0%}")
+            print(f"  At 1.0: {at_1_0:.0%}")
 
-        # Check graduation
-        if at_1_0 > baseline and at_1_0 >= 0.5:
-            print(f"\n{'*'*60}")
-            print(f"GRADUATED! margin=1.0 ({at_1_0:.0%}) > baseline ({baseline:.0%})")
-            print(f"Model: {model_path}")
-            print(f"{'*'*60}")
-            shutil.copy(model_path, "model_graduated.pt")
+            shutil.copy(model_path, "model_latest.pt")
+
+            # Check if we've mastered this margin level
+            if at_center >= baseline and at_center > 0:
+                mastered = True
+                print(f"  MASTERED margin={margin_center:.1f} "
+                      f"({at_center:.0%} >= baseline {baseline:.0%})")
+            else:
+                print(f"  Not yet — margin={margin_center:.1f} at {at_center:.0%} "
+                      f"vs baseline {baseline:.0%}, adding more data...")
+
+            # Check full graduation
+            if at_1_0 > baseline and at_1_0 >= 0.5:
+                print(f"\n{'*'*60}")
+                print(f"GRADUATED! margin=1.0 ({at_1_0:.0%}) > baseline ({baseline:.0%})")
+                print(f"Model: {model_path}")
+                print(f"{'*'*60}")
+                shutil.copy(model_path, "model_graduated.pt")
+                mastered = "graduated"
+                break
+
+            round_idx += 1
+            attempt += 1
+
+        if mastered == "graduated":
             break
-        elif at_1_0 > 0:
-            print(f"  Progress! margin=1.0 is landing {at_1_0:.0%}")
-        else:
-            print(f"  margin=1.0 not landing yet, continuing...")
+
+        if not mastered:
+            print(f"  Forced advance past margin={margin_center:.1f} "
+                  f"after {MAX_ATTEMPTS_PER_MARGIN} attempts")
+        round_idx += 1
 
     # Final summary
     print(f"\n{'='*60}")
