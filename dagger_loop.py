@@ -502,8 +502,14 @@ class _LiveModel:
 
 def evaluate_model(env, model_wrapper, margins, n_seeds=30, seed_offset=20000):
     """Evaluate model at given margins. Returns {margin: (lands, total)}."""
-    results = {}
     seeds = list(range(seed_offset, seed_offset + n_seeds))
+    return evaluate_model_seeds(env, model_wrapper, margins, seeds)
+
+
+def evaluate_model_seeds(env, model_wrapper, margins, seeds):
+    """Evaluate model at given margins on explicit seed list. Returns {margin: (lands, total)}."""
+    results = {}
+    n_seeds = len(seeds)
 
     for margin in margins:
         lands = 0
@@ -586,6 +592,8 @@ def main():
     n_rounds = 10
     margin_increment = 0.05
     kto_baseline_margin = 0.001
+    # Fixed holdout seeds — same every round for apples-to-apples comparison
+    HOLDOUT_SEEDS = list(range(90000, 90050))
 
     print(f"\n{'='*60}")
     print(f"Starting {n_rounds} DAgger iterations")
@@ -631,13 +639,12 @@ def main():
         # Store in current
         store_episodes(current_db, episodes, all_frames, git_commit, candidate_margin)
 
-        # Step 5: Evaluate — landing % per margin level
-        print(f"\n  Step 5: Evaluation (new collection: {n_landed}/{n_total} = {new_rate:.0%})")
+        # Step 5: Evaluate on fixed holdout seeds — same every round
+        print(f"\n  Step 5: Holdout eval (collection: {n_landed}/{n_total} = {new_rate:.0%})")
         eval_margins = [0.001, margin_mean, candidate_margin]
         eval_margins = sorted(set(np.clip(eval_margins, 0.001, 1.0)))
-        eval_results = evaluate_model(
-            env, live_model, eval_margins,
-            n_seeds=30, seed_offset=30000 + round_idx * 100,
+        eval_results = evaluate_model_seeds(
+            env, live_model, eval_margins, HOLDOUT_SEEDS,
         )
 
         # Check baseline performance
@@ -703,7 +710,7 @@ def main():
         pass
     env = gym.make("LL-dagger-final", render_mode=None, continuous=True)
     final_margins = [0.001, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]
-    evaluate_model(env, final_model, final_margins, n_seeds=50, seed_offset=50000)
+    evaluate_model_seeds(env, final_model, final_margins, HOLDOUT_SEEDS)
     env.close()
 
     archive_db.close()

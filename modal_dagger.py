@@ -639,9 +639,8 @@ def collect_parallel(source_files, ckpt_bytes, n_landed, n_failed,
     return all_results
 
 
-def evaluate_parallel(source_files, ckpt_bytes, margins, n_seeds=50, seed_offset=30000):
-    """Evaluate model at multiple margins in parallel on Modal."""
-    seeds = list(range(seed_offset, seed_offset + n_seeds))
+def evaluate_parallel(source_files, ckpt_bytes, margins, seeds):
+    """Evaluate model at multiple margins in parallel on Modal using fixed seed list."""
 
     # Launch all margin evaluations concurrently via starmap
     map_args = [
@@ -695,6 +694,9 @@ def main():
     current_db = DaggerDB("current.db")
     archive_db.clear()
     current_db.clear()
+
+    # Fixed holdout seeds — same every round for apples-to-apples comparison
+    HOLDOUT_SEEDS = list(range(90000, 90000 + args.eval_seeds))
 
     margin_mean = 0.2
     seed_counter = 10000
@@ -786,12 +788,10 @@ def main():
             print(f"\n  Evaluation (collection: {n_landed}/{n_total} = {new_rate:.0%}):")
             eval_margins = sorted(set([0.001, margin_mean, candidate_margin]))
             eval_results = evaluate_parallel(
-                source_files, new_ckpt_bytes, eval_margins,
-                n_seeds=args.eval_seeds,
-                seed_offset=30000 + round_idx * 200,
+                source_files, new_ckpt_bytes, eval_margins, HOLDOUT_SEEDS,
             )
 
-            baseline_lands = eval_results.get(0.001, (0, args.eval_seeds))[0]
+            baseline_lands = eval_results.get(0.001, (0, len(HOLDOUT_SEEDS)))[0]
             candidate_key = min(eval_results.keys(),
                                 key=lambda m: abs(m - candidate_margin))
             candidate_lands = eval_results[candidate_key][0]
@@ -820,8 +820,7 @@ def main():
         final_ckpt = _checkpoint_bytes(ckpt_path)
         final_margins = [0.001, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]
         evaluate_parallel(
-            source_files, final_ckpt, final_margins,
-            n_seeds=100, seed_offset=50000,
+            source_files, final_ckpt, final_margins, HOLDOUT_SEEDS,
         )
 
     # Cleanup
