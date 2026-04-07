@@ -144,7 +144,7 @@ def _get_model():
 
     ckpt_path = os.environ.get("DIFFUSION_MODEL_PATH", "")
     if ckpt_path:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         norm_stats = {
             "x_mean": np.asarray(ckpt["x_mean"], dtype=np.float32),
