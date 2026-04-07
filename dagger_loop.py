@@ -411,10 +411,10 @@ class ArchiveDataset(Dataset):
 
 
 def train_on_archive(model, archive_db, epochs=500, batch_size=64, lr=1e-4,
-                     x_mean=None, x_std=None, T=100, print_interval=50):
+                     x_mean=None, x_std=None, T=100, print_interval=50,
+                     n_frames=500):
     """Train model for additional epochs on sampled archive frames."""
-    # Sample 500 frames: 80% landed, 20% failed
-    frame_rows = archive_db.sample_frames(500, landed_frac=0.8)
+    frame_rows = archive_db.sample_frames(n_frames, landed_frac=0.8)
     if len(frame_rows) < 10:
         print("  WARNING: Too few frames to train on")
         return x_mean, x_std
@@ -536,28 +536,60 @@ def main():
                         help="Round number offset for checkpoint naming")
     parser.add_argument("--seed-offset", type=int, default=10000,
                         help="Starting seed for collection")
+    # Training hyperparameters
+    parser.add_argument("--train-frames", type=int, default=500,
+                        help="Frames sampled from archive per round")
+    parser.add_argument("--train-epochs", type=int, default=500,
+                        help="Training epochs per round")
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    # Model size
+    parser.add_argument("--hidden", type=int, default=256,
+                        help="Hidden dim for DiffusionMLP")
+    parser.add_argument("--n-blocks", type=int, default=6,
+                        help="Number of residual blocks")
+    # Output isolation
+    parser.add_argument("--run-dir", default=".",
+                        help="Directory for DBs and checkpoints")
     args = parser.parse_args()
 
     git_commit = _git_commit()
     T = 100
 
+    # Create run directory for isolated output
+    os.makedirs(args.run_dir, exist_ok=True)
+
+    print(f"{'='*60}")
+    print(f"DAgger config: frames={args.train_frames} epochs={args.train_epochs} "
+          f"bs={args.batch_size} lr={args.lr}")
+    print(f"  model: hidden={args.hidden} blocks={args.n_blocks}")
+    print(f"  run_dir={args.run_dir}")
+    print(f"{'='*60}")
+
     # Register env
+    env_id = f"LL-dagger-{os.getpid()}"
     try:
         gym.register(
-            id="LL-dagger",
+            id=env_id,
             entry_point="lunar_lander:LunarLander",
             max_episode_steps=1000,
         )
     except Exception:
         pass
-    env = gym.make("LL-dagger", render_mode=None, continuous=True)
+    env = gym.make(env_id, render_mode=None, continuous=True)
 
     # Load existing model checkpoint
     checkpoint_path = args.checkpoint
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, weights_only=False)
-    model = DiffusionMLP()
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model = DiffusionMLP(hidden=args.hidden, n_blocks=args.n_blocks)
+    # Load state dict — handle size mismatch for fresh larger models
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as e:
+        print(f"  WARNING: state dict mismatch ({e}), initializing fresh model")
+        # Keep x_mean/x_std from checkpoint but train from scratch
+        pass
     model.eval()
     x_mean = torch.tensor(checkpoint["x_mean"], dtype=torch.float32)
     x_std = torch.tensor(checkpoint["x_std"], dtype=torch.float32)
@@ -569,8 +601,8 @@ def main():
     live_model = _LiveModel(model, x_mean, x_std, T=T)
 
     # Initialize DBs
-    archive_db = DaggerDB("archive.db")
-    current_db = DaggerDB("current.db")
+    archive_db = DaggerDB(os.path.join(args.run_dir, "archive.db"))
+    current_db = DaggerDB(os.path.join(args.run_dir, "current.db"))
 
     resuming = args.resume_margin is not None
     if not resuming:
@@ -631,14 +663,16 @@ def main():
         print(f"{'─'*60}")
         t_round = time.time()
 
-        # Step 1-2: Sample 500 frames from archive, relabel outcomes, train
-        print(f"\n  Step 1-3: Training on archive frames...")
+        # Step 1-2: Sample frames from archive, relabel outcomes, train
+        print(f"\n  Step 1-3: Training on {args.train_frames} archive frames, "
+              f"{args.train_epochs} epochs...")
         model.train()
         x_mean, x_std = train_on_archive(
             model, archive_db,
-            epochs=500, batch_size=64, lr=1e-4,
+            epochs=args.train_epochs, batch_size=args.batch_size, lr=args.lr,
             x_mean=x_mean, x_std=x_std, T=T,
-            print_interval=50,
+            print_interval=max(50, args.train_epochs // 10),
+            n_frames=args.train_frames,
         )
         model.eval()
         live_model = _LiveModel(model, x_mean, x_std, T=T)
@@ -699,16 +733,18 @@ def main():
         print(f"  Round {round_num} took {round_time:.0f}s")
 
         # Save checkpoint after each round
-        ckpt_path = f"dagger_round{round_num}.pt"
+        ckpt_path = os.path.join(args.run_dir, f"dagger_round{round_num}.pt")
         torch.save({
             "model_state_dict": model.state_dict(),
             "x_mean": x_mean.numpy(),
             "x_std": x_std.numpy(),
-            "epochs": checkpoint.get("epochs", 0) + (round_num) * 500,
+            "epochs": checkpoint.get("epochs", 0) + round_num * args.train_epochs,
             "n_frames": archive_db.count_frames(),
             "T": T,
             "margin_mean": margin_mean,
             "round": round_num,
+            "hidden": args.hidden,
+            "n_blocks": args.n_blocks,
         }, ckpt_path)
         print(f"  Saved checkpoint: {ckpt_path}")
 
@@ -725,15 +761,13 @@ def main():
     # Final eval sweep
     print(f"\n  Final evaluation sweep:")
     final_model = _LiveModel(model, x_mean, x_std, T=T)
+    env_final_id = f"LL-dagger-final-{os.getpid()}"
     try:
-        gym.register(
-            id="LL-dagger-final",
-            entry_point="lunar_lander:LunarLander",
-            max_episode_steps=1000,
-        )
+        gym.register(id=env_final_id, entry_point="lunar_lander:LunarLander",
+                     max_episode_steps=1000)
     except Exception:
         pass
-    env = gym.make("LL-dagger-final", render_mode=None, continuous=True)
+    env = gym.make(env_final_id, render_mode=None, continuous=True)
     final_margins = [0.001, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]
     evaluate_model_seeds(env, final_model, final_margins, HOLDOUT_SEEDS)
     env.close()
