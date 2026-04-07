@@ -31,7 +31,7 @@ image = (
 @app.function(
     image=image,
     gpu="T4",
-    timeout=1800,
+    timeout=7200,
 )
 def train_remote(
     model_py: bytes,
@@ -73,7 +73,7 @@ def train_remote(
         ],
         capture_output=True,
         text=True,
-        timeout=1500,
+        timeout=6000,
     )
 
     print(result.stdout)
