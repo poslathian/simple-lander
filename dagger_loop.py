@@ -526,6 +526,18 @@ def evaluate_model_seeds(env, model_wrapper, margins, seeds):
 # ── Main DAgger Loop ─────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", default="position_model.pt")
+    parser.add_argument("--rounds", type=int, default=10)
+    parser.add_argument("--resume-margin", type=float, default=None,
+                        help="Resume from this margin (skip initial collection, keep archive)")
+    parser.add_argument("--resume-round", type=int, default=0,
+                        help="Round number offset for checkpoint naming")
+    parser.add_argument("--seed-offset", type=int, default=10000,
+                        help="Starting seed for collection")
+    args = parser.parse_args()
+
     git_commit = _git_commit()
     T = 100
 
@@ -541,7 +553,7 @@ def main():
     env = gym.make("LL-dagger", render_mode=None, continuous=True)
 
     # Load existing model checkpoint
-    checkpoint_path = "position_model.pt"
+    checkpoint_path = args.checkpoint
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, weights_only=False)
     model = DiffusionMLP()
@@ -549,7 +561,9 @@ def main():
     model.eval()
     x_mean = torch.tensor(checkpoint["x_mean"], dtype=torch.float32)
     x_std = torch.tensor(checkpoint["x_std"], dtype=torch.float32)
-    print(f"  Loaded: {checkpoint['epochs']} epochs, {checkpoint['n_frames']} frames")
+    print(f"  Loaded: {checkpoint.get('epochs', '?')} epochs, "
+          f"{checkpoint.get('n_frames', '?')} frames, "
+          f"margin={checkpoint.get('margin_mean', '?')}")
 
     # Wrap for collection/evaluation
     live_model = _LiveModel(model, x_mean, x_std, T=T)
@@ -557,39 +571,48 @@ def main():
     # Initialize DBs
     archive_db = DaggerDB("archive.db")
     current_db = DaggerDB("current.db")
-    archive_db.clear()
-    current_db.clear()
-    print("Initialized ArchiveDB and CurrentDB (empty)")
+
+    resuming = args.resume_margin is not None
+    if not resuming:
+        archive_db.clear()
+        current_db.clear()
+        print("Initialized ArchiveDB and CurrentDB (empty)")
+    else:
+        current_db.clear()
+        print(f"RESUMING: keeping archive ({archive_db.count_episodes()} episodes, "
+              f"{archive_db.count_frames()} frames), clearing current")
 
     # ── Initial collection: 40 landed + 10 failed ────────────────────────
-    margin_mean = 0.2
-    print(f"\n{'='*60}")
-    print(f"INITIAL COLLECTION: margin_mean={margin_mean:.3f}")
-    print(f"{'='*60}")
+    margin_mean = args.resume_margin if resuming else 0.2
+    seed_counter = args.seed_offset
 
-    seed_counter = 10000
-    episodes, all_frames = collect_until(
-        env, live_model,
-        target_landed=40, target_failed=10,
-        margin_mean=margin_mean, seed_offset=seed_counter,
-    )
-    seed_counter += len(episodes) + 10
+    if not resuming:
+        print(f"\n{'='*60}")
+        print(f"INITIAL COLLECTION: margin_mean={margin_mean:.3f}")
+        print(f"{'='*60}")
 
-    # Validate landing rate
-    n_landed = sum(1 for e in episodes if e["landed"])
-    n_total = len(episodes)
-    landing_rate = n_landed / n_total if n_total > 0 else 0
-    print(f"  Collected {n_total} episodes: {n_landed} landed, {n_total - n_landed} failed")
-    print(f"  Landing rate: {landing_rate:.0%} (expected ~58%)")
+        episodes, all_frames = collect_until(
+            env, live_model,
+            target_landed=40, target_failed=10,
+            margin_mean=margin_mean, seed_offset=seed_counter,
+        )
+        seed_counter += len(episodes) + 10
 
-    # Store in current and archive
-    store_episodes(current_db, episodes, all_frames, git_commit, margin_mean)
-    archive_db.copy_from(current_db)
-    print(f"  Archive: {archive_db.count_episodes()} episodes, "
-          f"{archive_db.count_frames()} frames")
+        n_landed = sum(1 for e in episodes if e["landed"])
+        n_total = len(episodes)
+        landing_rate = n_landed / n_total if n_total > 0 else 0
+        print(f"  Collected {n_total} episodes: {n_landed} landed, {n_total - n_landed} failed")
+        print(f"  Landing rate: {landing_rate:.0%}")
+
+        store_episodes(current_db, episodes, all_frames, git_commit, margin_mean)
+        archive_db.copy_from(current_db)
+        print(f"  Archive: {archive_db.count_episodes()} episodes, "
+              f"{archive_db.count_frames()} frames")
+    else:
+        print(f"\n  Skipping initial collection (resuming at margin={margin_mean:.3f})")
 
     # ── DAgger iterations ────────────────────────────────────────────────
-    n_rounds = 10
+    n_rounds = args.rounds
     margin_increment = 0.05
     kto_baseline_margin = 0.001
     # Fixed holdout seeds — same every round for apples-to-apples comparison
@@ -599,9 +622,11 @@ def main():
     print(f"Starting {n_rounds} DAgger iterations")
     print(f"{'='*60}")
 
+    round_offset = args.resume_round
     for round_idx in range(n_rounds):
+        round_num = round_offset + round_idx + 1
         print(f"\n{'─'*60}")
-        print(f"ROUND {round_idx + 1}/{n_rounds}  |  margin_mean={margin_mean:.3f}  "
+        print(f"ROUND {round_num} (iter {round_idx+1}/{n_rounds})  |  margin_mean={margin_mean:.3f}  "
               f"|  archive={archive_db.count_frames()} frames")
         print(f"{'─'*60}")
         t_round = time.time()
@@ -671,19 +696,19 @@ def main():
         else:
             print(f"\n  No improvement. Staying at margin_mean={margin_mean:.3f}")
 
-        print(f"  Round {round_idx+1} took {round_time:.0f}s")
+        print(f"  Round {round_num} took {round_time:.0f}s")
 
         # Save checkpoint after each round
-        ckpt_path = f"dagger_round{round_idx+1}.pt"
+        ckpt_path = f"dagger_round{round_num}.pt"
         torch.save({
             "model_state_dict": model.state_dict(),
             "x_mean": x_mean.numpy(),
             "x_std": x_std.numpy(),
-            "epochs": checkpoint.get("epochs", 0) + (round_idx + 1) * 500,
+            "epochs": checkpoint.get("epochs", 0) + (round_num) * 500,
             "n_frames": archive_db.count_frames(),
             "T": T,
             "margin_mean": margin_mean,
-            "round": round_idx + 1,
+            "round": round_num,
         }, ckpt_path)
         print(f"  Saved checkpoint: {ckpt_path}")
 
