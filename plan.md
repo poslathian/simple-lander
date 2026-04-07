@@ -81,16 +81,60 @@ ternary outcome. Output switches from thrust CPs to position CPs with PD trackin
 
 ## Implementation Steps
 
+### Step 0: Smoke Test — Noise Model + Guidance Clamp (FIRST)
+
+Validate the DiffusionAction PD tracking + guidance margin pipeline end-to-end
+before building any neural network. This isolates the control path from the
+learning path.
+
+**What to build:**
+- `DiffusionAction` with PD tracking (reuse `solver._tracking_step` gains/logic)
+- `DiffusionController` wiring that accepts a `DiffusionModel`-like interface
+- `NoiseModel`: drop-in replacement for `DiffusionModel` that returns random CPs
+  (pure noise — the model output is irrelevant when guidance_margin ≈ 1)
+
+**Test script: `test_noise_baseline.py`**
+1. Register the LunarLander env, loop over 100 seeds
+2. For each seed:
+   - Create a `KTOController` (the expert)
+   - Each step: extract `q_now` from Box2D state, compute `q_prev` from last step
+   - Build `GuidanceAction` from KTO's plan reference position at `t + dt`
+   - Call `DiffusionController` with `NoiseModel`, `guidance_margin=0.999`
+   - The tight margin means DiffusionAction should hard-clamp to KTO guidance
+   - Record per-step tracking error: `|q_actual - q_ref|`
+3. Collect: landing rate, mean reward, per-episode position tracking RMS
+4. Save frames for one seed to `./frames/` for visual inspection
+
+**Pass criteria:**
+- Landing rate >= 90% (matching KTO baseline)
+- Mean position tracking RMS < 0.5m (PD controller tracks the guidance)
+- Visual: trajectory follows KTO plan, smooth landing
+
+**Why this first:**
+- Validates DiffusionAction's PD controller works before any training
+- Validates guidance_margin clamp logic (margin ≈ 1 → pure KTO passthrough)
+- Proves the new interface wires into lunar_lander.py correctly
+- If this fails, the bug is in PD/wiring, not the neural network
+- Establishes the performance ceiling: this is the best DiffusionController
+  can ever do (it's literally running KTO with extra steps)
+
+### Step 1: Interface
 1. **diffusion_controller.pyi** — Simplified interface stub (3 modules)
+
+### Step 2: Implementation
 2. **diffusion_controller.py** — Rewrite implementation:
    - `_build_cond` produces 21-dim vector
    - `DiffusionModel` class wrapping MLP + DDIM
    - `DiffusionAction` class with PD tracking + guidance margin
    - `DiffusionController` function wiring it together
+
+### Step 3: Model
 3. **model.py** — Update dimensions:
    - `COND_DIM = 21`, `STATE_DIM = 20`, `CFG_DIM = 1`
    - `X_DIM = 30` (10 CPs x 3, not 15 CPs x 2)
    - Can try hidden=256 first given 21-dim conditioning
+
+### Step 4: Training + Eval
 4. **train.py** — Update dataset to produce 21-dim cond vectors
 5. **eval.py** — Update to use new interface
 6. **guidance_controller.py** — Simplify: outputs position guidance, not thrust
