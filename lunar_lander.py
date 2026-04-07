@@ -285,8 +285,14 @@ class LunarLander(gym.Env, EzPickle):
         self.moon.color2 = (0, 0, 0)
 
         # Lander — uniform across full display width, near top
-        initial_x = float(self.np_random.uniform(1.0, W - 1.0))
-        initial_y = float(np.clip(H * 0.85 + self.np_random.normal(0, 0.3), H * 0.6, H - 0.5))
+        if options is not None and "initial_x" in options:
+            initial_x = float(options["initial_x"])
+        else:
+            initial_x = float(self.np_random.uniform(1.0, W - 1.0))
+        if options is not None and "initial_y" in options:
+            initial_y = float(options["initial_y"])
+        else:
+            initial_y = float(np.clip(H * 0.85 + self.np_random.normal(0, 0.3), H * 0.6, H - 0.5))
 
         self.lander = self.world.CreateDynamicBody(
             position=(initial_x, initial_y),
@@ -851,6 +857,10 @@ if __name__ == "__main__":
                         help="Min landed episodes for --collect")
     parser.add_argument("--target-total", type=int, default=100,
                         help="Total episodes to store for --collect")
+    parser.add_argument("--spawn-x", type=float, default=None,
+                        help="Fixed spawn X in world units (0–30, helipad center ≈ 15)")
+    parser.add_argument("--spawn-y", type=float, default=None,
+                        help="Fixed spawn Y in world units (0–20, default spawn ≈ 17)")
     args = parser.parse_args()
 
     if args.collect:
@@ -861,6 +871,15 @@ if __name__ == "__main__":
         render_mode = "rgb_array"
     else:
         render_mode = "human"
+
+    # Build fixed spawn options (world coords) if requested
+    _spawn_options = None
+    if args.spawn_x is not None or args.spawn_y is not None:
+        _spawn_options = {}
+        if args.spawn_x is not None:
+            _spawn_options["initial_x"] = args.spawn_x
+        if args.spawn_y is not None:
+            _spawn_options["initial_y"] = args.spawn_y
 
     gym.register(
         id="LunarLander-simple",
@@ -929,7 +948,7 @@ if __name__ == "__main__":
             seed = args.seed + seed_idx
             seed_idx += 1
 
-            obs, _ = env.reset(seed=seed)
+            obs, _ = env.reset(seed=seed, options=_spawn_options)
             uw = env.unwrapped
 
             # Zero initial velocity for KTO
@@ -1138,7 +1157,7 @@ if __name__ == "__main__":
 
     episode = 0
     while args.episodes == 0 or episode < args.episodes:
-        obs, _ = env.reset(seed=args.seed + episode)
+        obs, _ = env.reset(seed=args.seed + episode, options=_spawn_options)
         total_reward, done, steps = 0.0, False, 0
         frame_idx = 0
 

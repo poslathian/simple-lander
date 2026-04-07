@@ -1,0 +1,10 @@
+services:
+  lander:
+    build: .
+    # Forward the pygame window to the host X server.
+    # On Windows: install VcXsrv, run it with "Disable access control" checked,
+    # then: set DISPLAY=host.docker.internal:0.0 in your shell before compose up.
+    environment:
+      - DISPLAY=${DISPLAY:-host.docker.internal:0.0}
+      - SDL_VIDEODRIVER=x11
+      - SDL_AUDIODRIVER=

@@ -1,0 +1,9 @@
+.git/
+.claude/
+.venv/
+__pycache__/
+*.pyc
+*.pyi
+tmp/
+.DS_Store
+*.db
