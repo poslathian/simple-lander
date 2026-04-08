@@ -262,10 +262,11 @@ class TestFirstCPPinning:
         }
 
         cps = _fit_kto_window(plan, idx=0, action_horizon=1.5)
-        # First CP should be at origin (relative coords)
-        assert np.allclose(cps[0], [0, 0, 0], atol=0.01), (
-            f"First CP should be ~[0,0,0], got {cps[0]}"
-        )
+        # x,y first CP should be zero (relative origin)
+        assert abs(cps[0, 0]) < 0.01, f"x first CP should be ~0, got {cps[0, 0]}"
+        assert abs(cps[0, 1]) < 0.01, f"y first CP should be ~0, got {cps[0, 1]}"
+        # theta first CP = world theta at idx=0 / π = 0.0 / π = 0.0 (for this plan)
+        assert abs(cps[0, 2]) < 0.01, f"theta first CP should be ~0 for zero-theta plan, got {cps[0, 2]}"
 
     def test_inference_pins_first_cp(self):
         """Inference always sets cps[0] = [0,0,0] after model.predict()."""
@@ -287,11 +288,15 @@ class TestFirstCPPinning:
         ctrl.warm_start(time_budget=5.0)
         ctrl.inference()
 
-        # Check that first CP was pinned to zero
+        # Check that x,y pinned to zero, theta pinned to current world angle
         if ctrl._diff_splines is not None:
             first_cp = [float(ctrl._diff_splines[ch].c[0]) for ch in range(N_CHANNELS)]
-            assert all(abs(v) < 1e-6 for v in first_cp), (
-                f"First CP should be pinned to [0,0,0], got {first_cp}"
+            assert abs(first_cp[0]) < 1e-6, f"x should be pinned to 0, got {first_cp[0]}"
+            assert abs(first_cp[1]) < 1e-6, f"y should be pinned to 0, got {first_cp[1]}"
+            # theta should be world angle (small but nonzero for seed=42)
+            world_theta = uw.lander.angle
+            assert abs(first_cp[2] - world_theta) < 1e-4, (
+                f"theta should be world angle {world_theta:.4f}, got {first_cp[2]:.4f}"
             )
         env.close()
 

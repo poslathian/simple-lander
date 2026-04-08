@@ -29,12 +29,11 @@ X_DIM = N_CPS * N_CHANNELS  # 30
 DEGREE = 3  # cubic B-spline
 
 # ── Normalization: world → uniform metric per channel ───────────────────
-# x and y share the same scale (30.0 = screen width) so 1 normalized unit
-# = 30 world units in both axes. The screen is 30x20, so x∈[0,1], y∈[0,⅔].
-# Theta is unnormalized (radians) — model can rotate freely at margin=1.0.
-# Margin = fraction of screen width (0.5 = ±15 world units in x AND y).
+# x,y: shared scale (30.0 = screen width). 1 normalized unit = 30 world units.
+# theta: world radians, scaled by π. 1 normalized unit = π radians.
+# At margin=1.0: x,y can deviate ±30 world units (full screen), theta ±π (full rotation).
 SCREEN_SIDE = 30.0  # world units — shared metric for x and y
-NORM_SCALES = np.array([SCREEN_SIDE, SCREEN_SIDE, 1.0], dtype=np.float64)
+NORM_SCALES = np.array([SCREEN_SIDE, SCREEN_SIDE, math.pi], dtype=np.float64)
 
 # ── Coordinate types ──────────────────────────────────────────────────────
 
@@ -240,10 +239,12 @@ class KTODiffusionController:
         )
 
         cps_norm = self.model.predict(cond, self.outcome, guidance_scale=2.0)
-        cps_norm[0] = [0.0, 0.0, 0.0]  # Pin first CP to origin
+        cps_norm[0, :2] = 0.0                    # x,y: pin to relative origin
+        cps_norm[0, 2] = q_now[2] / math.pi      # theta: pin to current world angle
         self._last_cps_norm = cps_norm.copy()
 
-        # Denormalize to world-relative for spline building
+        # Denormalize to world units for spline building
+        # x,y: relative world units. theta: world radians.
         cps_world = cps_norm * NORM_SCALES
         self._diff_splines = _make_position_spline(cps_world, self.action_horizon)
         self._diff_t0 = t_sim
@@ -285,9 +286,9 @@ class KTODiffusionController:
             t_diff = t_sim - self._diff_t0
             diff_rel = _eval_spline(self._diff_splines, t_diff, self.action_horizon)
             diff_world = np.array([
-                self._diff_q_origin[0] + diff_rel[0],
-                self._diff_q_origin[1] + diff_rel[1],
-                self._diff_q_origin[2] + diff_rel[2],
+                self._diff_q_origin[0] + diff_rel[0],   # x: relative → world
+                self._diff_q_origin[1] + diff_rel[1],   # y: relative → world
+                diff_rel[2],                              # theta: already world radians
             ])
             # Normalize to [0,1] screen coords, clamp, denormalize
             kto_n = np.array(kto_q) / NORM_SCALES

@@ -179,10 +179,9 @@ def _fit_kto_window(plan, idx, action_horizon, dt=DT):
     t = np.linspace(0, (n - 1) * dt, n)
     x0 = float(plan["x"][idx])
     y0 = float(plan["y"][idx])
-    th0 = float(plan["theta"][idx])
     x_rel = np.array(plan["x"][idx:end_idx], dtype=np.float64) - x0
     y_rel = np.array(plan["y"][idx:end_idx], dtype=np.float64) - y0
-    th_rel = np.array(plan["theta"][idx:end_idx], dtype=np.float64) - th0
+    th_world = np.array(plan["theta"][idx:end_idx], dtype=np.float64)  # world radians
 
     if len(t) < N_CPS:
         return np.zeros((N_CPS, N_CHANNELS), dtype=np.float64)
@@ -200,7 +199,7 @@ def _fit_kto_window(plan, idx, action_horizon, dt=DT):
     ])
 
     cps = np.zeros((N_CPS, N_CHANNELS), dtype=np.float64)
-    for ch, vals in enumerate([x_rel, y_rel, th_rel]):
+    for ch, vals in enumerate([x_rel, y_rel, th_world]):
         try:
             spline = make_lsq_spline(t, vals, knots, k=DEGREE)
             cps[:, ch] = spline.c[:N_CPS]
