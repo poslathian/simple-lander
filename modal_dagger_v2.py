@@ -155,26 +155,33 @@ def _get_rollout_functions():
     return rollout_app, solve_kto_batch, rollout_with_cache
 
 
-def collect_with_cache(source_files, ckpt_bytes, n_landed, n_failed,
-                       margin_mean, seed_offset, hidden, n_blocks,
-                       _solve_fn=None, _rollout_fn=None):
-    """Two-phase collection: parallel KTO solve -> parallel cached rollouts."""
-    est_total = int((n_landed + n_failed) / 0.50) + 40
-    seeds = list(range(seed_offset, seed_offset + est_total))
-
-    print(f"    KTO solve ({len(seeds)} seeds)...", end="", flush=True)
+def presolve_kto_pool(source_files, seeds, _solve_fn):
+    """Pre-solve KTO plans for a pool of seeds. Returns {seed: plan_data}."""
+    print(f"  Pre-solving KTO plans for {len(seeds)} seeds...", end="", flush=True)
     t0 = time.time()
-    kto_batches = [seeds[i:i+20] for i in range(0, len(seeds), 20)]
-    all_plans = {}
+    batches = [seeds[i:i+20] for i in range(0, len(seeds), 20)]
+    pool = {}
     for batch_result in _solve_fn.starmap(
-        [(source_files, batch) for batch in kto_batches]
+        [(source_files, batch) for batch in batches]
     ):
-        all_plans.update(batch_result)
+        pool.update(batch_result)
     print(f" {time.time()-t0:.0f}s")
+    return pool
 
-    print(f"    Rollouts...", end="", flush=True)
-    t1 = time.time()
-    seed_plan_pairs = [(s, all_plans[s]) for s in seeds if s in all_plans]
+
+def collect_from_pool(ckpt_bytes, plan_pool, n_landed, n_failed,
+                      margin_mean, hidden, n_blocks, source_files,
+                      _rollout_fn=None):
+    """Collect episodes using pre-solved KTO plan pool. No KTO solve needed."""
+    # Pick random seeds from pool
+    available = list(plan_pool.keys())
+    np.random.shuffle(available)
+    est_needed = int((n_landed + n_failed) / 0.50) + 40
+    seeds = available[:min(est_needed, len(available))]
+
+    print(f"    Rollouts ({len(seeds)} seeds from pool)...", end="", flush=True)
+    t0 = time.time()
+    seed_plan_pairs = [(s, plan_pool[s]) for s in seeds]
     rollout_batches = [seed_plan_pairs[i:i+10]
                        for i in range(0, len(seed_plan_pairs), 10)]
 
@@ -194,23 +201,16 @@ def collect_with_cache(source_files, ckpt_bytes, n_landed, n_failed,
         if landed >= n_landed and failed >= n_failed:
             break
 
-    print(f" {time.time()-t1:.0f}s  ({landed} landed, {failed} failed)")
+    print(f" {time.time()-t0:.0f}s  ({landed} landed, {failed} failed)")
     return all_results
 
 
-def evaluate_with_cache(source_files, ckpt_bytes, margins, holdout_seeds,
-                        hidden, n_blocks, _solve_fn=None, _rollout_fn=None):
-    """Evaluate at multiple margins using cached KTO plans."""
-    kto_batches = [holdout_seeds[i:i+20] for i in range(0, len(holdout_seeds), 20)]
-    all_plans = {}
-    for batch_result in _solve_fn.starmap(
-        [(source_files, batch) for batch in kto_batches]
-    ):
-        all_plans.update(batch_result)
+def evaluate_from_pool(ckpt_bytes, plan_pool, margins, holdout_seeds,
+                       hidden, n_blocks, source_files, _rollout_fn=None):
+    """Evaluate at multiple margins using pre-solved plans."""
+    seed_plan_pairs = [(s, plan_pool[s]) for s in holdout_seeds if s in plan_pool]
 
     results = {}
-    seed_plan_pairs = [(s, all_plans[s]) for s in holdout_seeds if s in all_plans]
-
     for batch_result in _rollout_fn.starmap([
         (source_files, ckpt_bytes, pickle.dumps(seed_plan_pairs), m, 1, hidden, n_blocks)
         for m in margins
@@ -283,8 +283,16 @@ def main():
         current_db.clear()
         print(f"  Fresh start from {ckpt_path}")
 
-    seed_counter = args.seed_offset
     margin_increment = 0.05
+    POOL_SIZE = 5000
+    pool_seeds = list(range(args.seed_offset, args.seed_offset + POOL_SIZE))
+
+    # Pre-solve KTO plans for entire seed pool + holdout seeds (one-time cost)
+    rollout_app, solve_fn, rollout_fn = _get_rollout_functions()
+    print(f"\n  Pre-solving KTO pool ({POOL_SIZE} + {len(HOLDOUT_SEEDS)} holdout)...")
+    with rollout_app.run():
+        plan_pool = presolve_kto_pool(source_files, pool_seeds + HOLDOUT_SEEDS, solve_fn)
+    print(f"  Pool: {len(plan_pool)} plans cached")
 
     # Initial collection (skip if resuming)
     if not resuming:
@@ -295,16 +303,14 @@ def main():
         with open(ckpt_path, "rb") as f:
             ckpt_bytes = f.read()
 
-        rollout_app, solve_fn, rollout_fn = _get_rollout_functions()
         with rollout_app.run():
-            results = collect_with_cache(
-                source_files, ckpt_bytes,
+            results = collect_from_pool(
+                ckpt_bytes, plan_pool,
                 n_landed=args.target_landed, n_failed=args.target_failed,
-                margin_mean=margin_mean, seed_offset=seed_counter,
+                margin_mean=margin_mean,
                 hidden=args.hidden, n_blocks=args.n_blocks,
-                _solve_fn=solve_fn, _rollout_fn=rollout_fn,
+                source_files=source_files, _rollout_fn=rollout_fn,
             )
-        seed_counter += len(results) + 50
 
         current_db.store_remote_results(results, git_commit)
         archive_db.copy_from(current_db)
@@ -336,9 +342,8 @@ def main():
         )
         print(f"  Got {len(frame_data)} frames")
 
-        # Step 3: GPU training via subprocess (avoids Modal app entanglement)
+        # Step 3: GPU training via subprocess
         print(f"\n  Training {args.train_epochs} epochs on GPU...")
-        # Write frame data to temp file for the subprocess
         frame_tmp = os.path.join(args.run_dir, "_train_frames.pkl")
         with open(frame_tmp, "wb") as f:
             pickle.dump(frame_data, f)
@@ -368,38 +373,35 @@ def main():
         ckpt_path = new_ckpt_path
         with open(ckpt_path, "rb") as f:
             new_ckpt_bytes = f.read()
-        # Cleanup temp
         os.unlink(frame_tmp)
         print(f"  Saved: {ckpt_path}")
 
-        # Step 4-5: Collect + eval (rollout app — has drake/Box2D)
+        # Step 4-5: Collect + eval from cached pool (no KTO solve!)
         candidate_margin = np.clip(margin_mean + margin_increment, 0.001, 1.0)
         print(f"\n  Collecting at candidate margin={candidate_margin:.3f}...")
         current_db.clear()
 
-        rollout_app, solve_fn, rollout_fn = _get_rollout_functions()
         with rollout_app.run():
-            new_results = collect_with_cache(
-                source_files, new_ckpt_bytes,
+            new_results = collect_from_pool(
+                new_ckpt_bytes, plan_pool,
                 n_landed=args.target_landed, n_failed=args.target_failed,
-                margin_mean=candidate_margin, seed_offset=seed_counter,
+                margin_mean=candidate_margin,
                 hidden=args.hidden, n_blocks=args.n_blocks,
-                _solve_fn=solve_fn, _rollout_fn=rollout_fn,
+                source_files=source_files, _rollout_fn=rollout_fn,
             )
-            seed_counter += len(new_results) + 50
 
             current_db.store_remote_results(new_results, git_commit)
             n_landed = sum(1 for r in new_results if r["landed"])
             n_total = len(new_results)
             new_rate = n_landed / n_total if n_total else 0
 
-            # Step 5: Holdout eval
+            # Holdout eval
             print(f"\n  Holdout eval (collection: {n_landed}/{n_total} = {new_rate:.0%}):")
             eval_margins = sorted(set([0.001, margin_mean, candidate_margin]))
-            eval_results = evaluate_with_cache(
-                source_files, new_ckpt_bytes, eval_margins, HOLDOUT_SEEDS,
+            eval_results = evaluate_from_pool(
+                new_ckpt_bytes, plan_pool, eval_margins, HOLDOUT_SEEDS,
                 hidden=args.hidden, n_blocks=args.n_blocks,
-                _solve_fn=solve_fn, _rollout_fn=rollout_fn,
+                source_files=source_files, _rollout_fn=rollout_fn,
             )
 
         baseline_lands = eval_results.get(0.001, (0, 50))[0]
@@ -412,13 +414,16 @@ def main():
         print(f"\n  Archive: {archive_db.count_episodes()} eps, "
               f"{archive_db.count_frames()} frames")
 
-        # Step 7-8: Decide margin
-        improved = new_rate >= 0.5 and candidate_lands >= baseline_lands
+        # Step 7-8: Advance if collection >= 50% AND candidate >= 70% of baseline
+        baseline_threshold = int(baseline_lands * 0.70)
+        improved = new_rate >= 0.5 and candidate_lands >= baseline_threshold
         if improved:
             margin_mean = candidate_margin
-            print(f"  IMPROVED! margin → {margin_mean:.3f}")
+            print(f"  IMPROVED! margin → {margin_mean:.3f} "
+                  f"(candidate {candidate_lands} >= 70% of baseline {baseline_lands})")
         else:
-            print(f"  No improvement. margin stays at {margin_mean:.3f}")
+            print(f"  No improvement. margin stays at {margin_mean:.3f} "
+                  f"(candidate {candidate_lands} vs 70%×baseline={baseline_threshold})")
 
         elapsed = time.time() - t_round
         print(f"  Round took {elapsed:.0f}s")
@@ -429,14 +434,13 @@ def main():
     print(f"{'='*60}")
     with open(ckpt_path, "rb") as f:
         final_bytes = f.read()
-    rollout_app, solve_fn, rollout_fn = _get_rollout_functions()
     with rollout_app.run():
-        evaluate_with_cache(
-            source_files, final_bytes,
+        evaluate_from_pool(
+            final_bytes, plan_pool,
             [0.001, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0],
             HOLDOUT_SEEDS,
             hidden=args.hidden, n_blocks=args.n_blocks,
-            _solve_fn=solve_fn, _rollout_fn=rollout_fn,
+            source_files=source_files, _rollout_fn=rollout_fn,
         )
 
     archive_db.close()
