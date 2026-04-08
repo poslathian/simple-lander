@@ -155,17 +155,22 @@ def _get_rollout_functions():
     return rollout_app, solve_kto_batch, rollout_with_cache
 
 
-def presolve_kto_pool(source_files, seeds, _solve_fn):
-    """Pre-solve KTO plans for a pool of seeds. Returns {seed: plan_data}."""
-    print(f"  Pre-solving KTO plans for {len(seeds)} seeds...", end="", flush=True)
+def presolve_kto_pool(source_files, seeds, _solve_fn, _rollout_app, chunk_size=100):
+    """Pre-solve KTO plans in chunks to avoid Modal heartbeat timeout."""
+    print(f"  Pre-solving KTO plans for {len(seeds)} seeds...", flush=True)
     t0 = time.time()
-    batches = [seeds[i:i+20] for i in range(0, len(seeds), 20)]
     pool = {}
-    for batch_result in _solve_fn.starmap(
-        [(source_files, batch) for batch in batches]
-    ):
-        pool.update(batch_result)
-    print(f" {time.time()-t0:.0f}s")
+    chunks = [seeds[i:i+chunk_size] for i in range(0, len(seeds), chunk_size)]
+    for ci, chunk in enumerate(chunks):
+        batches = [chunk[i:i+20] for i in range(0, len(chunk), 20)]
+        with _rollout_app.run():
+            for batch_result in _solve_fn.starmap(
+                [(source_files, batch) for batch in batches]
+            ):
+                pool.update(batch_result)
+        print(f"    chunk {ci+1}/{len(chunks)}: {len(pool)} plans ({time.time()-t0:.0f}s)",
+              flush=True)
+    print(f"  Pool complete: {len(pool)} plans in {time.time()-t0:.0f}s")
     return pool
 
 
@@ -284,14 +289,15 @@ def main():
         print(f"  Fresh start from {ckpt_path}")
 
     margin_increment = 0.05
-    POOL_SIZE = 5000
+    POOL_SIZE = 500
     pool_seeds = list(range(args.seed_offset, args.seed_offset + POOL_SIZE))
 
     # Pre-solve KTO plans for entire seed pool + holdout seeds (one-time cost)
     rollout_app, solve_fn, rollout_fn = _get_rollout_functions()
     print(f"\n  Pre-solving KTO pool ({POOL_SIZE} + {len(HOLDOUT_SEEDS)} holdout)...")
-    with rollout_app.run():
-        plan_pool = presolve_kto_pool(source_files, pool_seeds + HOLDOUT_SEEDS, solve_fn)
+    plan_pool = presolve_kto_pool(
+        source_files, pool_seeds + HOLDOUT_SEEDS, solve_fn, rollout_app,
+    )
     print(f"  Pool: {len(plan_pool)} plans cached")
 
     # Initial collection (skip if resuming)
