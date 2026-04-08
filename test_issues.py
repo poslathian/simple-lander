@@ -394,24 +394,39 @@ class TestMarginBlending:
         env.close()
 
     def test_margin_affects_output(self):
-        """Different margins should produce different actions (unless diffusion
-        spline happens to match KTO exactly, which is astronomically unlikely)."""
+        """Larger margin should allow more diffusion influence. With a model
+        that outputs far from KTO, a large margin clamp should differ from
+        a tiny one."""
+
+        class LargeOffsetModel:
+            """Returns CPs far from any KTO reference."""
+            def predict(self, cond, outcome, guidance_scale=2.0):
+                cps = np.ones((N_CPS, N_CHANNELS)) * 5.0
+                cps[0] = [0, 0, 0]
+                return cps
+
         env = _make_env(seed=42)
         uw = env.unwrapped
         uw.lander.linearVelocity = (0.0, 0.0)
         uw.lander.angularVelocity = 0.0
 
         ctrl = KTODiffusionController(
-            env, model=NoiseModel(), target_frequency=3.0,
+            env, model=LargeOffsetModel(), target_frequency=3.0,
             action_horizon=1.5, outcome=Outcome.SUCCESS,
         )
         ctrl.warm_start(time_budget=5.0)
         ctrl.inference()
 
-        a_low = ctrl.get_action(guidance_margin=0.001)
-        a_high = ctrl.get_action(guidance_margin=0.9)
+        # Advance a few steps so diffusion spline is evaluated past t=0
+        # (at t=0 the spline value is origin, matching KTO trivially)
+        for _ in range(5):
+            tv, th = ctrl.get_action(guidance_margin=0.001)
+            env.step(np.array([tv, th], dtype=np.float32))
 
-        # They should differ (noise model produces random CPs, not matching KTO)
+        a_low = ctrl.get_action(guidance_margin=0.001)
+        a_high = ctrl.get_action(guidance_margin=5.0)
+
+        # Large offset model + large margin should differ from tiny margin
         assert a_low != a_high, (
             f"Margin should affect output: low={a_low}, high={a_high}"
         )

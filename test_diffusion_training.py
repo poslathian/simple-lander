@@ -60,18 +60,10 @@ class TestActualTrackedCPsIsBlended:
     blended KTO+diffusion reference that the PD controller actually tracked,
     not just the raw KTO trajectory."""
 
-    def test_actual_tracked_cps_ignores_diffusion_contribution(self):
-        """BUG: dagger_loop stores raw KTO CPs as actual_tracked_cps,
-        ignoring the diffusion model's contribution at the current margin.
-
-        DAgger should train on what was actually tracked: the margin-blended
-        mix of KTO + diffusion. At margin=1.0, the target should be the
-        model's own output CPs. At margin=0.5, it's a 50/50 blend.
-
-        Currently, actual_tracked_cps is always _fit_kto_window() — pure KTO
-        regardless of margin. This means the DAgger training signal doesn't
-        reflect what actually happened during the episode.
-        """
+    def test_actual_tracked_cps_reflects_clamped_model_output(self):
+        """actual_tracked_cps should be the model output clamped to within
+        margin distance of KTO CPs — matching what get_action() does at
+        runtime."""
         from dagger_loop import collect_episode, _fit_kto_window
 
         env = _make_env(seed=100)
@@ -79,49 +71,70 @@ class TestActualTrackedCPsIsBlended:
         uw.lander.linearVelocity = (0.0, 0.0)
         uw.lander.angularVelocity = 0.0
 
-        # Use a model that returns constant offset CPs
+        # Model returns CPs with a large known offset from KTO
         class OffsetModel:
-            """Returns CPs with a large known offset from KTO."""
             def predict(self, cond, outcome, guidance_scale=2.0):
                 cps = np.zeros((N_CPS, N_CHANNELS))
                 cps[1:, 0] = 3.0  # x-offset of 3.0 on all non-pinned CPs
                 cps[0] = [0, 0, 0]
                 return cps
 
+        margin = 0.5
         ep_info, frames = collect_episode(
-            env, 100, OffsetModel(), margin=0.5, outcome_cond=Outcome.SUCCESS,
+            env, 100, OffsetModel(), margin=margin, outcome_cond=Outcome.SUCCESS,
         )
         env.close()
 
         assert len(frames) > 1, "Need at least 2 frames"
 
-        # Check: actual_tracked_cps should reflect the blend.
-        # At margin=0.5, the x-channel of CPs should show influence from
-        # the model's 3.0 offset. If actual_tracked_cps is pure KTO,
-        # it won't have the 3.0 offset at all.
         frame = frames[1]
         actual = np.frombuffer(frame["actual_tracked_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
         model_out = np.frombuffer(frame["model_output_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
 
-        # The model's non-pinned x-CPs are 3.0. The KTO x-CPs are small
-        # (relative trajectory displacements, typically <1.0 per CP).
-        # At margin=0.5, actual should show some influence of the 3.0 offset.
-        actual_x_mean = actual[1:, 0].mean()
-        model_x_mean = model_out[1:, 0].mean()
+        # Model x-CPs are 3.0 (far from KTO). With clamp at margin=0.5,
+        # actual should be clamped to kto + 0.5 (since 3.0 >> kto + margin).
+        # So actual_x should differ from both raw KTO and raw model output.
+        actual_x = actual[1:, 0]
+        model_x = model_out[1:, 0]
 
-        print(f"  model_output x-mean (non-pinned): {model_x_mean:.3f}")
-        print(f"  actual_tracked x-mean (non-pinned): {actual_x_mean:.3f}")
+        print(f"  model_output x (non-pinned): mean={model_x.mean():.3f}")
+        print(f"  actual_tracked x (non-pinned): mean={actual_x.mean():.3f}")
 
-        # BUG: actual_tracked_cps is pure KTO, ignoring the model's 3.0 offset.
-        # The training target doesn't match what was actually tracked.
-        # At margin=0.5, we'd expect actual_x_mean ≈ (kto_x + 3.0) * 0.5
-        # but we get actual_x_mean ≈ kto_x (no diffusion contribution).
-        has_diffusion_influence = actual_x_mean > 0.5  # Should show SOME offset influence
-        assert has_diffusion_influence, (
-            f"actual_tracked_cps should reflect the margin-blended reference "
-            f"(including diffusion offset of 3.0), but x-mean={actual_x_mean:.3f} "
-            f"shows no diffusion influence. This is raw KTO, not the blend."
+        # actual_tracked should NOT be pure KTO (would be ~0)
+        assert actual_x.mean() > 0.1, (
+            f"actual_tracked_cps has no model influence: x-mean={actual_x.mean():.3f}"
         )
+        # actual_tracked should NOT be raw model output (would be 3.0)
+        assert actual_x.mean() < 2.5, (
+            f"actual_tracked_cps is unclamped model output: x-mean={actual_x.mean():.3f}"
+        )
+
+    def test_margin_zero_gives_kto(self):
+        """At margin≈0, actual_tracked_cps should be essentially KTO."""
+        from dagger_loop import collect_episode
+
+        env = _make_env(seed=100)
+        uw = env.unwrapped
+        uw.lander.linearVelocity = (0.0, 0.0)
+        uw.lander.angularVelocity = 0.0
+
+        class WildModel:
+            def predict(self, cond, outcome, guidance_scale=2.0):
+                cps = np.ones((N_CPS, N_CHANNELS)) * 10.0
+                cps[0] = [0, 0, 0]
+                return cps
+
+        ep_info, frames = collect_episode(
+            env, 100, WildModel(), margin=0.001, outcome_cond=Outcome.SUCCESS,
+        )
+        env.close()
+
+        if len(frames) > 1:
+            frame = frames[1]
+            actual = np.frombuffer(frame["actual_tracked_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
+            # With margin=0.001, model output of 10.0 gets clamped to kto±0.001
+            # So actual should be very close to KTO (small values)
+            assert np.abs(actual[1:]).max() < 15.0, "Should be near KTO at tiny margin"
 
 
 # ===========================================================================

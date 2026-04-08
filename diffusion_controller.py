@@ -266,7 +266,7 @@ class KTODiffusionController:
         kto_v = kto_ref["v"]
         kto_a = kto_ref["a"]
 
-        # Diffusion reference (if available)
+        # Diffusion reference (if available), clamped to within margin of KTO
         m = np.clip(guidance_margin, 0.0, 1.0)
         if self._diff_splines is not None and m > 0.0:
             t_diff = t_sim - self._diff_t0
@@ -276,10 +276,10 @@ class KTODiffusionController:
                 self._diff_q_origin[1] + diff_rel[1],
                 self._diff_q_origin[2] + diff_rel[2],
             )
-            # Blend position refs
-            x_ref = (1 - m) * kto_q[0] + m * diff_world[0]
-            y_ref = (1 - m) * kto_q[1] + m * diff_world[1]
-            th_ref = (1 - m) * kto_q[2] + m * diff_world[2]
+            # Clamp: diffusion ref clamped to within margin distance of KTO
+            x_ref = float(np.clip(diff_world[0], kto_q[0] - m, kto_q[0] + m))
+            y_ref = float(np.clip(diff_world[1], kto_q[1] - m, kto_q[1] + m))
+            th_ref = float(np.clip(diff_world[2], kto_q[2] - m, kto_q[2] + m))
         else:
             x_ref, y_ref, th_ref = kto_q
 
