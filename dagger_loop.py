@@ -288,7 +288,7 @@ def collect_episode(env, seed, model, margin, outcome_cond=Outcome.SUCCESS):
             })
 
         # Apply margin with Gaussian sampling
-        actual_margin = np.clip(np.abs(np.random.normal(margin, 0.05)), 0.001, 1.0)
+        actual_margin = float(np.clip(margin, 0.0, 1.0))
         tv, th = ctrl.get_action(guidance_margin=actual_margin)
         action_out = np.array([tv, th], dtype=np.float32)
         obs, reward, term, trunc, _ = env.step(action_out)

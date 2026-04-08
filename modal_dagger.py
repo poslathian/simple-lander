@@ -235,7 +235,7 @@ def rollout_batch(
                     "actual_tracked_cps": actual_cps.astype(np.float32).flatten().tobytes(),
                 })
 
-            actual_margin = float(np.clip(abs(np.random.normal(margin_mean, 0.05)), 0.001, 1.0))
+            actual_margin = float(np.clip(margin_mean, 0.0, 1.0))
             tv, th = ctrl.get_action(guidance_margin=actual_margin)
             obs, reward, term, trunc, _ = env.step(np.array([tv, th], dtype=np.float32))
             total_reward += reward

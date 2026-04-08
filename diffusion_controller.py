@@ -243,6 +243,7 @@ class KTODiffusionController:
         )
 
         cps_norm = self.model.predict(cond, self.outcome, guidance_scale=2.0)
+        cps_norm = np.clip(cps_norm, -1.0, 1.0)  # keep CPs in valid normalized range
         cps_norm[0, :2] = 0.0                    # x,y: pin to relative origin
         cps_norm[0, 2] = q_now[2] / math.pi      # theta: pin to current world angle
         self._last_cps_norm = cps_norm.copy()
