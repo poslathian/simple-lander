@@ -16,6 +16,7 @@ from diffusion_controller import (
     KTODiffusionController, NoiseModel, Outcome,
     N_CPS, N_CHANNELS, COND_DIM, STATE_DIM,
     _build_cond, ObstacleRelative, WaypointTarget,
+    nearest_obstacle, _get_obstacle_tuples,
 )
 from model import DiffusionMLP, CosineSchedule, DDIMSampler, CFG_START, CFG_END
 import solver
@@ -70,7 +71,7 @@ def run_episode(env, seed, model, margin, kto_cache=None):
         env, model=model, target_frequency=3.0,
         action_horizon=1.5, outcome=Outcome.SUCCESS,
     )
-    ctrl.warm_start(time_budget=5.0)
+    ctrl.warm_start(time_budget=3.0)
 
     # Cache KTO plan for reuse across margins
     if kto_cache is not None and seed not in kto_cache:
@@ -120,7 +121,7 @@ def main():
         entry_point="lunar_lander:LunarLander",
         max_episode_steps=1000,
     )
-    env = gym.make("LL-eval", render_mode=None, continuous=True)
+    env = gym.make("LL-eval", render_mode=None, continuous=True, num_obstacles=2)
     seeds = [args.seed_offset + i for i in range(args.episodes)]
     kto_cache = {}
 
@@ -136,7 +137,7 @@ def main():
         uw = env.unwrapped
         uw.lander.linearVelocity = (0.0, 0.0)
         uw.lander.angularVelocity = 0.0
-        kto = KTOController(env, time_budget=5.0)
+        kto = KTOController(env, time_budget=3.0)
         done = False
         while not done:
             action = kto.step(env)

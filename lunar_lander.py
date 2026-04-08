@@ -188,7 +188,7 @@ class LunarLander(gym.Env, EzPickle):
         enable_wind: bool = False,
         wind_power: float = 15.0,
         turbulence_power: float = 1.5,
-        num_obstacles: int = 0,
+        num_obstacles: int = 2,
     ):
         EzPickle.__init__(
             self, render_mode, continuous, gravity, enable_wind,
@@ -358,11 +358,36 @@ class LunarLander(gym.Env, EzPickle):
             self.render()
         return self._build_obs(), {}
 
+    def get_obstacle_tuples(self):
+        """Return list of (cx, cy, radius) tuples for all obstacles."""
+        tuples = []
+        for obs_body, r in zip(self.obstacles, getattr(self, "obstacle_radii", [])):
+            tuples.append((obs_body.position.x, obs_body.position.y, r))
+        return tuples
+
     def _create_obstacles(self):
-        """Create satellite obstacles as static Box2D bodies."""
+        """Create satellite obstacles as static Box2D bodies.
+
+        When num_obstacles >= 2, samples actual count from distribution:
+          10% → 0 obstacles, 10% → 1 obstacle, 80% → num_obstacles
+        Obstacles have different sizes (min 0.3 scale difference enforced).
+        """
         self.obstacles = []
         self.obstacle_radii = []
-        if self.num_obstacles == 0:
+
+        # Sample actual obstacle count from probability distribution
+        if self.num_obstacles >= 2:
+            p = float(self.np_random.random())
+            if p < 0.10:
+                actual_count = 0
+            elif p < 0.20:
+                actual_count = 1
+            else:
+                actual_count = self.num_obstacles
+        else:
+            actual_count = self.num_obstacles
+
+        if actual_count == 0:
             return
 
         W = VIEWPORT_W / SCALE
@@ -371,8 +396,15 @@ class LunarLander(gym.Env, EzPickle):
         BASE_BOUNDING_RADIUS = 0.75
 
         positions, scales = [], []
-        for _ in range(self.num_obstacles):
-            r = float(self.np_random.uniform(0.5, 2.0))
+        for i in range(actual_count):
+            # Ensure differently sized obstacles: alternate small/large ranges
+            if actual_count >= 2:
+                if i == 0:
+                    r = float(self.np_random.uniform(0.5, 1.0))   # small
+                else:
+                    r = float(self.np_random.uniform(1.3, 2.0))   # large
+            else:
+                r = float(self.np_random.uniform(0.5, 2.0))
             for _attempt in range(50):
                 x = self.np_random.uniform(1.0, W - 1.0)
                 obs_y_lo = self.helipad_y + 2.0
@@ -730,7 +762,7 @@ class KTOController:
     Phase 2: Heuristic PD controller for final descent and landing.
     """
 
-    def __init__(self, env, time_budget=5.0, warmstart_budget=1.0):
+    def __init__(self, env, time_budget=3.0, warmstart_budget=1.0):
         import solver
 
         uw = env.unwrapped
@@ -833,7 +865,7 @@ if __name__ == "__main__":
                         help="Manual control (arrow keys / WASD)")
     parser.add_argument("--kto", action="store_true",
                         help="KTO trajectory solver (open-loop + heuristic settle)")
-    parser.add_argument("--obstacles", type=int, default=0,
+    parser.add_argument("--obstacles", type=int, default=2,
                         help="Number of obstacles (0-5)")
     parser.add_argument("--save-frames", type=str, default=None,
                         help="Save frames to directory (e.g. ./tmp)")

@@ -21,6 +21,7 @@ from diffusion_controller import (
     KTODiffusionController, NoiseModel, Outcome,
     _build_cond, ObstacleRelative, WaypointTarget,
     N_CPS, N_CHANNELS, DEGREE, STATE_DIM, COND_DIM,
+    nearest_obstacle, _get_obstacle_tuples,
 )
 import solver
 
@@ -143,7 +144,7 @@ def run_episode(env, seed, margin):
         env, model=NoiseModel(), target_frequency=3.0,
         action_horizon=1.5, outcome=Outcome.SUCCESS,
     )
-    ctrl.warm_start(time_budget=5.0)
+    ctrl.warm_start(time_budget=3.0)
 
     frames = []
     total_reward = 0.0
@@ -172,10 +173,11 @@ def run_episode(env, seed, margin):
             kto_ref = ctrl._get_kto_ref(t_sim)
             guidance_q = kto_ref["q"] if kto_ref else q_now
 
+            obs_rel = nearest_obstacle(ctrl._obstacles, q_now[0], q_now[1])
             cond = _build_cond(
                 t_obs_cmd_latency=DT,
                 q_now=q_now, q_prev=q_prev,
-                obstacle=ObstacleRelative(0.0, 0.0, 0.0),
+                obstacle=obs_rel,
                 waypoint=WaypointTarget(dq=dq, dq_prime=dq_prime),
                 guidance_q=guidance_q,
                 action_horizon=ctrl.action_horizon,
@@ -231,7 +233,7 @@ def main():
         entry_point="lunar_lander:LunarLander",
         max_episode_steps=1000,
     )
-    env = gym.make("LL-collect", render_mode=None, continuous=True)
+    env = gym.make("LL-collect", render_mode=None, continuous=True, num_obstacles=2)
     db = TrainingDB(args.db)
 
     print(f"Collecting {args.episodes} episodes, margin in [0, {args.max_margin}]")

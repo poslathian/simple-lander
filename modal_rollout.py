@@ -93,7 +93,7 @@ def solve_kto_batch(
                      max_episode_steps=1000)
     except Exception:
         pass
-    env = gym.make("LL-kto", render_mode=None, continuous=True)
+    env = gym.make("LL-kto", render_mode=None, continuous=True, num_obstacles=2)
 
     results = {}
     for seed in seeds:
@@ -156,6 +156,7 @@ def rollout_with_cache(
         KTODiffusionController, Outcome,
         _build_cond, ObstacleRelative, WaypointTarget,
         DT, DEGREE, _make_position_spline,
+        nearest_obstacle, _get_obstacle_tuples,
     )
     import solver
 
@@ -231,7 +232,7 @@ def rollout_with_cache(
                      max_episode_steps=1000)
     except Exception:
         pass
-    env = gym.make("LL-cached", render_mode=None, continuous=True)
+    env = gym.make("LL-cached", render_mode=None, continuous=True, num_obstacles=2)
 
     results = []
     for seed, plan_data in seed_plan_list:
@@ -276,7 +277,7 @@ def rollout_with_cache(
 
                 model_input = _build_cond(
                     t_obs_cmd_latency=DT, q_now=q_now, q_prev=q_prev,
-                    obstacle=ObstacleRelative(0.0, 0.0, 0.0),
+                    obstacle=nearest_obstacle(ctrl._obstacles, q_now[0], q_now[1]),
                     waypoint=WaypointTarget(dq=dq, dq_prime=dq_prime),
                     guidance_q=guidance_q, action_horizon=ctrl.action_horizon,
                 )
@@ -397,7 +398,7 @@ def solve_kto_local(seeds):
                      max_episode_steps=1000)
     except Exception:
         pass
-    env = gym.make("LL-kto-local", render_mode=None, continuous=True)
+    env = gym.make("LL-kto-local", render_mode=None, continuous=True, num_obstacles=2)
 
     results = {}
     for seed in seeds:
@@ -437,6 +438,7 @@ def rollout_with_cache_local(
         KTODiffusionController, Outcome,
         _build_cond, ObstacleRelative, WaypointTarget,
         DT, DEGREE,
+        nearest_obstacle, _get_obstacle_tuples,
     )
     import solver
 
@@ -503,7 +505,7 @@ def rollout_with_cache_local(
                      max_episode_steps=1000)
     except Exception:
         pass
-    env = gym.make("LL-cache-local", render_mode=None, continuous=True)
+    env = gym.make("LL-cache-local", render_mode=None, continuous=True, num_obstacles=2)
 
     results = []
     for seed, plan_data in seed_plan_list:
@@ -547,7 +549,7 @@ def rollout_with_cache_local(
 
                 model_input = _build_cond(
                     t_obs_cmd_latency=DT, q_now=q_now, q_prev=q_prev,
-                    obstacle=ObstacleRelative(0.0, 0.0, 0.0),
+                    obstacle=nearest_obstacle(ctrl._obstacles, q_now[0], q_now[1]),
                     waypoint=WaypointTarget(dq=dq, dq_prime=dq_prime),
                     guidance_q=guidance_q, action_horizon=ctrl.action_horizon,
                 )

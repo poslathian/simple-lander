@@ -15,7 +15,7 @@ import numpy as np
 from scipy.interpolate import BSpline
 
 import solver
-from lunar_lander import KTOController, TIMEOUT
+from lunar_lander import KTOController, LunarLander, TIMEOUT
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -111,6 +111,43 @@ def _eval_spline(splines, t, duration):
     return (float(splines[0](t_c)), float(splines[1](t_c)), float(splines[2](t_c)))
 
 
+# ── Obstacle helpers ─────────────────────────────────────────────────────
+
+def _get_obstacle_tuples(env) -> list[tuple[float, float, float]]:
+    """Extract (cx, cy, radius) tuples from environment obstacles."""
+    uw = env.unwrapped
+    if hasattr(uw, 'get_obstacle_tuples'):
+        return uw.get_obstacle_tuples()
+    tuples = []
+    for obs_body, r in zip(uw.obstacles, getattr(uw, "obstacle_radii", [])):
+        tuples.append((obs_body.position.x, obs_body.position.y, r))
+    return tuples
+
+
+def nearest_obstacle(
+    obstacles: list[tuple[float, float, float]],
+    lander_x: float,
+    lander_y: float,
+) -> ObstacleRelative:
+    """Return the nearest obstacle relative to the lander position.
+
+    If no obstacles, returns ObstacleRelative(0, 0, 0).
+    """
+    if not obstacles:
+        return ObstacleRelative(0.0, 0.0, 0.0)
+
+    best_dist = float('inf')
+    best = ObstacleRelative(0.0, 0.0, 0.0)
+    for cx, cy, r in obstacles:
+        dx = cx - lander_x
+        dy = cy - lander_y
+        dist = math.sqrt(dx * dx + dy * dy) - r
+        if dist < best_dist:
+            best_dist = dist
+            best = ObstacleRelative(dx, dy, r)
+    return best
+
+
 # ── Conditioning vector builder ───────────────────────────────────────────
 
 def _build_cond(
@@ -159,6 +196,7 @@ class KTODiffusionController:
         target_frequency: float = 3.0,
         action_horizon: float = 1.5,
         outcome: Outcome = Outcome.SUCCESS,
+        obstacles: list[tuple[float, float, float]] | None = None,
     ):
         self.env = env
         self.model = model if model is not None else NoiseModel()
@@ -166,6 +204,12 @@ class KTODiffusionController:
         self.action_horizon = action_horizon
         self.outcome = outcome
         self.gains = solver.DEFAULT_GAINS
+
+        # Obstacles: extract from env if not provided explicitly
+        if obstacles is not None:
+            self._obstacles = obstacles
+        else:
+            self._obstacles = _get_obstacle_tuples(env)
 
         # KTO state
         self._kto: KTOController | None = None
@@ -181,7 +225,7 @@ class KTODiffusionController:
     def warm_start(
         self,
         waypoint: WaypointTarget | None = None,
-        time_budget: float = 5.0,
+        time_budget: float = 3.0,
     ) -> None:
         """Solve KTO to produce guidance spline."""
         self._kto = KTOController(self.env, time_budget=time_budget)
@@ -221,11 +265,14 @@ class KTODiffusionController:
         kto_ref = self._get_kto_ref(t_sim)
         guidance_q = kto_ref["q"] if kto_ref else q_now
 
+        # Select nearest obstacle for diffusion model conditioning
+        obs_rel = nearest_obstacle(self._obstacles, q_now[0], q_now[1])
+
         cond = _build_cond(
             t_obs_cmd_latency=DT,
             q_now=q_now,
             q_prev=q_prev,
-            obstacle=ObstacleRelative(0.0, 0.0, 0.0),
+            obstacle=obs_rel,
             waypoint=WaypointTarget(dq=dq, dq_prime=dq_prime),
             guidance_q=guidance_q,
             action_horizon=self.action_horizon,

@@ -135,6 +135,16 @@ STRATEGIES = {
         duration_cost=5.0,
         num_control_points=15,
     ),
+    "obstacles": Strategy(
+        name="obstacles",
+        warmstart_frac=0.0,
+        goal_region=False,
+        goal_cost_weight=0.0,
+        energy_cost=1.0,
+        duration_cost=5.0,
+        num_control_points=10,
+        constraint_scale=2.0,
+    ),
     "region_goal": Strategy(
         name="region_goal",
         warmstart_frac=0.4,
@@ -225,7 +235,7 @@ def solve(start=None, goal=None, obstacles=(),
     goal = np.asarray(goal if goal is not None else GOAL, dtype=float)
 
     if strategy is None:
-        strat = STRATEGIES["default"]
+        strat = STRATEGIES["obstacles"] if obstacles else STRATEGIES["default"]
     elif isinstance(strategy, str):
         strat = STRATEGIES[strategy]
     else:
@@ -594,7 +604,7 @@ def _add_obstacle_constraints(kto, prog, obstacles, n_samples):
     MARGIN = LANDER_RADIUS
 
     # Cap obstacle samples — too many makes the problem intractable
-    n_obs = min(n_samples, 20)
+    n_obs = min(n_samples, 12)
     for cx, cy, r in obstacles:
         r_eff = r + MARGIN
         for s in np.linspace(0, 1, n_obs):

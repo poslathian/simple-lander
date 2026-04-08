@@ -24,6 +24,7 @@ from diffusion_controller import (
     KTODiffusionController, NoiseModel, Outcome,
     _build_cond, ObstacleRelative, WaypointTarget,
     N_CPS, N_CHANNELS, DEGREE, STATE_DIM, COND_DIM, DT,
+    nearest_obstacle, _get_obstacle_tuples,
 )
 from eval import TrainedModel, run_episode
 from lunar_lander import LunarLander, KTOController, TIMEOUT
@@ -226,7 +227,7 @@ def collect_episode(env, seed, model, margin, outcome_cond=Outcome.SUCCESS):
         env, model=model, target_frequency=3.0,
         action_horizon=1.5, outcome=outcome_cond,
     )
-    ctrl.warm_start(time_budget=5.0)
+    ctrl.warm_start(time_budget=3.0)
 
     frames = []
     total_reward = 0.0
@@ -252,10 +253,11 @@ def collect_episode(env, seed, model, margin, outcome_cond=Outcome.SUCCESS):
             kto_ref = ctrl._get_kto_ref(t_sim)
             guidance_q = kto_ref["q"] if kto_ref else q_now
 
+            obs_rel = nearest_obstacle(ctrl._obstacles, q_now[0], q_now[1])
             model_input = _build_cond(
                 t_obs_cmd_latency=DT,
                 q_now=q_now, q_prev=q_prev,
-                obstacle=ObstacleRelative(0.0, 0.0, 0.0),
+                obstacle=obs_rel,
                 waypoint=WaypointTarget(dq=dq, dq_prime=dq_prime),
                 guidance_q=guidance_q,
                 action_horizon=ctrl.action_horizon,
@@ -576,7 +578,7 @@ def main():
         )
     except Exception:
         pass
-    env = gym.make(env_id, render_mode=None, continuous=True)
+    env = gym.make(env_id, render_mode=None, continuous=True, num_obstacles=2)
 
     # Load existing model checkpoint
     checkpoint_path = args.checkpoint
@@ -767,7 +769,7 @@ def main():
                      max_episode_steps=1000)
     except Exception:
         pass
-    env = gym.make(env_final_id, render_mode=None, continuous=True)
+    env = gym.make(env_final_id, render_mode=None, continuous=True, num_obstacles=2)
     final_margins = [0.001, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]
     evaluate_model_seeds(env, final_model, final_margins, HOLDOUT_SEEDS)
     env.close()
