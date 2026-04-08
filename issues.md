@@ -1,26 +1,8 @@
 # Issues Found in position-dagger Codebase
 
-## Bug: B-spline knot vector mismatch between collect.py and diffusion_controller.py
+## ~~Not a bug: B-spline knot vectors~~
 
-**Files:** `collect.py:109-120`, `dagger_loop.py:192-199`, `diffusion_controller.py:93-105`
-
-The `_fit_kto_window()` functions in `collect.py` and `dagger_loop.py` use `DEGREE + 1` repeated knots at each end (i.e., 4 repeated knots for cubic), but `_make_position_spline()` in `diffusion_controller.py` uses only `DEGREE` repeated knots (3 repeated). For a clamped cubic B-spline, the correct number of repeated boundary knots is `DEGREE + 1 = 4`.
-
-This means the spline used for inference (in `_make_position_spline`) has a different knot structure than what was used to generate training data. The training CPs were fit with clamped knots (4 repeated), but at inference time they're evaluated with non-clamped knots (3 repeated), producing different curves from the same control points.
-
-**Impact:** The model's output CPs produce different trajectories at inference time vs what they represented during training. This is a systematic train/test mismatch that degrades controller performance.
-
-## Bug: _make_position_spline produces wrong number of knots
-
-**File:** `diffusion_controller.py:93-105`
-
-With `n = 10` CPs and `DEGREE = 3`:
-- `n_internal = n - DEGREE + 1 = 8`
-- `internal = linspace(0, duration, 8)` → 8 values
-- `knots = [0,0,0] + [0, ..., duration (8 values)] + [duration, duration, duration]`
-- Total: 3 + 8 + 3 = 14 knots
-
-For a clamped cubic B-spline with 10 CPs, we need exactly `n + DEGREE + 1 = 14` knots. So the count happens to be correct, but the structure is wrong: clamped splines need `DEGREE + 1 = 4` repeated endpoint knots, not 3. The current code has only 3 repeats, so the spline is not properly clamped — the first/last CPs don't pin the spline endpoints.
+**RETRACTED:** Initial analysis claimed a knot mismatch between `_fit_kto_window()` and `_make_position_spline()`. Testing confirmed both produce identical clamped knot vectors. The `internal = linspace(0, duration, n_internal)` array starts with 0.0, which overlaps with the `np.full(DEGREE, 0.0)` padding, correctly producing DEGREE+1 = 4 repeated boundary knots.
 
 ## Bug: Conditioning vector q_prev is stale after inference
 

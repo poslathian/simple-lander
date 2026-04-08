@@ -225,32 +225,15 @@ class TestTrackingInverseDynamics:
 
 class TestImports:
 
-    def test_guidance_controller_imports(self):
-        """guidance_controller.py imports ActionTarget which doesn't exist
-        in diffusion_controller.py."""
-        import importlib
-        import sys
-
-        # Remove from cache to force fresh import
-        for mod in list(sys.modules):
-            if 'guidance_controller' in mod:
-                del sys.modules[mod]
-
-        with pytest.raises(ImportError):
-            import guidance_controller  # noqa: F811
-
-    def test_diffusion_pipeline_imports(self):
-        """test_diffusion_pipeline.py imports DiffusionController and LanderState
-        which don't exist in diffusion_controller.py."""
-        import importlib
-        import sys
-
-        for mod in list(sys.modules):
-            if 'test_diffusion_pipeline' in mod:
-                del sys.modules[mod]
-
-        with pytest.raises(ImportError):
-            import test_diffusion_pipeline  # noqa: F811
+    def test_vestigial_files_removed(self):
+        """guidance_controller.py and test_diffusion_pipeline.py referenced
+        non-existent types (ActionTarget, DiffusionController, LanderState).
+        They should be deleted as they belong to the old thrust-spline API."""
+        import os
+        assert not os.path.exists("guidance_controller.py"), \
+            "guidance_controller.py should be deleted (broken imports)"
+        assert not os.path.exists("test_diffusion_pipeline.py"), \
+            "test_diffusion_pipeline.py should be deleted (broken imports)"
 
 
 # ===========================================================================

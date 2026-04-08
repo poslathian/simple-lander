@@ -825,8 +825,12 @@ def _tracking_step(x, y, theta, vx, vy, omega,
     ax_des = ax_ref + gains.Kp_pos * (x_ref - x) + gains.Kd_pos * (vx_ref - vx)
     ay_des = ay_ref + gains.Kp_pos * (y_ref - y) + gains.Kd_pos * (vy_ref - vy)
 
-    # ── Main engine thrust (inverse dynamics at current theta) ──
-    Fm = MASS * (-ax_des * st + (ay_des + GRAVITY) * ct)
+    # ── Main engine thrust (full inverse dynamics via Cramer's rule) ──
+    c2t = ct * ct - st * st  # cos(2θ)
+    if abs(c2t) > 1e-6:
+        Fm = MASS * (ax_des * st + (ay_des + GRAVITY) * ct) / c2t
+    else:
+        Fm = MASS * (ay_des + GRAVITY)  # fallback at θ ≈ ±π/4
 
     # ── Attitude command from desired acceleration vector ───────
     # theta_cmd points the rocket so main thrust aligns with (ax_des, ay_des+g)
