@@ -38,7 +38,7 @@ from modal_rollout import (
 app = rollout_app
 
 train_image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.debian_slim(python_version="3.13")
     .pip_install("torch", "numpy", "scipy")
 )
 

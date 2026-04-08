@@ -27,7 +27,7 @@ app = modal.App("position-dagger-rollout")
 # ── Modal image ──────────────────────────────────────────────────────────
 
 rollout_image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.debian_slim(python_version="3.13")
     .apt_install("swig", "build-essential")
     .pip_install(
         "torch", "numpy", "scipy", "gymnasium[box2d]", "swig",
