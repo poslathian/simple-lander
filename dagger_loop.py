@@ -274,14 +274,17 @@ def collect_episode(env, seed, model, margin, outcome_cond=Outcome.SUCCESS):
                     model_out[:, ch] = ctrl._diff_splines[ch].c[:N_CPS]
                 last_model_output = model_out
 
-            # Clamp diffusion CPs to within margin of KTO CPs.
-            # This matches what get_action() does at runtime: the model
-            # outputs freely, but each position ref is clamped to within
-            # margin distance of the KTO reference.
+            # Clamp diffusion CPs to within normalized margin of KTO CPs.
+            # margin ∈ [0,1]: 0=pure KTO, 1=unclamped diffusion.
+            # Radius = m/(1-m), matching get_action() semantics.
             kto_idx = int(round((t_sim - ctrl._kto_t0) / DT))
             kto_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
-            m = np.clip(margin, 0.001, 1.0)
-            actual_cps = np.clip(last_model_output, kto_cps - m, kto_cps + m)
+            m = float(np.clip(margin, 0.0, 1.0))
+            if m >= 1.0:
+                actual_cps = last_model_output.copy()
+            else:
+                r = m / (1.0 - m)
+                actual_cps = np.clip(last_model_output, kto_cps - r, kto_cps + r)
 
             frames.append({
                 "t_sim": t_sim,

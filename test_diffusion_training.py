@@ -91,9 +91,9 @@ class TestActualTrackedCPsIsBlended:
         actual = np.frombuffer(frame["actual_tracked_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
         model_out = np.frombuffer(frame["model_output_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
 
-        # Model x-CPs are 3.0 (far from KTO). With clamp at margin=0.5,
-        # actual should be clamped to kto + 0.5 (since 3.0 >> kto + margin).
-        # So actual_x should differ from both raw KTO and raw model output.
+        # Model x-CPs are 3.0 (far from KTO). With margin=0.5, clamp
+        # radius = 0.5/(1-0.5) = 1.0, so actual = clip(3.0, kto-1, kto+1).
+        # KTO CPs are small (~0), so actual_x ≈ clip(3.0, -1, 1) ≈ 1.0.
         actual_x = actual[1:, 0]
         model_x = model_out[1:, 0]
 
@@ -132,7 +132,8 @@ class TestActualTrackedCPsIsBlended:
         if len(frames) > 1:
             frame = frames[1]
             actual = np.frombuffer(frame["actual_tracked_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
-            # With margin=0.001, model output of 10.0 gets clamped to kto±0.001
+            # With margin=0.001, radius = 0.001/0.999 ≈ 0.001
+            # Model output of 10.0 gets clamped to kto±0.001
             # So actual should be very close to KTO (small values)
             assert np.abs(actual[1:]).max() < 15.0, "Should be near KTO at tiny margin"
 

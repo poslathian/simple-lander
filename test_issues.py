@@ -334,8 +334,10 @@ class TestBuildCond:
 
 class TestGetActionAfterKTOExhausted:
 
-    def test_returns_zero_thrust(self):
-        """After KTO plan is exhausted, get_action should return (0, 0)."""
+    def test_uses_zero_kto_refs_when_exhausted(self):
+        """After KTO plan is exhausted, get_action should still return a valid
+        action (not short-circuit to 0,0). KTO refs become zeros, and the
+        diffusion model can still contribute."""
         env = _make_env(seed=42)
         uw = env.unwrapped
         uw.lander.linearVelocity = (0.0, 0.0)
@@ -346,17 +348,16 @@ class TestGetActionAfterKTOExhausted:
             action_horizon=1.5, outcome=Outcome.SUCCESS,
         )
         ctrl.warm_start(time_budget=5.0)
-
-        # Run inference
         ctrl.inference()
 
-        # Advance time past KTO duration by directly modifying elapsed_s
+        # Advance time past KTO duration
         kto_end = ctrl._kto_t0 + ctrl._kto_duration
         uw.elapsed_s = kto_end + 1.0
 
+        # Should still return a valid action, not crash
         tv, th = ctrl.get_action(guidance_margin=0.5)
-        assert tv == 0.0, f"Expected zero main thrust after KTO, got {tv}"
-        assert th == 0.0, f"Expected zero side thrust after KTO, got {th}"
+        assert -1.0 <= tv <= 1.0, f"Invalid main thrust: {tv}"
+        assert -1.0 <= th <= 1.0, f"Invalid side thrust: {th}"
         env.close()
 
 
@@ -424,9 +425,9 @@ class TestMarginBlending:
             env.step(np.array([tv, th], dtype=np.float32))
 
         a_low = ctrl.get_action(guidance_margin=0.001)
-        a_high = ctrl.get_action(guidance_margin=5.0)
+        a_high = ctrl.get_action(guidance_margin=1.0)
 
-        # Large offset model + large margin should differ from tiny margin
+        # margin=0.001 (tight clamp) vs margin=1.0 (unclamped) should differ
         assert a_low != a_high, (
             f"Margin should affect output: low={a_low}, high={a_high}"
         )

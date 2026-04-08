@@ -240,10 +240,12 @@ class KTODiffusionController:
         self._last_inference_q = q_now
 
     def get_action(self, guidance_margin: float = 0.001) -> ThrustVec:
-        """Blend KTO + diffusion splines, PD track the result.
+        """Clamp diffusion position ref to within margin of KTO, PD track.
 
         Args:
-            guidance_margin: [0,1]. 0=track KTO, 1=trust model.
+            guidance_margin: [0,1]. 0=pure KTO, 1=unclamped diffusion.
+                Mapped to clamp radius via m/(1-m): 0.001→~0.001,
+                0.5→1.0, 0.9→9.0, 1.0→unclamped.
 
         Returns:
             (thrust_v, thrust_h) each in [-1, 1].
@@ -252,22 +254,23 @@ class KTODiffusionController:
         L = uw.lander
         t_sim = uw.elapsed_s
 
-        # Check if KTO plan is exhausted
-        kto_ref = self._get_kto_ref(t_sim)
-        if kto_ref is None:
-            return (0.0, 0.0)  # zero thrust, gravity settles
-
         # Current state from Box2D
         x, y, theta = L.position.x, L.position.y, L.angle
         vx, vy, omega = L.linearVelocity.x, L.linearVelocity.y, L.angularVelocity
 
-        # KTO reference (world frame)
-        kto_q = kto_ref["q"]
-        kto_v = kto_ref["v"]
-        kto_a = kto_ref["a"]
+        # KTO reference — zeros when exhausted
+        kto_ref = self._get_kto_ref(t_sim)
+        if kto_ref is not None:
+            kto_q = kto_ref["q"]
+            kto_v = kto_ref["v"]
+            kto_a = kto_ref["a"]
+        else:
+            kto_q = (x, y, theta)
+            kto_v = (0.0, 0.0, 0.0)
+            kto_a = (0.0, 0.0, 0.0)
 
-        # Diffusion reference (if available), clamped to within margin of KTO
-        m = np.clip(guidance_margin, 0.0, 1.0)
+        # Diffusion ref clamped to within radius of KTO
+        m = float(np.clip(guidance_margin, 0.0, 1.0))
         if self._diff_splines is not None and m > 0.0:
             t_diff = t_sim - self._diff_t0
             diff_rel = _eval_spline(self._diff_splines, t_diff, self.action_horizon)
@@ -276,14 +279,19 @@ class KTODiffusionController:
                 self._diff_q_origin[1] + diff_rel[1],
                 self._diff_q_origin[2] + diff_rel[2],
             )
-            # Clamp: diffusion ref clamped to within margin distance of KTO
-            x_ref = float(np.clip(diff_world[0], kto_q[0] - m, kto_q[0] + m))
-            y_ref = float(np.clip(diff_world[1], kto_q[1] - m, kto_q[1] + m))
-            th_ref = float(np.clip(diff_world[2], kto_q[2] - m, kto_q[2] + m))
+            if m >= 1.0:
+                # Unclamped: trust diffusion fully
+                x_ref, y_ref, th_ref = diff_world[0], diff_world[1], diff_world[2]
+            else:
+                # Clamp radius: m/(1-m) maps [0,1) → [0,∞)
+                r = m / (1.0 - m)
+                x_ref = float(np.clip(diff_world[0], kto_q[0] - r, kto_q[0] + r))
+                y_ref = float(np.clip(diff_world[1], kto_q[1] - r, kto_q[1] + r))
+                th_ref = float(np.clip(diff_world[2], kto_q[2] - r, kto_q[2] + r))
         else:
             x_ref, y_ref, th_ref = kto_q
 
-        # Velocity and accel refs come from KTO (model doesn't produce these)
+        # Velocity and accel refs come from KTO (zeros when exhausted)
         vx_ref, vy_ref, om_ref = kto_v
         ax_ref, ay_ref, al_ref = kto_a
 
