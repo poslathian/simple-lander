@@ -44,7 +44,7 @@ def read_source_files():
     for name in [
         "model.py", "diffusion_controller.py", "lunar_lander.py",
         "solver.py", "thrust_spline.py", "eval.py", "collect.py",
-        "guidance_controller.py",
+        "dagger_loop.py",
     ]:
         if os.path.exists(name):
             with open(name, "rb") as f:
@@ -206,7 +206,7 @@ def rollout_with_cache(
         th0 = float(plan["theta"][idx])
         x_rel = np.array(plan["x"][idx:end_idx], dtype=np.float64) - x0
         y_rel = np.array(plan["y"][idx:end_idx], dtype=np.float64) - y0
-        th_rel = np.array(plan["theta"][idx:end_idx], dtype=np.float64) - th0
+        th_world = np.array(plan["theta"][idx:end_idx], dtype=np.float64)  # world radians
         if len(t) < N_CPS:
             return np.zeros((N_CPS, N_CHANNELS), dtype=np.float64)
         duration = t[-1]
@@ -218,12 +218,14 @@ def rollout_with_cache(
             np.full(DEGREE + 1, 0.0), internal[1:-1], np.full(DEGREE + 1, duration),
         ])
         cps = np.zeros((N_CPS, N_CHANNELS), dtype=np.float64)
-        for ch, vals in enumerate([x_rel, y_rel, th_rel]):
+        for ch, vals in enumerate([x_rel, y_rel, th_world]):
             try:
                 spline = make_lsq_spline(t, vals, knots, k=DEGREE)
                 cps[:, ch] = spline.c[:N_CPS]
             except Exception:
                 pass
+        from diffusion_controller import NORM_SCALES
+        cps /= NORM_SCALES
         return cps
 
     try:
@@ -284,18 +286,21 @@ def rollout_with_cache(
                 ctrl.inference()
                 last_inf = step_idx
 
+                # Capture normalized model CPs
                 model_out = np.zeros((N_CPS, N_CHANNELS), dtype=np.float32)
-                if ctrl._diff_splines is not None:
-                    for ch in range(N_CHANNELS):
-                        model_out[:, ch] = ctrl._diff_splines[ch].c[:N_CPS]
+                if hasattr(ctrl, '_last_cps_norm') and ctrl._last_cps_norm is not None:
+                    model_out = ctrl._last_cps_norm.astype(np.float32)
 
+                # Clamp model CPs to within margin of KTO CPs (both normalized)
                 kto_idx = int(round((t_sim - ctrl._kto_t0) / DT))
-                actual_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
+                kto_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
+                m = float(np.clip(margin_mean, 0.0, 1.0))
+                actual_cps = np.clip(model_out, kto_cps - m, kto_cps + m)
 
                 frames.append({
                     "t_sim": t_sim,
                     "model_input": model_input.tobytes(),
-                    "model_output_cps": model_out.flatten().tobytes(),
+                    "model_output_cps": model_out.flatten().astype(np.float32).tobytes(),
                     "actual_tracked_cps": actual_cps.astype(np.float32).flatten().tobytes(),
                 })
 
@@ -475,10 +480,10 @@ def rollout_with_cache_local(
             return np.zeros((N_CPS, N_CHANNELS), dtype=np.float64)
         n = end_idx - idx
         t = np.linspace(0, (n - 1) * dt, n)
-        x0, y0, th0 = float(plan["x"][idx]), float(plan["y"][idx]), float(plan["theta"][idx])
+        x0, y0 = float(plan["x"][idx]), float(plan["y"][idx])
         x_rel = np.array(plan["x"][idx:end_idx], dtype=np.float64) - x0
         y_rel = np.array(plan["y"][idx:end_idx], dtype=np.float64) - y0
-        th_rel = np.array(plan["theta"][idx:end_idx], dtype=np.float64) - th0
+        th_world = np.array(plan["theta"][idx:end_idx], dtype=np.float64)  # world radians
         if len(t) < N_CPS:
             return np.zeros((N_CPS, N_CHANNELS), dtype=np.float64)
         duration = t[-1]
@@ -490,12 +495,14 @@ def rollout_with_cache_local(
             np.full(DEGREE + 1, 0.0), internal[1:-1], np.full(DEGREE + 1, duration),
         ])
         cps = np.zeros((N_CPS, N_CHANNELS), dtype=np.float64)
-        for ch, vals in enumerate([x_rel, y_rel, th_rel]):
+        for ch, vals in enumerate([x_rel, y_rel, th_world]):
             try:
                 spline = make_lsq_spline(t, vals, knots, k=DEGREE)
                 cps[:, ch] = spline.c[:N_CPS]
             except Exception:
                 pass
+        from diffusion_controller import NORM_SCALES
+        cps /= NORM_SCALES
         return cps
 
     try:
@@ -555,18 +562,21 @@ def rollout_with_cache_local(
                 ctrl.inference()
                 last_inf = step_idx
 
+                # Capture normalized model CPs
                 model_out = np.zeros((N_CPS, N_CHANNELS), dtype=np.float32)
-                if ctrl._diff_splines is not None:
-                    for ch in range(N_CHANNELS):
-                        model_out[:, ch] = ctrl._diff_splines[ch].c[:N_CPS]
+                if hasattr(ctrl, '_last_cps_norm') and ctrl._last_cps_norm is not None:
+                    model_out = ctrl._last_cps_norm.astype(np.float32)
 
+                # Clamp model CPs to within margin of KTO CPs (both normalized)
                 kto_idx = int(round((t_sim - ctrl._kto_t0) / DT))
-                actual_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
+                kto_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
+                m = float(np.clip(margin_mean, 0.0, 1.0))
+                actual_cps = np.clip(model_out, kto_cps - m, kto_cps + m)
 
                 frames.append({
                     "t_sim": t_sim,
                     "model_input": model_input.tobytes(),
-                    "model_output_cps": model_out.flatten().tobytes(),
+                    "model_output_cps": model_out.flatten().astype(np.float32).tobytes(),
                     "actual_tracked_cps": actual_cps.astype(np.float32).flatten().tobytes(),
                 })
 

@@ -79,7 +79,11 @@ class ModelProtocol(Protocol):
 # ── NoiseModel (Step 0 stub) ─────────────────────────────────────────────
 
 class NoiseModel:
-    """Drop-in for DiffusionModel that returns random normalized CPs."""
+    """Drop-in for untrained DiffusionModel — unit Gaussian CPs.
+
+    Matches the distribution of an untrained diffusion model's output:
+    DDIM starts from randn, untrained model doesn't denoise, so output ≈ N(0,1).
+    """
 
     def predict(
         self,
@@ -87,7 +91,7 @@ class NoiseModel:
         outcome: Outcome,
         guidance_scale: float = 2.0,
     ) -> np.ndarray:
-        return np.random.randn(N_CPS, N_CHANNELS) * 0.05
+        return np.random.randn(N_CPS, N_CHANNELS)
 
 
 # ── Position B-spline helper ─────────────────────────────────────────────

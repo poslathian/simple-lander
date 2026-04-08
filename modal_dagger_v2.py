@@ -33,7 +33,7 @@ def read_source_files():
     for name in [
         "model.py", "diffusion_controller.py", "lunar_lander.py",
         "solver.py", "thrust_spline.py", "eval.py", "collect.py",
-        "guidance_controller.py",
+        "dagger_loop.py",
     ]:
         if os.path.exists(name):
             with open(name, "rb") as f:
