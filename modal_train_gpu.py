@@ -8,7 +8,7 @@ import torch
 app = modal.App("test-train-standalone")
 train_image = modal.Image.debian_slim(python_version="3.13").pip_install("torch", "numpy", "scipy")
 
-@app.function(image=train_image, gpu="T4", timeout=120)
+@app.function(image=train_image, gpu="T4", timeout=1800)
 def train_gpu(model_py_bytes, checkpoint_bytes, frame_data, epochs, lr, batch_size, T, hidden, n_blocks, print_interval=1):
     import sys, os
     os.makedirs("/root/train", exist_ok=True)
