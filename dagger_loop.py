@@ -274,9 +274,14 @@ def collect_episode(env, seed, model, margin, outcome_cond=Outcome.SUCCESS):
                     model_out[:, ch] = ctrl._diff_splines[ch].c[:N_CPS]
                 last_model_output = model_out
 
-            # KTO ground truth CPs for this window
+            # Blend KTO + diffusion CPs at the episode margin.
+            # This is the reference the PD controller actually tracks:
+            #   ref = (1 - margin) * kto + margin * diffusion
+            # At margin=0 → pure KTO expert, margin=1 → pure model output.
             kto_idx = int(round((t_sim - ctrl._kto_t0) / DT))
-            actual_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
+            kto_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
+            m = np.clip(margin, 0.001, 1.0)
+            actual_cps = (1.0 - m) * kto_cps + m * last_model_output
 
             frames.append({
                 "t_sim": t_sim,
