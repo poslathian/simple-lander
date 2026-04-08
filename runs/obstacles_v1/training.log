@@ -1,0 +1,932 @@
+============================================================
+MODAL DAGGER v2 — GPU training + cached parallel rollouts
+============================================================
+  hidden=256 blocks=6 (435,742 params)
+  frames=2000 epochs=1000 bs=128 lr=0.0001
+  collect: 80 landed + 20 failed
+  run_dir=runs/obstacles_v1
+  Fresh start from dagger_round20.pt
+
+  Pre-solving KTO pool (500 + 50 holdout)...
+  Pre-solving KTO plans for 550 seeds...
+    chunk 1/6: 100 plans (84s)
+    chunk 2/6: 200 plans (167s)
+    chunk 3/6: 300 plans (249s)
+    chunk 4/6: 400 plans (333s)
+    chunk 5/6: 500 plans (414s)
+    chunk 6/6: 550 plans (485s)
+  Pool complete: 550 plans in 485s
+  Pool: 550 plans cached
+
+============================================================
+INITIAL COLLECTION: margin=0.200
+============================================================
+    Rollouts (240 seeds from pool)... 19s  (37 landed, 203 failed)
+  37/240 landed = 15%
+  Archive: 3221 frames
+
+============================================================
+Starting 10 DAgger rounds
+============================================================
+
+────────────────────────────────────────────────────────────
+ROUND 1/10  |  margin=0.200  |  archive=3221 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 1011 frames
+
+  Training 1000 epochs on GPU...
+    ckpt=1.8MB frames=269KB
+    Done in 109.2s, saved 1.8MB to runs/obstacles_v1/dagger_round1.pt
+  Training took 112s
+  Saved: runs/obstacles_v1/dagger_round1.pt
+
+  Collecting at candidate margin=0.250...
+    Rollouts (240 seeds from pool)...an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d2f0>
+asyncgen: <async_generator object async_merge at 0x10b37d2f0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10b6b4d00>
+asyncgen: <async_generator object _Function._map at 0x10b6b4d00>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10b18e320>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10b18e320>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+ 15s  (89 landed, 21 failed)
+
+  Holdout eval (collection: 89/110 = 81%):
+    margin=0.001: 42/50 = 84%
+Task was destroyed but it is pending!
+task: <Task cancelling name='Task-2497' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/futures.py:384, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-2929' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
+    margin=0.200: 39/50 = 78%
+    margin=0.250: 43/50 = 86%
+
+  Archive: 350 eps, 4752 frames
+  IMPROVED! margin → 0.250 (candidate 43 >= 70% of baseline 42)
+  Round took 150s
+
+────────────────────────────────────────────────────────────
+ROUND 2/10  |  margin=0.250  |  archive=4752 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 2000 frames
+
+  Training 1000 epochs on GPU...
+    ckpt=1.8MB frames=532KB
+    Done in 120.8s, saved 1.8MB to runs/obstacles_v1/dagger_round2.pt
+  Training took 125s
+  Saved: runs/obstacles_v1/dagger_round2.pt
+
+  Collecting at candidate margin=0.300...
+    Rollouts (240 seeds from pool)...an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d010>
+asyncgen: <async_generator object async_merge at 0x10b37d010>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10be2bcd0>
+asyncgen: <async_generator object _Function._map at 0x10be2bcd0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 57, in wrapped
+    yield item
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 55, in wrapped
+    async with aclosing(method(self, *args, **kwargs)) as stream:
+               ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_functions.py", line 1596, in _map
+    async with aclosing(
+               ~~~~~~~~^
+        _map_invocation(
+        ^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        )
+        ^
+    ) as stream:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/parallel_map.py", line 604, in _map_invocation
+    async with aclosing(
+               ~~~~~~~~^
+        async_merge(
+        ^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    ) as streamer:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 1122, in async_merge
+    await asyncio.wait_for(
+    ...<6 lines>...
+    )
+  File "/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+RuntimeError: Task <Task pending name='Task-3664' coro=<<async_generator_athrow without __name__>()> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]> got Future <Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975]> attached to a different loop
+an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10b6aeb00>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10b6aeb00>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+ 17s  (80 landed, 20 failed)
+
+  Holdout eval (collection: 80/100 = 80%):
+    margin=0.001: 42/50 = 84%
+    margin=0.250: 43/50 = 86%
+    margin=0.300: 41/50 = 82%
+
+  Archive: 450 eps, 6115 frames
+  IMPROVED! margin → 0.300 (candidate 41 >= 70% of baseline 42)
+  Round took 162s
+
+────────────────────────────────────────────────────────────
+ROUND 3/10  |  margin=0.300  |  archive=6115 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 2000 frames
+
+  Training 1000 epochs on GPU...
+Task was destroyed but it is pending!
+task: <Task cancelling name='Task-3196' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-3661' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
+    ckpt=1.8MB frames=532KB
+    Done in 114.4s, saved 1.8MB to runs/obstacles_v1/dagger_round3.pt
+  Training took 121s
+  Saved: runs/obstacles_v1/dagger_round3.pt
+
+  Collecting at candidate margin=0.350...
+    Rollouts (240 seeds from pool)...an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d010>
+asyncgen: <async_generator object async_merge at 0x10b37d010>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10bf16e60>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10bf16e60>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10be2bcd0>
+asyncgen: <async_generator object _Function._map at 0x10be2bcd0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+ 16s  (109 landed, 21 failed)
+
+  Holdout eval (collection: 109/130 = 84%):
+    margin=0.001: 42/50 = 84%
+    margin=0.300: 41/50 = 82%
+    margin=0.350: 43/50 = 86%
+
+  Archive: 580 eps, 7939 frames
+  IMPROVED! margin → 0.350 (candidate 43 >= 70% of baseline 42)
+  Round took 150s
+
+────────────────────────────────────────────────────────────
+ROUND 4/10  |  margin=0.350  |  archive=7939 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 2000 frames
+
+  Training 1000 epochs on GPU...
+    ckpt=1.8MB frames=532KB
+    Done in 125.7s, saved 1.8MB to runs/obstacles_v1/dagger_round4.pt
+  Training took 129s
+  Saved: runs/obstacles_v1/dagger_round4.pt
+
+  Collecting at candidate margin=0.400...
+    Rollouts (240 seeds from pool)...an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d460>
+asyncgen: <async_generator object async_merge at 0x10b37d460>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10bf170a0>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10bf170a0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10b9bc6a0>
+asyncgen: <async_generator object _Function._map at 0x10b9bc6a0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 57, in wrapped
+    yield item
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 55, in wrapped
+    async with aclosing(method(self, *args, **kwargs)) as stream:
+               ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_functions.py", line 1596, in _map
+    async with aclosing(
+               ~~~~~~~~^
+        _map_invocation(
+        ^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        )
+        ^
+    ) as stream:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/parallel_map.py", line 604, in _map_invocation
+    async with aclosing(
+               ~~~~~~~~^
+        async_merge(
+        ^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    ) as streamer:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 1122, in async_merge
+    await asyncio.wait_for(
+    ...<6 lines>...
+    )
+  File "/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+RuntimeError: Task <Task pending name='Task-5082' coro=<<async_generator_athrow without __name__>()> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]> got Future <Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975]> attached to a different loop
+ 107s  (82 landed, 28 failed)
+
+  Holdout eval (collection: 82/110 = 75%):
+    margin=0.001: 43/50 = 86%
+    margin=0.350: 43/50 = 86%
+Task was destroyed but it is pending!
+task: <Task cancelling name='Task-3929' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/futures.py:384, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-4390' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
+Task was destroyed but it is pending!
+task: <Task cancelling name='Task-4654' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-5076' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
+    margin=0.400: 40/50 = 80%
+
+  Archive: 690 eps, 9408 frames
+  IMPROVED! margin → 0.400 (candidate 40 >= 70% of baseline 43)
+  Round took 253s
+
+────────────────────────────────────────────────────────────
+ROUND 5/10  |  margin=0.400  |  archive=9408 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 2000 frames
+
+  Training 1000 epochs on GPU...
+    ckpt=1.8MB frames=532KB
+    Done in 120.0s, saved 1.8MB to runs/obstacles_v1/dagger_round5.pt
+  Training took 123s
+  Saved: runs/obstacles_v1/dagger_round5.pt
+
+  Collecting at candidate margin=0.450...
+    Rollouts (240 seeds from pool)...an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10b9bc260>
+asyncgen: <async_generator object _Function._map at 0x10b9bc260>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 57, in wrapped
+    yield item
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 55, in wrapped
+    async with aclosing(method(self, *args, **kwargs)) as stream:
+               ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_functions.py", line 1596, in _map
+    async with aclosing(
+               ~~~~~~~~^
+        _map_invocation(
+        ^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        )
+        ^
+    ) as stream:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/parallel_map.py", line 604, in _map_invocation
+    async with aclosing(
+               ~~~~~~~~^
+        async_merge(
+        ^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    ) as streamer:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 1122, in async_merge
+    await asyncio.wait_for(
+    ...<6 lines>...
+    )
+  File "/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+RuntimeError: Task <Task pending name='Task-5803' coro=<<async_generator_athrow without __name__>()> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]> got Future <Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975]> attached to a different loop
+an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d460>
+asyncgen: <async_generator object async_merge at 0x10b37d460>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10bf167a0>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10bf167a0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+ 16s  (88 landed, 22 failed)
+
+  Holdout eval (collection: 88/110 = 80%):
+    margin=0.001: 44/50 = 88%
+    margin=0.400: 43/50 = 86%
+    margin=0.450: 40/50 = 80%
+
+  Archive: 800 eps, 10997 frames
+  IMPROVED! margin → 0.450 (candidate 40 >= 70% of baseline 44)
+  Round took 165s
+
+────────────────────────────────────────────────────────────
+ROUND 6/10  |  margin=0.450  |  archive=10997 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 2000 frames
+
+  Training 1000 epochs on GPU...
+    ckpt=1.8MB frames=532KB
+    Done in 112.0s, saved 1.8MB to runs/obstacles_v1/dagger_round6.pt
+  Training took 114s
+  Saved: runs/obstacles_v1/dagger_round6.pt
+
+  Collecting at candidate margin=0.500...
+    Rollouts (240 seeds from pool)...Task was destroyed but it is pending!
+task: <Task cancelling name='Task-5348' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-5800' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
+an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10b9bc040>
+asyncgen: <async_generator object _Function._map at 0x10b9bc040>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 57, in wrapped
+    yield item
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 55, in wrapped
+    async with aclosing(method(self, *args, **kwargs)) as stream:
+               ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_functions.py", line 1596, in _map
+    async with aclosing(
+               ~~~~~~~~^
+        _map_invocation(
+        ^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        )
+        ^
+    ) as stream:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/parallel_map.py", line 604, in _map_invocation
+    async with aclosing(
+               ~~~~~~~~^
+        async_merge(
+        ^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    ) as streamer:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 1122, in async_merge
+    await asyncio.wait_for(
+    ...<6 lines>...
+    )
+  File "/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+RuntimeError: Task <Task pending name='Task-6509' coro=<<async_generator_athrow without __name__>()> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]> got Future <Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975]> attached to a different loop
+an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d180>
+asyncgen: <async_generator object async_merge at 0x10b37d180>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10bf17be0>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10bf17be0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+ 18s  (90 landed, 20 failed)
+
+  Holdout eval (collection: 90/110 = 82%):
+    margin=0.001: 44/50 = 88%
+    margin=0.450: 43/50 = 86%
+    margin=0.500: 41/50 = 82%
+
+  Archive: 910 eps, 12630 frames
+  IMPROVED! margin → 0.500 (candidate 41 >= 70% of baseline 44)
+  Round took 145s
+
+────────────────────────────────────────────────────────────
+ROUND 7/10  |  margin=0.500  |  archive=12630 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 2000 frames
+
+  Training 1000 epochs on GPU...
+    ckpt=1.8MB frames=532KB
+    Done in 152.5s, saved 1.8MB to runs/obstacles_v1/dagger_round7.pt
+  Training took 155s
+  Saved: runs/obstacles_v1/dagger_round7.pt
+
+  Collecting at candidate margin=0.550...
+    Rollouts (240 seeds from pool)...an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d010>
+asyncgen: <async_generator object async_merge at 0x10b37d010>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10b9bc480>
+asyncgen: <async_generator object _Function._map at 0x10b9bc480>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 57, in wrapped
+    yield item
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 55, in wrapped
+    async with aclosing(method(self, *args, **kwargs)) as stream:
+               ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_functions.py", line 1596, in _map
+    async with aclosing(
+               ~~~~~~~~^
+        _map_invocation(
+        ^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        )
+        ^
+    ) as stream:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/parallel_map.py", line 604, in _map_invocation
+    async with aclosing(
+               ~~~~~~~~^
+        async_merge(
+        ^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    ) as streamer:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 1122, in async_merge
+    await asyncio.wait_for(
+    ...<6 lines>...
+    )
+  File "/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+RuntimeError: Task <Task pending name='Task-7235' coro=<<async_generator_athrow without __name__>()> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]> got Future <Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975]> attached to a different loop
+an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10b6ac700>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10b6ac700>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+ 19s  (89 landed, 21 failed)
+
+  Holdout eval (collection: 89/110 = 81%):
+    margin=0.001: 44/50 = 88%
+    margin=0.500: 41/50 = 82%
+    margin=0.550: 41/50 = 82%
+
+  Archive: 1020 eps, 14242 frames
+  IMPROVED! margin → 0.550 (candidate 41 >= 70% of baseline 44)
+  Round took 190s
+
+────────────────────────────────────────────────────────────
+ROUND 8/10  |  margin=0.550  |  archive=14242 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 2000 frames
+
+  Training 1000 epochs on GPU...
+Task was destroyed but it is pending!
+task: <Task cancelling name='Task-6773' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-7231' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
+    ckpt=1.8MB frames=532KB
+    Done in 109.8s, saved 1.8MB to runs/obstacles_v1/dagger_round8.pt
+  Training took 114s
+  Saved: runs/obstacles_v1/dagger_round8.pt
+
+  Collecting at candidate margin=0.600...
+    Rollouts (240 seeds from pool)...an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d010>
+asyncgen: <async_generator object async_merge at 0x10b37d010>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10b9bc6a0>
+asyncgen: <async_generator object _Function._map at 0x10b9bc6a0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 57, in wrapped
+    yield item
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 55, in wrapped
+    async with aclosing(method(self, *args, **kwargs)) as stream:
+               ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_functions.py", line 1596, in _map
+    async with aclosing(
+               ~~~~~~~~^
+        _map_invocation(
+        ^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        )
+        ^
+    ) as stream:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/parallel_map.py", line 604, in _map_invocation
+    async with aclosing(
+               ~~~~~~~~^
+        async_merge(
+        ^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    ) as streamer:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 1122, in async_merge
+    await asyncio.wait_for(
+    ...<6 lines>...
+    )
+  File "/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+RuntimeError: Task <Task pending name='Task-7952' coro=<<async_generator_athrow without __name__>()> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]> got Future <Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975]> attached to a different loop
+an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10bf15fc0>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10bf15fc0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+ 17s  (87 landed, 23 failed)
+
+  Holdout eval (collection: 87/110 = 79%):
+    margin=0.001: 45/50 = 90%
+    margin=0.550: 39/50 = 78%
+    margin=0.600: 38/50 = 76%
+
+  Archive: 1130 eps, 15815 frames
+  IMPROVED! margin → 0.600 (candidate 38 >= 70% of baseline 45)
+  Round took 149s
+
+────────────────────────────────────────────────────────────
+ROUND 9/10  |  margin=0.600  |  archive=15815 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 2000 frames
+
+  Training 1000 epochs on GPU...
+    ckpt=1.8MB frames=532KB
+    Done in 123.9s, saved 1.8MB to runs/obstacles_v1/dagger_round9.pt
+  Training took 146s
+  Saved: runs/obstacles_v1/dagger_round9.pt
+
+  Collecting at candidate margin=0.650...
+    Rollouts (240 seeds from pool)...Task was destroyed but it is pending!
+task: <Task cancelling name='Task-7499' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-7948' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
+an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10b9bc260>
+asyncgen: <async_generator object _Function._map at 0x10b9bc260>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 57, in wrapped
+    yield item
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 55, in wrapped
+    async with aclosing(method(self, *args, **kwargs)) as stream:
+               ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_functions.py", line 1596, in _map
+    async with aclosing(
+               ~~~~~~~~^
+        _map_invocation(
+        ^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        )
+        ^
+    ) as stream:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/parallel_map.py", line 604, in _map_invocation
+    async with aclosing(
+               ~~~~~~~~^
+        async_merge(
+        ^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    ) as streamer:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 1122, in async_merge
+    await asyncio.wait_for(
+    ...<6 lines>...
+    )
+  File "/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+RuntimeError: Task <Task pending name='Task-8694' coro=<<async_generator_athrow without __name__>()> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]> got Future <Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975]> attached to a different loop
+an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d2f0>
+asyncgen: <async_generator object async_merge at 0x10b37d2f0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10bf16b00>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10bf16b00>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+ 23s  (86 landed, 34 failed)
+
+  Holdout eval (collection: 86/120 = 72%):
+    margin=0.001: 44/50 = 88%
+    margin=0.600: 37/50 = 74%
+    margin=0.650: 35/50 = 70%
+
+  Archive: 1250 eps, 17449 frames
+  IMPROVED! margin → 0.650 (candidate 35 >= 70% of baseline 44)
+  Round took 208s
+
+────────────────────────────────────────────────────────────
+ROUND 10/10  |  margin=0.650  |  archive=17449 frames
+────────────────────────────────────────────────────────────
+
+  Sampling 2000 frames...
+  Got 2000 frames
+
+  Training 1000 epochs on GPU...
+    ckpt=1.8MB frames=532KB
+    Done in 126.6s, saved 1.8MB to runs/obstacles_v1/dagger_round10.pt
+  Training took 145s
+  Saved: runs/obstacles_v1/dagger_round10.pt
+
+  Collecting at candidate margin=0.700...
+    Rollouts (240 seeds from pool)...an error occurred during closing of asynchronous generator <async_generator object Synchronizer._run_generator_async at 0x10b6ac040>
+asyncgen: <async_generator object Synchronizer._run_generator_async at 0x10b6ac040>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object async_merge at 0x10b37d460>
+asyncgen: <async_generator object async_merge at 0x10b37d460>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 844, in __iter__
+    yield from run_async_gen(runner, self._async_iterable)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError: aclose(): asynchronous generator is already running
+an error occurred during closing of asynchronous generator <async_generator object _Function._map at 0x10b9bc6a0>
+asyncgen: <async_generator object _Function._map at 0x10b9bc6a0>
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 57, in wrapped
+    yield item
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_object.py", line 55, in wrapped
+    async with aclosing(method(self, *args, **kwargs)) as stream:
+               ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_functions.py", line 1596, in _map
+    async with aclosing(
+               ~~~~~~~~^
+        _map_invocation(
+        ^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        )
+        ^
+    ) as stream:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/parallel_map.py", line 604, in _map_invocation
+    async with aclosing(
+               ~~~~~~~~^
+        async_merge(
+        ^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    ) as streamer:
+    ^
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 943, in __aexit__
+    await self.agen.aclose()
+  File "/Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 1122, in async_merge
+    await asyncio.wait_for(
+    ...<6 lines>...
+    )
+  File "/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+RuntimeError: Task <Task pending name='Task-9399' coro=<<async_generator_athrow without __name__>()> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]> got Future <Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975]> attached to a different loop
+ 73s  (82 landed, 28 failed)
+
+  Holdout eval (collection: 82/110 = 75%):
+    margin=0.001: 43/50 = 86%
+    margin=0.650: 36/50 = 72%
+    margin=0.700: 35/50 = 70%
+
+  Archive: 1360 eps, 18980 frames
+  IMPROVED! margin → 0.700 (candidate 35 >= 70% of baseline 43)
+  Round took 235s
+
+============================================================
+FINAL EVALUATION
+============================================================
+Task was destroyed but it is pending!
+task: <Task cancelling name='Task-8960' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-9394' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
+    margin=0.001: 44/50 = 88%
+    margin=0.100: 41/50 = 82%
+    margin=0.200: 40/50 = 80%
+    margin=0.300: 41/50 = 82%
+    margin=0.400: 41/50 = 82%
+    margin=0.500: 39/50 = 78%
+    margin=0.700: 35/50 = 70%
+    margin=1.000: 24/50 = 48%
+
+============================================================
+COMPLETE: final margin=0.700
+============================================================
+Task was destroyed but it is pending!
+task: <Task cancelling name='Task-6068' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-6506' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
+Task was destroyed but it is pending!
+task: <Task cancelling name='Task-8215' coro=<async_merge.<locals>.producer() running at /Users/canopy4/habitat3/scratchpad/obstacles/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py:1075> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]> cb=[gather.<locals>._done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:820]>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-8692' coro=<<async_generator_athrow without __name__>()> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()]>>
