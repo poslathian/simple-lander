@@ -103,7 +103,7 @@ def solve_kto_batch(
         uw.lander.angularVelocity = 0.0
 
         t0 = time.time()
-        kto = KTOController(env, time_budget=5.0)
+        kto = KTOController(env, time_budget=3.0)
         solve_time = time.time() - t0
 
         # Serialize the plan — convert all arrays to numpy for pickling
