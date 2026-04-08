@@ -1,5 +1,20 @@
 # Issues Found in position-dagger Codebase
 
+## CRITICAL Bug: actual_tracked_cps is always raw KTO, ignoring diffusion blend
+
+**File:** `dagger_loop.py:277-279`
+
+```python
+kto_idx = int(round((t_sim - ctrl._kto_t0) / DT))
+actual_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
+```
+
+The DAgger training target `actual_tracked_cps` is always the pure KTO trajectory window, regardless of what margin was used during collection. This is fundamentally wrong for DAgger.
+
+**What should happen:** The training target should be the blended reference that the PD controller actually tracked — the margin-weighted mix of KTO + diffusion CPs. At margin=1.0, the target should be the diffusion model's own output CPs. At margin=0.5, it should be a 50/50 blend. The guidance clamp mixes expert corrections into the rollouts, and training should reflect what actually happened.
+
+**Impact:** The model learns to predict pure KTO CPs regardless of its own output. This prevents the model from ever learning to improve beyond KTO — outcome conditioning has nothing meaningful to condition on since all training targets are identical KTO trajectories with only the outcome label varying.
+
 ## ~~Not a bug: B-spline knot vectors~~
 
 **RETRACTED:** Initial analysis claimed a knot mismatch between `_fit_kto_window()` and `_make_position_spline()`. Testing confirmed both produce identical clamped knot vectors. The `internal = linspace(0, duration, n_internal)` array starts with 0.0, which overlaps with the `np.full(DEGREE, 0.0)` padding, correctly producing DEGREE+1 = 4 repeated boundary knots.
@@ -141,10 +156,16 @@ This samples a different margin on *every simulation step* within an episode, wh
 
 **Impact:** Noisy tracking behavior during collection. The PD controller tracks a reference that jitters between KTO and diffusion every 20ms.
 
-## Design Issue: _tracking_step uses simplified inverse dynamics
+## FIXED: _tracking_step uses simplified inverse dynamics
 
-**File:** `solver.py:829`
+**File:** `solver.py:829` — **FIXED** in commit e245031.
 
-As noted above, `_tracking_step` omits the `1/cos(2θ)` factor from the full inverse dynamics. This is used by both `solver.track()` and `diffusion_controller.get_action()`. The error is proportional to `1 - 1/cos(2θ)` which grows with θ. At θ=π/6 (30°), the error is about 15%.
+Sign was wrong (`-ax*st` → `+ax*st`) and `1/cos(2θ)` denominator was missing. Error was 10% at θ=6° and 69% at θ=30°.
 
-**Impact:** Tracking accuracy degrades at larger tilt angles, which occur during aggressive maneuvers that the DAgger system needs most.
+## Design Issue: Normalization stats drift across DAgger rounds
+
+**File:** `dagger_loop.py:428-430`
+
+Each DAgger round recomputes `x_mean`/`x_std` from a 500-frame subsample of the archive. These stats are then saved to the checkpoint. Since each round samples different frames, the normalization basis drifts slightly per round. Evaluation loads these checkpoint stats but the model was trained on a different normalization basis than what's stored.
+
+**Impact:** Moderate — introduces silent distribution shift between what the model learned and how outputs are denormalized at inference.
