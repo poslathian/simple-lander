@@ -46,7 +46,7 @@ class TrainedModel:
         full_cond[CFG_START] = float(outcome)  # +1 for success
 
         cond_tensor = torch.tensor(full_cond, dtype=torch.float32).unsqueeze(0)
-        x_norm = self.sampler.sample_cfg(cond_tensor, guidance_scale=guidance_scale)
+        x_norm = self.sampler.sample(cond_tensor)
 
         # Denormalize
         x_raw = (x_norm * self.x_std + self.x_mean).squeeze(0).numpy()

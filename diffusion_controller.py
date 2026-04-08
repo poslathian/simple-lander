@@ -28,12 +28,20 @@ N_CHANNELS = 3  # x, y, theta
 X_DIM = N_CPS * N_CHANNELS  # 30
 DEGREE = 3  # cubic B-spline
 
-# ── Normalization: world → uniform metric per channel ───────────────────
-# x,y: shared scale (30.0 = screen width). 1 normalized unit = 30 world units.
-# theta: world radians, scaled by π. 1 normalized unit = π radians.
-# At margin=1.0: x,y can deviate ±30 world units (full screen), theta ±π (full rotation).
-SCREEN_SIDE = 30.0  # world units — shared metric for x and y
-NORM_SCALES = np.array([SCREEN_SIDE, SCREEN_SIDE, math.pi], dtype=np.float64)
+# ── Normalization: physics-based, max_velocity × action_horizon ─────────
+# Each channel's scale = max achievable displacement over one action horizon.
+# KTO velocity bounds: vx ∈ [-20,20], vy ∈ [-20,1], omega ∈ [-3,3].
+# Action horizon = 1.5s. So max displacement = max_abs_vel × 1.5.
+# x,y CPs are lander-relative displacements. theta CPs are world radians.
+ACTION_HORIZON = 1.5
+VEL_MAX_X = 20.0   # from solver velocity bounds
+VEL_MAX_Y = 20.0
+OMEGA_MAX = 3.0
+NORM_SCALES = np.array([
+    VEL_MAX_X * ACTION_HORIZON,   # 30.0 — max x displacement
+    VEL_MAX_Y * ACTION_HORIZON,   # 30.0 — max y displacement
+    OMEGA_MAX * ACTION_HORIZON,   #  4.5 — max theta change
+], dtype=np.float64)
 
 # ── Coordinate types ──────────────────────────────────────────────────────
 
@@ -245,7 +253,7 @@ class KTODiffusionController:
         cps_norm = self.model.predict(cond, self.outcome, guidance_scale=2.0)
         cps_norm = np.clip(cps_norm, -1.0, 1.0)  # keep CPs in valid normalized range
         cps_norm[0, :2] = 0.0                    # x,y: pin to relative origin
-        cps_norm[0, 2] = q_now[2] / math.pi      # theta: pin to current world angle
+        cps_norm[0, 2] = q_now[2] / NORM_SCALES[2]  # theta: pin to current world angle
         self._last_cps_norm = cps_norm.copy()
 
         # Denormalize to world units for spline building

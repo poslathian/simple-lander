@@ -55,8 +55,8 @@ class PositionDataset(Dataset):
         cond[:STATE_DIM] = self.conds[idx]
         cond[CFG_START] = self.outcomes[idx]  # +1 or -1
 
-        # CFG dropout: zero the outcome dim with probability
-        if np.random.random() < CFG_DROPOUT_RATE:
+        # No CFG dropout — outcome is a regular conditioning input
+        if False:
             cond[CFG_START:CFG_END] = 0.0
 
         return (
@@ -87,7 +87,7 @@ def _quick_eval(model_state, x_mean, x_std, T, n_seeds=20, seed_offset=9000):
             full[:STATE_DIM] = cond[:STATE_DIM]
             full[CFG_START] = float(outcome)
             ct = torch.tensor(full, dtype=torch.float32).unsqueeze(0)
-            x_norm = self.sampler.sample_cfg(ct, guidance_scale=guidance_scale)
+            x_norm = self.sampler.sample(ct)
             x_raw = (x_norm * self.x_std + self.x_mean).squeeze(0).numpy()
             cps = x_raw.reshape(N_CPS, N_CHANNELS)
             cps[0] = [0, 0, 0]

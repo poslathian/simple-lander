@@ -403,8 +403,8 @@ class ArchiveDataset(Dataset):
 
     def __getitem__(self, idx):
         cond = self.conds[idx].copy()
-        # CFG dropout: zero outcome with 50% probability
-        if np.random.random() < 0.5:
+        # No CFG dropout — outcome is a regular conditioning input
+        if False:
             cond[CFG_START:CFG_END] = 0.0
         return (
             torch.tensor(cond, dtype=torch.float32),
@@ -495,7 +495,7 @@ class _LiveModel:
         full[CFG_START] = float(outcome)
         ct = torch.tensor(full, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
-            x_norm = self.sampler.sample_cfg(ct, guidance_scale=guidance_scale)
+            x_norm = self.sampler.sample(ct)
         x_raw = (x_norm * self.x_std + self.x_mean).squeeze(0).numpy()
         cps = x_raw.reshape(N_CPS, N_CHANNELS)
         cps[0] = [0, 0, 0]

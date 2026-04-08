@@ -355,8 +355,8 @@ class TestNormalizationConsistency:
 
 class TestCFGConditioning:
 
-    def test_cfg_dropout_zeros_outcome_dim_only(self):
-        """CFG dropout should zero only index [20], not state dims [0:20]."""
+    def test_outcome_always_passed_through(self):
+        """Outcome is a regular input — no CFG dropout, always passed through."""
         from train import PositionDataset
 
         # Create a minimal training DB
@@ -405,10 +405,10 @@ class TestCFGConditioning:
                         f"Outcome should be 1.0 when not dropped, got {c[CFG_START]}"
                     )
 
-            # Should be ~50/50 with some variance
-            ratio = n_dropped / (n_dropped + n_kept)
-            print(f"  CFG dropout ratio: {ratio:.2f} (expected ~0.50)")
-            assert 0.3 < ratio < 0.7, f"Dropout ratio {ratio:.2f} far from 0.5"
+            # No CFG dropout — outcome should always be passed through
+            print(f"  Outcome kept: {n_kept}, dropped: {n_dropped}")
+            assert n_dropped == 0, f"Outcome should never be dropped, got {n_dropped} drops"
+            assert n_kept == 200, f"Outcome should always be present"
         finally:
             os.unlink(db_path)
 

@@ -58,8 +58,7 @@ def train_gpu(model_py_bytes, checkpoint_bytes, frame_data, epochs, lr, batch_si
             return len(s.c)
         def __getitem__(s, i):
             c = s.c[i].copy()
-            if np.random.random() < 0.5:
-                c[CFG_START:CFG_END] = 0.0
+            # No CFG dropout — outcome is a regular conditioning input
             return torch.tensor(c, dtype=torch.float32), torch.tensor(s.t[i], dtype=torch.float32)
     
     loader = DataLoader(_DS(conds, targets), batch_size=batch_size, shuffle=True)

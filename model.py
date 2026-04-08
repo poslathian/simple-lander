@@ -97,7 +97,7 @@ class CosineSchedule:
         return self.alpha_bar[t]
 
 
-# ── DDIM sampler with CFG ────────────────────────────────────────────────
+# ── DDIM sampler ────────────────────────────────────────────────────────
 
 class DDIMSampler:
     def __init__(self, model: DiffusionMLP, schedule: CosineSchedule,
@@ -130,13 +130,33 @@ class DDIMSampler:
         return x
 
     @torch.no_grad()
+    def sample(
+        self,
+        cond: torch.Tensor,
+        device: str = "cpu",
+    ) -> torch.Tensor:
+        """DDIM sample conditioned on cond (includes outcome as input dim)."""
+        B = cond.shape[0]
+        x_dim = self.model.output_proj.out_features
+        x = torch.randn(B, x_dim, device=device)
+
+        for i in range(len(self.timesteps)):
+            t_cur = self.timesteps[i]
+            t_prev = self.timesteps[i + 1] if i + 1 < len(self.timesteps) else 0
+            t_batch = torch.full((B,), t_cur, device=device, dtype=torch.long)
+            eps_pred = self.model(x, cond, t_batch)
+            x = self._ddim_step(x, eps_pred, t_cur, t_prev, device)
+
+        return x
+
+    @torch.no_grad()
     def sample_cfg(
         self,
         cond: torch.Tensor,
         guidance_scale: float = 2.0,
         device: str = "cpu",
     ) -> torch.Tensor:
-        """Sample with classifier-free guidance on the outcome dim."""
+        """Sample with classifier-free guidance (legacy, prefer sample())."""
         B = cond.shape[0]
         x_dim = self.model.output_proj.out_features
         x = torch.randn(B, x_dim, device=device)

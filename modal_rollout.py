@@ -184,7 +184,7 @@ def rollout_with_cache(
             full[CFG_START] = float(outcome)
             ct = torch.tensor(full, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
-                x_norm = sampler.sample_cfg(ct, guidance_scale=guidance_scale)
+                x_norm = sampler.sample(ct)
             x_raw = (x_norm * x_std + x_mean).squeeze(0).numpy()
             cps = x_raw.reshape(N_CPS, N_CHANNELS)
             cps[0] = [0, 0, 0]
@@ -464,7 +464,7 @@ def rollout_with_cache_local(
             full[CFG_START] = float(outcome)
             ct = torch.tensor(full, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
-                x_norm = sampler.sample_cfg(ct, guidance_scale=guidance_scale)
+                x_norm = sampler.sample(ct)
             x_raw = (x_norm * x_std + x_mean).squeeze(0).numpy()
             cps = x_raw.reshape(N_CPS, N_CHANNELS)
             cps[0] = [0, 0, 0]
