@@ -85,9 +85,12 @@ class TrainingDB:
 def _fit_kto_window(plan, idx, action_horizon, dt=DT):
     """Fit KTO trajectory from idx forward (action_horizon seconds) to 10 CPs x 3.
 
-    Returns (10, 3) numpy array of position control points in lander-relative coords.
-    Origin = plan position at idx.
+    Returns (10, 3) numpy array of normalized position control points in
+    lander-relative coords. Each channel is divided by NORM_SCALES so the
+    CPs share the same [0,1] screen-fraction basis as the diffusion model.
     """
+    from diffusion_controller import NORM_SCALES
+
     n_steps = int(round(action_horizon / dt))
     end_idx = min(idx + n_steps, len(plan["x"]) - 1)
     if end_idx <= idx:
@@ -102,9 +105,7 @@ def _fit_kto_window(plan, idx, action_horizon, dt=DT):
     th_rel = np.array(plan["theta"][idx:end_idx], dtype=np.float64) - th0
 
     if len(t) < N_CPS:
-        # Not enough points, pad with zeros
-        cps = np.zeros((N_CPS, N_CHANNELS), dtype=np.float64)
-        return cps
+        return np.zeros((N_CPS, N_CHANNELS), dtype=np.float64)
 
     # Build knot vector for LSQ fit
     duration = t[-1]
@@ -127,6 +128,8 @@ def _fit_kto_window(plan, idx, action_horizon, dt=DT):
         except Exception:
             pass  # Leave as zeros
 
+    # Normalize: world-relative → screen-fraction
+    cps /= NORM_SCALES
     return cps
 
 

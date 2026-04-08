@@ -400,9 +400,9 @@ class TestMarginBlending:
         a tiny one."""
 
         class LargeOffsetModel:
-            """Returns CPs far from any KTO reference."""
+            """Returns CPs far from KTO in normalized coords."""
             def predict(self, cond, outcome, guidance_scale=2.0):
-                cps = np.ones((N_CPS, N_CHANNELS)) * 5.0
+                cps = np.ones((N_CPS, N_CHANNELS)) * 0.8
                 cps[0] = [0, 0, 0]
                 return cps
 

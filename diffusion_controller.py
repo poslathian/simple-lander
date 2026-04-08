@@ -28,6 +28,13 @@ N_CHANNELS = 3  # x, y, theta
 X_DIM = N_CPS * N_CHANNELS  # 30
 DEGREE = 3  # cubic B-spline
 
+# ── Normalization: world → [0,1] per channel ────────────────────────────
+# x: screen width (30.0), y: screen height (20.0), theta: unnormalized (radians)
+# Model outputs and training targets are in normalized lander-relative coords.
+# Margin = fraction of full range (0.5 = half screen, 1.0 = unclamped).
+# Theta is NOT normalized — the model can rotate freely at margin=1.0.
+NORM_SCALES = np.array([30.0, 20.0, 1.0], dtype=np.float64)
+
 # ── Coordinate types ──────────────────────────────────────────────────────
 
 Position = tuple[float, float, float]      # (x, y, theta)
@@ -72,7 +79,7 @@ class ModelProtocol(Protocol):
 # ── NoiseModel (Step 0 stub) ─────────────────────────────────────────────
 
 class NoiseModel:
-    """Drop-in for DiffusionModel that returns random CPs."""
+    """Drop-in for DiffusionModel that returns random normalized CPs."""
 
     def predict(
         self,
@@ -80,7 +87,7 @@ class NoiseModel:
         outcome: Outcome,
         guidance_scale: float = 2.0,
     ) -> np.ndarray:
-        return np.random.randn(N_CPS, N_CHANNELS) * 0.1
+        return np.random.randn(N_CPS, N_CHANNELS) * 0.05
 
 
 # ── Position B-spline helper ─────────────────────────────────────────────
@@ -231,10 +238,13 @@ class KTODiffusionController:
             action_horizon=self.action_horizon,
         )
 
-        cps = self.model.predict(cond, self.outcome, guidance_scale=2.0)
-        cps[0] = [0.0, 0.0, 0.0]  # Pin first CP to origin
+        cps_norm = self.model.predict(cond, self.outcome, guidance_scale=2.0)
+        cps_norm[0] = [0.0, 0.0, 0.0]  # Pin first CP to origin
+        self._last_cps_norm = cps_norm.copy()
 
-        self._diff_splines = _make_position_spline(cps, self.action_horizon)
+        # Denormalize to world-relative for spline building
+        cps_world = cps_norm * NORM_SCALES
+        self._diff_splines = _make_position_spline(cps_world, self.action_horizon)
         self._diff_t0 = t_sim
         self._diff_q_origin = np.array(q_now)
         self._last_inference_q = q_now
@@ -243,9 +253,8 @@ class KTODiffusionController:
         """Clamp diffusion position ref to within margin of KTO, PD track.
 
         Args:
-            guidance_margin: [0,1]. 0=pure KTO, 1=unclamped diffusion.
-                Mapped to clamp radius via m/(1-m): 0.001→~0.001,
-                0.5→1.0, 0.9→9.0, 1.0→unclamped.
+            guidance_margin: [0,1] fraction of full range per channel.
+                0=pure KTO, 0.5=half screen deviation, 1=unclamped.
 
         Returns:
             (thrust_v, thrust_h) each in [-1, 1].
@@ -269,25 +278,21 @@ class KTODiffusionController:
             kto_v = (0.0, 0.0, 0.0)
             kto_a = (0.0, 0.0, 0.0)
 
-        # Diffusion ref clamped to within radius of KTO
+        # Diffusion ref clamped to within margin of KTO in normalized space
         m = float(np.clip(guidance_margin, 0.0, 1.0))
         if self._diff_splines is not None and m > 0.0:
             t_diff = t_sim - self._diff_t0
             diff_rel = _eval_spline(self._diff_splines, t_diff, self.action_horizon)
-            diff_world = (
+            diff_world = np.array([
                 self._diff_q_origin[0] + diff_rel[0],
                 self._diff_q_origin[1] + diff_rel[1],
                 self._diff_q_origin[2] + diff_rel[2],
-            )
-            if m >= 1.0:
-                # Unclamped: trust diffusion fully
-                x_ref, y_ref, th_ref = diff_world[0], diff_world[1], diff_world[2]
-            else:
-                # Clamp radius: m/(1-m) maps [0,1) → [0,∞)
-                r = m / (1.0 - m)
-                x_ref = float(np.clip(diff_world[0], kto_q[0] - r, kto_q[0] + r))
-                y_ref = float(np.clip(diff_world[1], kto_q[1] - r, kto_q[1] + r))
-                th_ref = float(np.clip(diff_world[2], kto_q[2] - r, kto_q[2] + r))
+            ])
+            # Normalize to [0,1] screen coords, clamp, denormalize
+            kto_n = np.array(kto_q) / NORM_SCALES
+            diff_n = diff_world / NORM_SCALES
+            ref_n = np.clip(diff_n, kto_n - m, kto_n + m)
+            x_ref, y_ref, th_ref = ref_n * NORM_SCALES
         else:
             x_ref, y_ref, th_ref = kto_q
 

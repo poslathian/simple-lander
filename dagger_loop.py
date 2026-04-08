@@ -167,7 +167,9 @@ def _git_commit():
 
 
 def _fit_kto_window(plan, idx, action_horizon, dt=DT):
-    """Fit KTO trajectory window to 10 CP x 3 position B-spline."""
+    """Fit KTO trajectory window to 10 CP x 3 normalized position B-spline."""
+    from diffusion_controller import NORM_SCALES
+
     n_steps = int(round(action_horizon / dt))
     end_idx = min(idx + n_steps, len(plan["x"]) - 1)
     if end_idx <= idx:
@@ -204,6 +206,9 @@ def _fit_kto_window(plan, idx, action_horizon, dt=DT):
             cps[:, ch] = spline.c[:N_CPS]
         except Exception:
             pass
+
+    # Normalize: world-relative → screen-fraction
+    cps /= NORM_SCALES
     return cps
 
 
@@ -265,26 +270,16 @@ def collect_episode(env, seed, model, margin, outcome_cond=Outcome.SUCCESS):
             ctrl.inference()
             last_inference_step = step_idx
 
-            # Capture model output: reconstruct CPs from the splines
-            if ctrl._diff_splines is not None:
-                # The model output is what was passed to _make_position_spline
-                # We can recover it from the spline coefficients
-                model_out = np.zeros((N_CPS, N_CHANNELS), dtype=np.float32)
-                for ch in range(N_CHANNELS):
-                    model_out[:, ch] = ctrl._diff_splines[ch].c[:N_CPS]
-                last_model_output = model_out
+            # Capture normalized model output CPs
+            if hasattr(ctrl, '_last_cps_norm') and ctrl._last_cps_norm is not None:
+                last_model_output = ctrl._last_cps_norm.copy()
 
-            # Clamp diffusion CPs to within normalized margin of KTO CPs.
-            # margin ∈ [0,1]: 0=pure KTO, 1=unclamped diffusion.
-            # Radius = m/(1-m), matching get_action() semantics.
+            # Clamp model CPs to within margin of KTO CPs (both normalized).
+            # margin = fraction of full range: 0.5 = half screen, 1.0 = unclamped.
             kto_idx = int(round((t_sim - ctrl._kto_t0) / DT))
             kto_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
             m = float(np.clip(margin, 0.0, 1.0))
-            if m >= 1.0:
-                actual_cps = last_model_output.copy()
-            else:
-                r = m / (1.0 - m)
-                actual_cps = np.clip(last_model_output, kto_cps - r, kto_cps + r)
+            actual_cps = np.clip(last_model_output, kto_cps - m, kto_cps + m)
 
             frames.append({
                 "t_sim": t_sim,

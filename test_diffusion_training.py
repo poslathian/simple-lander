@@ -71,15 +71,16 @@ class TestActualTrackedCPsIsBlended:
         uw.lander.linearVelocity = (0.0, 0.0)
         uw.lander.angularVelocity = 0.0
 
-        # Model returns CPs with a large known offset from KTO
+        # Model returns CPs with a known offset in normalized space.
+        # 0.8 normalized x = 0.8 * 30 = 24 world units — nearly full screen.
         class OffsetModel:
             def predict(self, cond, outcome, guidance_scale=2.0):
                 cps = np.zeros((N_CPS, N_CHANNELS))
-                cps[1:, 0] = 3.0  # x-offset of 3.0 on all non-pinned CPs
+                cps[1:, 0] = 0.8  # x-offset of 0.8 screen widths
                 cps[0] = [0, 0, 0]
                 return cps
 
-        margin = 0.5
+        margin = 0.3
         ep_info, frames = collect_episode(
             env, 100, OffsetModel(), margin=margin, outcome_cond=Outcome.SUCCESS,
         )
@@ -88,12 +89,12 @@ class TestActualTrackedCPsIsBlended:
         assert len(frames) > 1, "Need at least 2 frames"
 
         frame = frames[1]
-        actual = np.frombuffer(frame["actual_tracked_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
-        model_out = np.frombuffer(frame["model_output_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
+        actual = np.asarray(frame["actual_tracked_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
+        model_out = np.asarray(frame["model_output_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
 
-        # Model x-CPs are 3.0 (far from KTO). With margin=0.5, clamp
-        # radius = 0.5/(1-0.5) = 1.0, so actual = clip(3.0, kto-1, kto+1).
-        # KTO CPs are small (~0), so actual_x ≈ clip(3.0, -1, 1) ≈ 1.0.
+        # Model x-CPs are 3.0 in normalized space (= 3.0 * 30 = 90 world units).
+        # KTO CPs are small in normalized space (~0).
+        # With margin=0.5, clamp clips model to kto ± 0.5.
         actual_x = actual[1:, 0]
         model_x = model_out[1:, 0]
 
@@ -101,11 +102,11 @@ class TestActualTrackedCPsIsBlended:
         print(f"  actual_tracked x (non-pinned): mean={actual_x.mean():.3f}")
 
         # actual_tracked should NOT be pure KTO (would be ~0)
-        assert actual_x.mean() > 0.1, (
+        assert actual_x.mean() > 0.01, (
             f"actual_tracked_cps has no model influence: x-mean={actual_x.mean():.3f}"
         )
-        # actual_tracked should NOT be raw model output (would be 3.0)
-        assert actual_x.mean() < 2.5, (
+        # actual_tracked should NOT be raw model output (would be 0.8)
+        assert actual_x.mean() < 0.7, (
             f"actual_tracked_cps is unclamped model output: x-mean={actual_x.mean():.3f}"
         )
 
@@ -120,7 +121,7 @@ class TestActualTrackedCPsIsBlended:
 
         class WildModel:
             def predict(self, cond, outcome, guidance_scale=2.0):
-                cps = np.ones((N_CPS, N_CHANNELS)) * 10.0
+                cps = np.ones((N_CPS, N_CHANNELS)) * 0.9
                 cps[0] = [0, 0, 0]
                 return cps
 
@@ -131,11 +132,111 @@ class TestActualTrackedCPsIsBlended:
 
         if len(frames) > 1:
             frame = frames[1]
-            actual = np.frombuffer(frame["actual_tracked_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
-            # With margin=0.001, radius = 0.001/0.999 ≈ 0.001
-            # Model output of 10.0 gets clamped to kto±0.001
-            # So actual should be very close to KTO (small values)
-            assert np.abs(actual[1:]).max() < 15.0, "Should be near KTO at tiny margin"
+            actual = np.asarray(frame["actual_tracked_cps"], dtype=np.float32).reshape(N_CPS, N_CHANNELS)
+            # With margin=0.001, model output of 0.9 gets clamped to kto±0.001
+            # KTO CPs are small, so actual ≈ kto (near zero)
+            assert np.abs(actual[1:, 0]).max() < 0.1, (
+                f"Should be near KTO at tiny margin, got max={np.abs(actual[1:, 0]).max():.3f}"
+            )
+
+
+# ===========================================================================
+# Test: Normalization roundtrip through spline
+# ===========================================================================
+
+class TestNormalizationRoundtrip:
+
+    def test_normalized_cps_spline_roundtrip(self):
+        """Normalized CPs → denormalize → build spline → evaluate should
+        produce world-frame values consistent with the original trajectory."""
+        from diffusion_controller import NORM_SCALES
+
+        # Create normalized CPs (model output space)
+        cps_norm = np.random.RandomState(42).randn(N_CPS, N_CHANNELS) * 0.1
+        cps_norm[0] = [0, 0, 0]
+
+        # Denormalize to world-relative (what inference() does)
+        cps_world = cps_norm * NORM_SCALES
+
+        # Build spline in world-relative coords
+        duration = 1.5
+        splines = _make_position_spline(cps_world, duration)
+
+        # Evaluate at midpoint
+        mid = _eval_spline(splines, duration / 2, duration)
+
+        # The spline value should be in world-relative coords
+        # Re-normalize and check it's in the expected range
+        mid_norm = np.array(mid) / NORM_SCALES
+        print(f"  mid_world: {mid}")
+        print(f"  mid_norm:  {mid_norm}")
+
+        # Normalized values should be small (CPs were ~0.1 normalized)
+        assert np.abs(mid_norm).max() < 1.0, (
+            f"Normalized midpoint too large: {mid_norm}"
+        )
+
+    def test_fit_kto_window_produces_normalized_cps(self):
+        """_fit_kto_window should output normalized CPs (divided by NORM_SCALES)."""
+        from collect import _fit_kto_window
+        from diffusion_controller import NORM_SCALES
+
+        # Build a KTO-like plan: descend from (15, 17) to (15, 5)
+        n = 100
+        plan = {
+            "x": np.full(n, 15.0),
+            "y": np.linspace(17.0, 5.0, n),
+            "theta": np.zeros(n),
+        }
+        cps = _fit_kto_window(plan, idx=0, action_horizon=1.5)
+
+        # CPs are normalized. The y displacement is 17→5 = -12 world units.
+        # Normalized: -12/20 = -0.6. CPs should be in this range.
+        y_cps = cps[1:, 1]  # skip pinned first CP
+        print(f"  y CPs (normalized): {y_cps}")
+        assert np.abs(y_cps).max() < 1.0, (
+            f"Normalized y CPs should be < 1.0, got max={np.abs(y_cps).max():.3f}"
+        )
+        # Should have negative y values (descending)
+        assert y_cps.min() < -0.1, (
+            f"Expected negative y CPs for descent, got min={y_cps.min():.3f}"
+        )
+
+    def test_kto_spline_roundtrip_preserves_trajectory(self):
+        """Fit KTO → normalize CPs → denormalize → build spline → evaluate
+        should reconstruct the original KTO trajectory."""
+        from collect import _fit_kto_window
+        from diffusion_controller import NORM_SCALES
+
+        n = 100
+        dt = 0.02
+        plan = {
+            "x": np.linspace(15.0, 15.0, n),
+            "y": np.linspace(17.0, 5.0, n),
+            "theta": np.linspace(0.0, -0.3, n),
+        }
+
+        cps_norm = _fit_kto_window(plan, idx=0, action_horizon=1.5)
+        cps_world = cps_norm * NORM_SCALES
+
+        duration = 1.5
+        splines = _make_position_spline(cps_world, duration)
+
+        # Evaluate at a few time points and compare to original trajectory
+        for step in [10, 30, 50, 70]:
+            t = step * dt
+            if t > duration:
+                break
+            spline_val = _eval_spline(splines, t, duration)
+            # Original relative position at this time
+            orig_y_rel = plan["y"][step] - plan["y"][0]
+            orig_th_rel = plan["theta"][step] - plan["theta"][0]
+
+            # Spline should approximate the original trajectory
+            assert abs(spline_val[1] - orig_y_rel) < 1.0, (
+                f"Step {step}: spline y={spline_val[1]:.3f}, "
+                f"orig y_rel={orig_y_rel:.3f}"
+            )
 
 
 # ===========================================================================
