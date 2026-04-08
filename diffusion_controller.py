@@ -28,12 +28,13 @@ N_CHANNELS = 3  # x, y, theta
 X_DIM = N_CPS * N_CHANNELS  # 30
 DEGREE = 3  # cubic B-spline
 
-# ── Normalization: world → [0,1] per channel ────────────────────────────
-# x: screen width (30.0), y: screen height (20.0), theta: unnormalized (radians)
-# Model outputs and training targets are in normalized lander-relative coords.
-# Margin = fraction of full range (0.5 = half screen, 1.0 = unclamped).
-# Theta is NOT normalized — the model can rotate freely at margin=1.0.
-NORM_SCALES = np.array([30.0, 20.0, 1.0], dtype=np.float64)
+# ── Normalization: world → uniform metric per channel ───────────────────
+# x and y share the same scale (30.0 = screen width) so 1 normalized unit
+# = 30 world units in both axes. The screen is 30x20, so x∈[0,1], y∈[0,⅔].
+# Theta is unnormalized (radians) — model can rotate freely at margin=1.0.
+# Margin = fraction of screen width (0.5 = ±15 world units in x AND y).
+SCREEN_SIDE = 30.0  # world units — shared metric for x and y
+NORM_SCALES = np.array([SCREEN_SIDE, SCREEN_SIDE, 1.0], dtype=np.float64)
 
 # ── Coordinate types ──────────────────────────────────────────────────────
 
