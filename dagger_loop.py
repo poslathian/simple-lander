@@ -525,10 +525,9 @@ def train_on_archive(model, archive_db, epochs=500, batch_size=64, lr=1e-4,
 
     schedule = CosineSchedule(T=T)
 
-    # Compute normalization stats from this batch if not provided
-    if x_mean is None:
-        x_mean = torch.tensor(dataset.targets.mean(axis=0), dtype=torch.float32)
-        x_std = torch.tensor(dataset.targets.std(axis=0).clip(1e-6), dtype=torch.float32)
+    # Always recompute normalization stats from current training data
+    x_mean = torch.tensor(dataset.targets.mean(axis=0), dtype=torch.float32)
+    x_std = torch.tensor(dataset.targets.std(axis=0).clip(1e-6), dtype=torch.float32)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
@@ -735,7 +734,7 @@ def main():
         print(f"  Saved pool to {pool_path}")
 
     # ── Initial collection: 40 landed + 10 failed ────────────────────────
-    margin_mean = args.resume_margin if resuming else 0.01
+    margin_mean = args.resume_margin if resuming else 0.001
     seed_counter = args.seed_offset
 
     if not resuming:
@@ -903,9 +902,9 @@ def main():
 
         old_margin = margin_mean
         if new_rate >= 0.7:
-            margin_mean = float(np.clip(margin_mean + 0.01, 0.01, 1.0))
+            margin_mean = float(np.clip(margin_mean + 0.001, 0.001, 1.0))
         else:
-            margin_mean = float(np.clip(margin_mean - 0.01, 0.01, 1.0))
+            margin_mean = float(np.clip(margin_mean - 0.001, 0.001, 1.0))
         print(f"\n  landing {new_rate:.0%} → margin {old_margin:.3f} → {margin_mean:.3f}")
 
         print(f"  Round {round_num} took {round_time:.0f}s")
