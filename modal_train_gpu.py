@@ -44,8 +44,9 @@ def train_gpu(model_py_bytes, checkpoint_bytes, frame_data, epochs, lr, batch_si
     targets = np.array([f[1] for f in frame_list], dtype=np.float32)
     print(f"Training on {len(conds)} frames for {epochs} epochs")
     
-    x_mean = torch.tensor(ckpt["x_mean"], dtype=torch.float32).to(device)
-    x_std = torch.tensor(ckpt["x_std"], dtype=torch.float32).to(device)
+    # Always recompute from current training data (not stale checkpoint stats)
+    x_mean = torch.tensor(targets.mean(axis=0), dtype=torch.float32).to(device)
+    x_std = torch.tensor(targets.std(axis=0).clip(1e-6), dtype=torch.float32).to(device)
     
     schedule = CosineSchedule(T=T)
     alpha_bar_all = torch.tensor(schedule.alpha_bar, dtype=torch.float32, device=device)

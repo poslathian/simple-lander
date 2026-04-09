@@ -235,7 +235,7 @@ def evaluate_from_pool(ckpt_bytes, plan_pool, margins, holdout_seeds,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="position_model_923760b.pt")
+    parser.add_argument("--checkpoint", default="fresh_1024.pt")
     parser.add_argument("--resume-checkpoint", default=None,
                         help="Resume from this checkpoint (keeps archive DB)")
     parser.add_argument("--rounds", type=int, default=20)
@@ -283,22 +283,33 @@ def main():
         print(f"  Archive: {archive_db.count_episodes()} eps, {archive_db.count_frames()} frames")
     else:
         ckpt_path = args.checkpoint
-        margin_mean = 0.2
+        margin_mean = 0.001
         archive_db.clear()
         current_db.clear()
         print(f"  Fresh start from {ckpt_path}")
 
-    margin_increment = 0.05
+    # margin advances ±0.001 per round based on landing rate
     POOL_SIZE = 500
     pool_seeds = list(range(args.seed_offset, args.seed_offset + POOL_SIZE))
 
-    # Pre-solve KTO plans for entire seed pool + holdout seeds (one-time cost)
+    # Pre-solve KTO plans (cached to disk)
     rollout_app, solve_fn, rollout_fn = _get_rollout_functions()
-    print(f"\n  Pre-solving KTO pool ({POOL_SIZE} + {len(HOLDOUT_SEEDS)} holdout)...")
-    plan_pool = presolve_kto_pool(
-        source_files, pool_seeds + HOLDOUT_SEEDS, solve_fn, rollout_app,
-    )
-    print(f"  Pool: {len(plan_pool)} plans cached")
+    pool_path = os.path.join(args.run_dir, "kto_pool.pkl")
+    if os.path.exists(pool_path):
+        import pickle
+        with open(pool_path, "rb") as f:
+            plan_pool = pickle.load(f)
+        print(f"\n  Loaded cached KTO pool: {len(plan_pool)} plans from {pool_path}")
+    else:
+        print(f"\n  Pre-solving KTO pool ({POOL_SIZE} + {len(HOLDOUT_SEEDS)} holdout)...")
+        plan_pool = presolve_kto_pool(
+            source_files, pool_seeds + HOLDOUT_SEEDS, solve_fn, rollout_app,
+        )
+        import pickle
+        with open(pool_path, "wb") as f:
+            pickle.dump(plan_pool, f)
+        print(f"  Saved pool to {pool_path}")
+    print(f"  Pool: {len(plan_pool)} plans")
 
     # Initial collection (skip if resuming)
     if not resuming:
@@ -383,53 +394,68 @@ def main():
         print(f"  Saved: {ckpt_path}")
 
         # Step 4-5: Collect + eval from cached pool (no KTO solve!)
-        candidate_margin = np.clip(margin_mean + margin_increment, 0.001, 1.0)
-        print(f"\n  Collecting at candidate margin={candidate_margin:.3f}...")
+        candidate_margin = margin_mean
+        print(f"\n  Collecting at margin={candidate_margin:.3f}...")
         current_db.clear()
 
         with rollout_app.run():
             new_results = collect_from_pool(
                 new_ckpt_bytes, plan_pool,
-                n_landed=args.target_landed, n_failed=args.target_failed,
+                n_landed=args.target_landed, n_failed=0,
                 margin_mean=candidate_margin,
                 hidden=args.hidden, n_blocks=args.n_blocks,
                 source_files=source_files, _rollout_fn=rollout_fn,
             )
 
-            current_db.store_remote_results(new_results, git_commit)
+            # Only store up to 40 successes + 10 failures
+            keep = []
+            kept_l, kept_f = 0, 0
+            for r in new_results:
+                if r["landed"] and kept_l < 40:
+                    keep.append(r)
+                    kept_l += 1
+                elif not r["landed"] and kept_f < 10:
+                    keep.append(r)
+                    kept_f += 1
+
+            current_db.store_remote_results(keep, git_commit)
             n_landed = sum(1 for r in new_results if r["landed"])
             n_total = len(new_results)
             new_rate = n_landed / n_total if n_total else 0
 
             # Holdout eval
             print(f"\n  Holdout eval (collection: {n_landed}/{n_total} = {new_rate:.0%}):")
-            eval_margins = sorted(set([0.001, margin_mean, candidate_margin]))
+            eval_margins = sorted(set([0.001, margin_mean]))
             eval_results = evaluate_from_pool(
                 new_ckpt_bytes, plan_pool, eval_margins, HOLDOUT_SEEDS,
                 hidden=args.hidden, n_blocks=args.n_blocks,
                 source_files=source_files, _rollout_fn=rollout_fn,
             )
 
-        baseline_lands = eval_results.get(0.001, (0, 50))[0]
-        candidate_key = min(eval_results.keys(),
-                            key=lambda m: abs(m - candidate_margin))
-        candidate_lands = eval_results[candidate_key][0]
+            # Outcome=-1 eval
+            fail_results = evaluate_from_pool(
+                new_ckpt_bytes, plan_pool, [candidate_margin],
+                HOLDOUT_SEEDS[:20],
+                hidden=args.hidden, n_blocks=args.n_blocks,
+                source_files=source_files, _rollout_fn=rollout_fn,
+            )
+            if fail_results:
+                fk = list(fail_results.keys())[0]
+                fl, ft = fail_results[fk]
+                print(f"    outcome=-1 @ m={candidate_margin:.3f}: {fl}/{ft} = {fl/ft:.0%}")
 
         # Step 6: Add to archive
         archive_db.copy_from(current_db)
         print(f"\n  Archive: {archive_db.count_episodes()} eps, "
               f"{archive_db.count_frames()} frames")
 
-        # Step 7-8: Advance if collection >= 50% AND candidate >= 70% of baseline
-        baseline_threshold = int(baseline_lands * 0.70)
-        improved = new_rate >= 0.5 and candidate_lands >= baseline_threshold
-        if improved:
-            margin_mean = candidate_margin
-            print(f"  IMPROVED! margin → {margin_mean:.3f} "
-                  f"(candidate {candidate_lands} >= 70% of baseline {baseline_lands})")
+        # Step 7-8: Advance margin based on landing rate
+        old_margin = margin_mean
+        if new_rate >= 0.7:
+            margin_mean = float(np.clip(margin_mean + 0.001, 0.001, 1.0))
         else:
-            print(f"  No improvement. margin stays at {margin_mean:.3f} "
-                  f"(candidate {candidate_lands} vs 70%×baseline={baseline_threshold})")
+            margin_mean = float(np.clip(margin_mean - 0.001, 0.001, 1.0))
+        print(f"\n  landing {new_rate:.0%} → margin {old_margin:.3f} → {margin_mean:.3f}")
 
         elapsed = time.time() - t_round
         print(f"  Round took {elapsed:.0f}s")

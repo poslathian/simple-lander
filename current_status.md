@@ -1,85 +1,103 @@
-# Simple Lander — Current Status
+# Position DAgger — Current Status
 
-## Environment (`lunar_lander.py`)
+## Architecture
+- DiffusionMLP (256 hidden, 6 blocks, 435K params)
+- 10 CPs × 3 channels (x, y, theta) = 30-dim output
+- DDIM sampler (10 steps, no CFG)
+- Outcome conditioning as regular input (not classifier-free guidance)
+- Observed-trajectory supervision (fit CPs to what lander actually did)
 
-**LunarLander** — a simplified gymnasium env with time-optimal reward (-dt per step).
+## Normalization
+- x, y: normalized by 30.0 (screen width, physics-based: vx_max × action_horizon)
+- theta: world radians, normalized by 4.5 (omega_max × action_horizon)
+- Model output in [-1, 1], clipped
+- x_mean/x_std recomputed from training data each round
 
-- **Viewport**: 900x600 pixels, world is 30x20 units
-- **Spawn**: uniform x over full display width `[1, 29]`, y gaussian near top ~17
-- **Landing pad**: center of screen at (15, 5)
-- **Obstacles**: 0-5 configurable satellite obstacles
-- **Action space**: continuous `[-1, 1]` x 2 — `[main_engine, side_engine]`
-  - Main: -1 = off, +1 = full thrust. Maps to `m_power = (a+1)/2`
-  - Side: sign = direction, magnitude = power
-- **Reward**: -dt per step. Crash/timeout -> total = -10s. Landing -> total ~ -elapsed_time
-- **Observation**: 9-dim `[x, y, vx, vy, angle, angular_vel, leg1, leg2, sim_t]`
+## Guidance Mechanism
+- Weighted average: `ref = (1-m)*kto + m*diffusion`
+- NOT a clamp (clamp creates hard boundary → oscillation/crashes)
+- Margin ∈ [0, 1]: 0 = pure KTO, 1 = pure diffusion
 
-### Flight physics tweaks
+## DAgger Loop
+- Start at margin 0.001
+- Step ±0.001: ≥70% landing → +0.001, <70% → -0.001, floor 0.001
+- Collect 40 landed episodes per round, store up to 10 failures
+- Train on 500 frames sampled from archive, 200 epochs, batch 32, lr 5e-5
+- KTO plan pool cached to disk (550 plans)
+- Single-seed mode (--single-seed) for memorization experiments
 
-- Leg joint motors **disabled during flight** — no torque on lander from legs
-- Leg density set to **0.001 during flight** — effectively massless, no drag on lander
-- Both restored on ground contact for landing shock absorption
-- This makes the lander behave as a clean single rigid body in flight
+## Evals Per Round
+- Holdout landing rate at current margin (50 episodes)
+- Outcome=-1 landing rate (20 episodes) — OOD detector
+- Temporal consistency (10 episodes) — prediction coherence metric
 
-### Surrogate functions (in `lunar_lander.py`)
+## Key Findings
 
-- `lander_dynamics(state, Fm, Fs)` — continuous-time ODE (6-state)
-- `lander_acceleration(state, Fm, Fs)` — just the `[ax, ay, alpha]` accelerations
-- `lander_step(state, Fm, Fs)` — one semi-implicit Euler step matching Box2D
-- All use `LANDER_BODY_MASS = 4.817` (not system mass 4.959)
+### Clamp vs Weighted Average
+Clamp (`clip(diff, kto-m, kto+m)`) creates hard boundary that causes oscillation.
+At small margins, untrained model CPs saturate at clamp boundary every step.
+Weighted average is smooth and proportional — model can't hurt at low margins.
+See issues.md for full writeup.
 
-## Solver (`solver.py`)
+### Outcome Conditioning as OOD Detector
+When outcome=+1 lands more than outcome=-1: model is in-distribution.
+When gap inverts: model is OOD, shouldn't be trusted at current margin.
+Works best at higher margins where model has more influence.
 
-**KTO B-spline trajectory optimizer** using Drake's KinematicTrajectoryOptimization:
+### Temporal Consistency
+Compare overlapping 666ms windows between successive inference predictions.
+Untrained: ~35 world units. Trained (R67): **1.08 world units** (median 0.68).
+Tracks learning progress even when margin stalls.
 
-- Plans in `[x, y, theta]` space with cubic B-splines (15 control points)
-- Dynamics constraints at ~65 sample points verify thrust feasibility via inverse dynamics
-- Torque model **validated at import time** against `lander_acceleration()`
-- Two-phase solve: warm-start (no obstacles) -> obstacle phase
-- Default time budget: 5s total, 1s warm-start
+### Single-Seed Memorization
+Training on one seed is 3-10x faster than multi-seed at advancing margin.
+The model memorizes the KTO trajectory for one initial condition, then
+gradually takes on more responsibility via the weighted average blend.
 
-### Key constants
+## Current Experiment Results
 
-- `MASS = 4.817` (lander body), `INERTIA = 0.833`, `GRAVITY = 10.0`
-- `THRUST_MAX ~ 86.7 N` (main), `SIDE_MAX ~ 30.0 N` (side)
-- `SIDE_FORCE_MAX = 75.0 N` (action scaling for side engine)
+### Single-seed, 256-hidden, strong training (200ep/500fr/batch32/lr5e-5)
 
-### Tracking controller (`track()` + `_tracking_step()`)
+**Round 67 of 100, seed=50042:**
+- Margin: **0.051** (5.1% model influence)
+- Consistency: **1.08** world units (median 0.68)
+- 24 consecutive advances (no retreat since R43)
+- Landing rate: 74-95% at every margin level
+- Archive: 62k frames
 
-Cascaded PD feedback: outer loop (position) -> inner loop (attitude).
+**Progression:**
+| Phase | Rounds | Margin range | Consistency |
+|-------|--------|-------------|-------------|
+| Bootstrap | R1-12 | 0.001-0.010 | 27→10 |
+| First wall | R12-15 | 0.010-0.015 | 10→6 |
+| Steady climb | R15-42 | 0.015-0.030 | 6→2 |
+| Acceleration | R43-67 | 0.030-0.051 | 2→1.1 |
 
-- Gains: `Kp_pos=4, Kd_pos=4, Kp_att=50, Kd_att=10`
-- Blends commanded theta (from acceleration vector) with plan theta: 40/60 split
-- Achieves **0.09x** the tracking error of open-loop replay
+**Walls encountered and broken:**
+- m=0.010 (R12): broke through R14 (2 rounds)
+- m=0.015 (R19): broke through R23 (4 rounds)
+- m=0.025 (R35): broke through R37 (2 rounds)
+- m=0.030 (R42): broke through R44 (2 rounds)
+- No wall since R42 — 24 consecutive advances
 
-## KTOController (in `lunar_lander.py`)
+### Comparison: weak vs strong training (same 256-hidden model, single seed)
 
-**Phase 1** — PD tracking of the KTO plan:
-- Reads actual state from Box2D each step
-- Calls `_tracking_step()` to compute corrective Fm/Fs
-- Converts to actions: `a_main = 2*Fm/THRUST_MAX - 1`, `a_side = Fs/SIDE_FORCE_MAX`
+| Metric | Weak (50ep/200fr) | Strong (200ep/500fr) |
+|--------|-------------------|----------------------|
+| Rounds to m=0.010 | 38 | **12** |
+| Rounds to m=0.020 | 78 | **30** |
+| Peak margin (100 rounds) | 0.022 | **0.051+** (still climbing) |
+| Consistency at peak | 7.7 | **1.08** |
+| Retreats in 100 rounds | ~15 | ~5 |
 
-**Phase 2** — Heuristic PD controller for final descent (after plan ends ~2m above pad).
+### Multi-seed experiment (for comparison)
+- 256-hidden, 550 seeds, strong training
+- Stuck at m=0.003-0.004 after 57 rounds
+- The model can't generalize across seeds at this size
 
-## Running
-
-```
-python lunar_lander.py                        # heuristic controller
-python lunar_lander.py --kto                  # KTO plan + PD tracking
-python lunar_lander.py --kto --obstacles 3    # with obstacles
-python lunar_lander.py --kto --seed 42        # specific seed
-python lunar_lander.py --keyboard             # manual control
-python lunar_lander.py --speedup 2.0          # 2x playback
-```
-
-## Test suite (`tests.py` — 19 tests)
-
-| Test class | Count | What it checks |
-|---|---|---|
-| `TestSurrogateDynamics` | 4 | `lander_step` vs Box2D: freefall, main thrust, side thrust, three-way agreement with KTO plan |
-| `TestPhysicsDivergence` | 4 | Euler step vs Box2D, solver plan replay, mass/inertia match |
-| `TestKTOActions` | 3 | Action ranges, no dead zones |
-| `TestKTOTracking` | 2 | Drift correlates with lateral demand, PD tracking vs direct impulse |
-| `TestThrustTriangles` | 2 | Rendering indicators |
-| `TestInitialState` | 2 | Spawn x uniform across display, y gaussian near top |
-| `TestKTOLanding` | 1 | 10 episodes, >=3 land, faster than realtime |
+## Next Steps
+1. Scale to 1024-hidden on Modal (6.5M params, GPU training)
+2. Use 550+ seeds for generalization
+3. Fix Modal rollout code (currently crashes with ConflictError)
+4. Refactor: supervision CPs from controller (TODO.md)
+5. Fix t_obs_cmd_latency (should be compute time, not DT)
