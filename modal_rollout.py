@@ -295,7 +295,7 @@ def rollout_with_cache(
                 kto_idx = int(round((t_sim - ctrl._kto_t0) / DT))
                 kto_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
                 m = float(np.clip(margin_mean, 0.0, 1.0))
-                actual_cps = np.clip(model_out, kto_cps - m, kto_cps + m)
+                actual_cps = (1.0 - m) * kto_cps + m * model_out
 
                 frames.append({
                     "t_sim": t_sim,
@@ -571,7 +571,7 @@ def rollout_with_cache_local(
                 kto_idx = int(round((t_sim - ctrl._kto_t0) / DT))
                 kto_cps = _fit_kto_window(ctrl._kto.plan, kto_idx, ctrl.action_horizon)
                 m = float(np.clip(margin_mean, 0.0, 1.0))
-                actual_cps = np.clip(model_out, kto_cps - m, kto_cps + m)
+                actual_cps = (1.0 - m) * kto_cps + m * model_out
 
                 frames.append({
                     "t_sim": t_sim,

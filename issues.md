@@ -1,5 +1,22 @@
 # Issues Found in position-dagger Codebase
 
+## RESOLVED: Clamp vs weighted average for guidance margin
+
+**Finding from local DAgger experiment (30 rounds, 256-hidden model):**
+
+A per-component clamp (`clip(diff, kto-m, kto+m)`) was tested as the guidance margin mechanism. It creates a hard boundary: the model's output is either inside the band (no effect) or outside (slammed to the boundary). With an untrained or early-training model whose CPs are far from KTO, the clamp saturates on every inference step, creating a consistent bias at the clamp boundary. This causes:
+
+1. **Hard wall at m≈0.02** — the model could never advance past this margin
+2. **Reset-advance cycles** — margin would climb to 0.02, crash, reset to 0.01, repeat
+3. **Training data poisoning** — repeated failures at the clamp boundary filled the archive with crash data, degrading even m=0.01 performance over time
+
+The weighted average (`ref = (1-m)*kto + m*diff`) is fundamentally better because:
+- At small m, a wrong model contributes proportionally small noise (m=0.02 → 2% influence)
+- No discontinuity — smooth, proportional blending at all margins
+- The previous DAgger runs using weighted average reached 74% at m=1.0
+
+**Resolution:** Reverted to weighted average for both `get_action()` and DAgger training targets.
+
 ## CRITICAL Bug: actual_tracked_cps is always raw KTO, ignoring diffusion blend
 
 **File:** `dagger_loop.py:277-279`

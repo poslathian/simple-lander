@@ -59,7 +59,8 @@ class TrainedModel:
 
 # ── Run episode ───────────────────────────────────────────────────────────
 
-def run_episode(env, seed, model, margin, kto_cache=None):
+def run_episode(env, seed, model, margin, kto_cache=None, plan_pool=None,
+                outcome=Outcome.SUCCESS):
     """Run one episode with KTODiffusionController."""
     obs, _ = env.reset(seed=seed)
     uw = env.unwrapped
@@ -68,9 +69,17 @@ def run_episode(env, seed, model, margin, kto_cache=None):
 
     ctrl = KTODiffusionController(
         env, model=model, target_frequency=3.0,
-        action_horizon=1.5, outcome=Outcome.SUCCESS,
+        action_horizon=1.5, outcome=outcome,
     )
-    ctrl.warm_start(time_budget=5.0)
+    cached = plan_pool.get(seed) if plan_pool else None
+    if cached is not None:
+        ctrl._kto = type("CachedKTO", (), {
+            "plan": cached["plan"], "n_steps": cached["n_steps"],
+        })()
+        ctrl._kto_t0 = uw.elapsed_s
+        ctrl._kto_duration = cached["n_steps"] * DT
+    else:
+        ctrl.warm_start(time_budget=5.0)
 
     # Cache KTO plan for reuse across margins
     if kto_cache is not None and seed not in kto_cache:

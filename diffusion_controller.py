@@ -197,6 +197,12 @@ class KTODiffusionController:
         self._diff_q_origin: np.ndarray = np.zeros(3)  # world pos at inference time
         self._last_inference_q: Position | None = None  # q_prev for next inference
 
+        # Temporal consistency: stash previous raw prediction for comparison
+        self._prev_splines: tuple | None = None
+        self._prev_t0: float = 0.0
+        self._prev_q_origin: np.ndarray = np.zeros(3)
+        self._consistency_scores: list[float] = []  # per-inference consistency
+
     def warm_start(
         self,
         waypoint: WaypointTarget | None = None,
@@ -256,6 +262,11 @@ class KTODiffusionController:
         cps_norm[0, 2] = q_now[2] / NORM_SCALES[2]  # theta: pin to current world angle
         self._last_cps_norm = cps_norm.copy()
 
+        # Stash previous prediction before overwriting
+        self._prev_splines = self._diff_splines
+        self._prev_t0 = self._diff_t0
+        self._prev_q_origin = self._diff_q_origin.copy()
+
         # Denormalize to world units for spline building
         # x,y: relative world units. theta: world radians.
         cps_world = cps_norm * NORM_SCALES
@@ -263,6 +274,62 @@ class KTODiffusionController:
         self._diff_t0 = t_sim
         self._diff_q_origin = np.array(q_now)
         self._last_inference_q = q_now
+
+        # Compute temporal consistency with previous prediction
+        score = self._temporal_consistency()
+        if score is not None:
+            self._consistency_scores.append(score)
+
+    def _temporal_consistency(self, compare_duration: float = 0.666) -> float | None:
+        """Compare current prediction with previous on overlapping time window.
+
+        Both predictions produce world-frame trajectories. We compare them
+        on the overlap: the previous prediction evaluated at
+        [dt, dt+compare_duration] vs the new prediction at [0, compare_duration],
+        where dt = time between inference calls.
+
+        Returns mean position error in world units, or None if no comparison.
+        """
+        if self._prev_splines is None or self._diff_splines is None:
+            return None
+
+        dt = self._diff_t0 - self._prev_t0  # time between inference calls
+        if dt < DT or dt > self.action_horizon:
+            return None
+
+        n_samples = max(5, int(compare_duration / DT))
+        errors = []
+
+        for i in range(n_samples):
+            t_rel = i * DT
+            if t_rel > compare_duration:
+                break
+
+            # Previous prediction: evaluate at (dt + t_rel) from its t0
+            t_prev = dt + t_rel
+            if t_prev > self.action_horizon:
+                break
+            prev_rel = _eval_spline(self._prev_splines, t_prev, self.action_horizon)
+            prev_world = (
+                self._prev_q_origin[0] + prev_rel[0],
+                self._prev_q_origin[1] + prev_rel[1],
+                prev_rel[2],  # theta is world radians
+            )
+
+            # Current prediction: evaluate at t_rel from its t0
+            curr_rel = _eval_spline(self._diff_splines, t_rel, self.action_horizon)
+            curr_world = (
+                self._diff_q_origin[0] + curr_rel[0],
+                self._diff_q_origin[1] + curr_rel[1],
+                curr_rel[2],
+            )
+
+            # Position error in world units
+            dx = prev_world[0] - curr_world[0]
+            dy = prev_world[1] - curr_world[1]
+            errors.append(math.sqrt(dx * dx + dy * dy))
+
+        return float(np.mean(errors)) if errors else None
 
     def get_action(self, guidance_margin: float = 0.001) -> ThrustVec:
         """Clamp diffusion position ref to within margin of KTO, PD track.
@@ -293,7 +360,8 @@ class KTODiffusionController:
             kto_v = (0.0, 0.0, 0.0)
             kto_a = (0.0, 0.0, 0.0)
 
-        # Diffusion ref clamped to within margin of KTO in normalized space
+        # Weighted average: ref = (1-m)*kto + m*diffusion
+        # At m=0 pure KTO, m=1 pure diffusion. Smooth, proportional blending.
         m = float(np.clip(guidance_margin, 0.0, 1.0))
         if self._diff_splines is not None and m > 0.0:
             t_diff = t_sim - self._diff_t0
@@ -303,11 +371,9 @@ class KTODiffusionController:
                 self._diff_q_origin[1] + diff_rel[1],   # y: relative → world
                 diff_rel[2],                              # theta: already world radians
             ])
-            # Normalize to [0,1] screen coords, clamp, denormalize
-            kto_n = np.array(kto_q) / NORM_SCALES
-            diff_n = diff_world / NORM_SCALES
-            ref_n = np.clip(diff_n, kto_n - m, kto_n + m)
-            x_ref, y_ref, th_ref = ref_n * NORM_SCALES
+            x_ref = (1 - m) * kto_q[0] + m * diff_world[0]
+            y_ref = (1 - m) * kto_q[1] + m * diff_world[1]
+            th_ref = (1 - m) * kto_q[2] + m * diff_world[2]
         else:
             x_ref, y_ref, th_ref = kto_q
 
