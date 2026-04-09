@@ -411,7 +411,7 @@ def collect_until(env, model, target_landed, target_failed, margin_mean,
     pool_seeds = sorted(plan_pool.keys()) if plan_pool else []
     pool_size = len(pool_seeds)
 
-    while landed_count < target_landed or failed_count < target_failed:
+    while landed_count < target_landed:
         # Always use a cached seed — wrap around the pool
         if pool_seeds:
             actual_seed = pool_seeds[(seed - seed_offset) % pool_size]
@@ -651,6 +651,8 @@ def main():
     # Output isolation
     parser.add_argument("--run-dir", default=".",
                         help="Directory for DBs and checkpoints")
+    parser.add_argument("--single-seed", type=int, default=None,
+                        help="Use one seed for everything (memorization test)")
     args = parser.parse_args()
 
     git_commit = _git_commit()
@@ -715,9 +717,16 @@ def main():
               f"{archive_db.count_frames()} frames), clearing current")
 
     # ── Pre-solve KTO plan pool (cached to disk) ──────────────────────────
-    POOL_SIZE = 500
-    pool_seeds = list(range(args.seed_offset, args.seed_offset + POOL_SIZE))
-    HOLDOUT_SEEDS = list(range(90000, 90050))
+    single_seed = getattr(args, 'single_seed', None)
+    if single_seed is not None:
+        POOL_SIZE = 1
+        pool_seeds = [single_seed]
+        HOLDOUT_SEEDS = [single_seed]
+        print(f"\n  SINGLE SEED MODE: seed={single_seed}")
+    else:
+        POOL_SIZE = 500
+        pool_seeds = list(range(args.seed_offset, args.seed_offset + POOL_SIZE))
+        HOLDOUT_SEEDS = list(range(90000, 90050))
     all_pool_seeds = pool_seeds + HOLDOUT_SEEDS
     pool_path = os.path.join(args.run_dir, "kto_pool.pkl")
     if os.path.exists(pool_path):
@@ -744,7 +753,7 @@ def main():
 
         episodes, all_frames = collect_until(
             env, live_model,
-            target_landed=40, target_failed=10,
+            target_landed=40, target_failed=2,
             margin_mean=margin_mean, seed_offset=seed_counter,
             plan_pool=plan_pool,
         )
@@ -799,7 +808,7 @@ def main():
         current_db.clear()
         episodes, all_frames = collect_until(
             env, live_model,
-            target_landed=40, target_failed=10,
+            target_landed=40, target_failed=2,
             margin_mean=candidate_margin,
             seed_offset=seed_counter,
             outcome_cond=Outcome.SUCCESS,
@@ -833,14 +842,16 @@ def main():
         print(f"\n  Step 5: Holdout eval (collection: {n_landed}/{n_total} = {new_rate:.0%})")
         eval_margins = [0.001, margin_mean, candidate_margin]
         eval_margins = sorted(set(np.clip(eval_margins, 0.001, 1.0)))
+        eval_seeds = (HOLDOUT_SEEDS * 50)[:50]  # repeat if fewer than 50 holdout seeds
         eval_results = evaluate_model_seeds(
-            env, live_model, eval_margins, HOLDOUT_SEEDS,
+            env, live_model, eval_margins, eval_seeds,
             plan_pool=plan_pool,
         )
 
         # Outcome conditioning comparison: run with outcome=-1
         fail_lands = 0
-        for s in HOLDOUT_SEEDS[:20]:
+        oc_seeds = (HOLDOUT_SEEDS * 20)[:20]  # repeat if fewer than 20 holdout seeds
+        for s in oc_seeds:
             _, landed = run_episode(env, s, live_model, candidate_margin,
                                     plan_pool=plan_pool, outcome=Outcome.FAIL)
             fail_lands += landed
@@ -848,7 +859,8 @@ def main():
 
         # Temporal consistency: run a few episodes and collect scores
         all_scores = []
-        for s in HOLDOUT_SEEDS[:10]:
+        tc_seeds = (HOLDOUT_SEEDS * 10)[:10]  # repeat if fewer than 10 holdout seeds
+        for s in tc_seeds:
             obs, _ = env.reset(seed=s)
             uw = env.unwrapped
             uw.lander.linearVelocity = (0.0, 0.0)
