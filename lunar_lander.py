@@ -25,6 +25,19 @@ except ImportError as e:
     ) from e
 
 
+# --- simple-viewer frame hook (added on branch `simple-viewer`) ---
+# External consumers (e.g. the remote viewer in scratchpad/simple-viewer)
+# can register a callable here to receive the final pygame.Surface produced
+# by render() on every frame, without modifying any rendering behavior.
+_FRAME_HOOK = None
+
+def set_frame_hook(fn):
+    """Register a callable receiving the post-render pygame.Surface, or None to clear."""
+    global _FRAME_HOOK
+    _FRAME_HOOK = fn
+# --- end simple-viewer frame hook ---
+
+
 FPS = 50
 SCALE = 30.0
 DT = 1.0 / FPS
@@ -608,6 +621,10 @@ class LunarLander(gym.Env, EzPickle):
             self._draw_thrust(self.surf)
 
         self.surf = pygame.transform.flip(self.surf, False, True)
+
+        # simple-viewer: external frame consumer
+        if _FRAME_HOOK is not None:
+            _FRAME_HOOK(self.surf)
 
         if self.render_mode == "human":
             assert self.screen is not None
