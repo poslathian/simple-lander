@@ -243,7 +243,11 @@ All operations (spline evaluation, the three linear equations, concatenation) ar
 
 ### Numerical Stability
 
-The formulas involve `Δ` and `Δ²` terms. For very small `Δ` (< 0.01s), the constrained CPs cluster tightly near `pos`, and the free CPs must do all the shaping work in a narrow region — this can cause oscillation. For typical control horizons (`Δ ≈ 0.1–0.5s`), the weld region spans a physically meaningful distance and the formulas are well-conditioned.
+The constrained CPs are separated by `vel·Δ/3` and `acc·Δ²/3` terms. Two regimes:
+
+- **Small derivatives** (hold position, hover): `vel ≈ 0, acc ≈ 0` → `P_0 ≈ P_1 ≈ P_2 ≈ pos`. This is correct and well-conditioned. The weld smoothly continues "stay here," and the free CPs can either maintain position or initiate a departure with guaranteed zero initial velocity and acceleration.
+
+- **Small `Δ` with large derivatives**: the CPs cluster because `vel·Δ/3` is tiny relative to the trajectory's scale, not because the trajectory is stationary. The free CPs must make sharp corrections to "catch up" to the physical velocity, which can cause oscillation. Use `Δ` large enough that `vel·Δ` is a meaningful fraction of the trajectory length.
 
 ## Verification
 
