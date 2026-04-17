@@ -135,9 +135,34 @@ def compound_inertia_about_body_com(env) -> tuple[float, float]:
 # ---------------------------------------------------------------------------
 # Warm-up: let INITIAL_RANDOM impulse settle and snapshot state
 # ---------------------------------------------------------------------------
-def warmup_and_snapshot(env, n_steps: int = 5):
-    """Reset the env, take n_steps of noop (fully noop in continuous), then return (obs, state, params)."""
+def randomize_initial_pose(env) -> None:
+    """Teleport lander + legs to a random (x, y) that uses the full horizontal
+    and most of the vertical space. Called right after env.reset() (after the
+    gym applied its INITIAL_RANDOM impulse) and before any physics steps.
+
+    Uses env.unwrapped.np_random so randomness is seeded by reset(seed=...).
+    """
+    rng = env.unwrapped.np_random
+    lander = env.unwrapped.lander
+    legs = env.unwrapped.legs
+
+    # Full horizontal (1 m wall margin); upper ~half of vertical so the
+    # lander still has room to descend.
+    x_abs = float(rng.uniform(1.0, WORLD_W - 1.0))
+    y_abs = float(rng.uniform(PAD_BODY_Y + 4.0, WORLD_H - 0.5))
+
+    dx = x_abs - lander.position.x
+    dy = y_abs - lander.position.y
+    lander.position = (x_abs, y_abs)
+    for leg in legs:
+        leg.position = (leg.position.x + dx, leg.position.y + dy)
+
+
+def warmup_and_snapshot(env, n_steps: int = 5, randomize: bool = True):
+    """Reset the env, optionally randomize pose, step n_steps of noop, snapshot state."""
     obs, _ = env.reset()
+    if randomize:
+        randomize_initial_pose(env)
     noop = np.array([-1.0, 0.0], dtype=np.float32)  # main off, side off
     for _ in range(n_steps):
         obs, _, terminated, truncated, _ = env.step(noop)
@@ -298,14 +323,17 @@ def plan_with_kto(x0, y0, vx0, vy0, params: LanderParams,
     m, g = params.mass, params.g
     F_max, F_min_on = params.F_main_max, M_POWER_MIN * params.F_main_max
 
-    # Conservative box bounds: every (ẍ, ÿ) in this box satisfies powered-descent
-    # floor (F_main ≥ F_min_on) and thrust ceiling (F_main ≤ F_max).
+    # Conservative box bounds: every (ẍ, ÿ) in this box must (a) satisfy the main-engine
+    # floor (F_main ≥ F_min_on) and ceiling (F_main ≤ F_max), and (b) imply a flatness
+    # attitude |θ| = |atan2(-ẍ, ÿ+g)| that the tracker can hold (clipped at theta_des_max).
     #   min required: ẍ² + (ÿ+g)² ≥ (F_min_on/m)²
     #   max allowed:  ẍ² + (ÿ+g)² ≤ (F_max/m)²
-    # With ax_max=4, ay_min=-1, ay_max=6.5 and g=10:
-    #   worst-case-min: (ẍ=0, ÿ=-1) → (0)+(9)² = 81  ≥ (43.3/4.96)² = 76.4 ✓
-    #   worst-case-max: (ẍ=4, ÿ=6.5) → 16 + 272.25 = 288  ≤ (86.67/4.96)² = 305 ✓
-    ax_max, ay_min, ay_max = 4.0, -1.0, 6.5
+    #   flatness:     atan2(|ẍ_max|, ÿ_min + g) ≤ θ_clip  ⇒  ẍ_max ≤ (ÿ_min+g)·tan(θ_clip)
+    # With ax_max=3, ay_min=-1, ay_max=5.0, g=10, θ_clip=0.5:
+    #   worst-case flatness: atan2(3, 9) = 0.32 rad < 0.5 ✓ (0.18 rad headroom for PD)
+    #   worst-case-min:      (ẍ=0, ÿ=-1)  → 81     ≥ 76.4 ✓
+    #   worst-case-max:      (ẍ=3, ÿ=5)   → 9+225  ≤ 305 ✓
+    ax_max, ay_min, ay_max = 3.0, -1.0, 5.0
     # Velocity bounds must accommodate any possible initial state. INITIAL_RANDOM=1000 N
     # applied for dt=0.02s over ~5 kg → up to ~4 m/s. Plus gravity during 5-step warmup
     # (~0.1s at g=10) adds ~1 m/s vy drift. Use generous bounds so initial-state
@@ -329,6 +357,14 @@ def plan_with_kto(x0, y0, vx0, vy0, params: LanderParams,
     qT = np.array([0.0, -0.15])
     kto.AddPathPositionConstraint(q0, q0, 0.0)
     kto.AddPathPositionConstraint(qT, qT, 1.0)
+
+    # Pin r̈(0) = r̈(1) = 0 so the flatness-derived θ_ref matches the lander's actual
+    # attitude (θ ≈ 0) at both ends. Without this, θ_ref(0) can jump to ~0.3 rad on the
+    # first sample, which the attitude inner loop can't close in time — driving the
+    # tracking-error e-stop. Since q̈(t) = r̈(s)/T², pinning r̈ also pins q̈.
+    zero2 = np.zeros(2)
+    kto.AddPathAccelerationConstraint(zero2, zero2, 0.0)
+    kto.AddPathAccelerationConstraint(zero2, zero2, 1.0)
 
     # Boundary velocities in physical time via AddVelocityConstraintAtNormalizedTime.
     # Its constraint is bound with vars [q(T·s), q̇(T·s)] → (4,) for 2D problem.
@@ -443,8 +479,9 @@ class TrackerGains:
     # Attitude (inner loop) — produces desired angular accel
     kp_theta: float = 60.0
     kd_theta: float = 12.0
-    # Saturation on desired tilt angle (rad)
-    theta_des_max: float = 0.4
+    # Saturation on desired tilt angle (rad). Must exceed the worst-case flatness
+    # angle implied by the KTO accel bounds, with margin for the PD correction.
+    theta_des_max: float = 0.5
 
 
 def control(state: np.ndarray, t: float, ref: Reference, params: LanderParams,
@@ -601,15 +638,19 @@ def run_episode(render: bool = False, duration_s: float = 3.0, seed: int | None 
         e_th = obs_state[4] - r_next[4]
         errs.append((e_x, e_y, e_th))
 
-        # E-stop monitor: if the weighted error norm is monotonically increasing
-        # over the last `window_steps` samples, declare overtorque failure.
+        # E-stop monitor: trip if the weighted tracking error stays above a
+        # threshold for the whole window (sustained deviation from plan), or
+        # if it spikes above a larger hard threshold at any single sample.
         e_norm = math.sqrt(e_x * e_x + e_y * e_y + (2.0 * e_th) ** 2)
         err_hist.append(e_norm)
         if len(err_hist) > window_steps:
             err_hist.pop(0)
-        if (len(err_hist) == window_steps
-                and all(err_hist[i + 1] > err_hist[i] for i in range(window_steps - 1))
-                and err_hist[-1] - err_hist[0] > 0.30):
+        E_STOP_SUSTAINED = 1.0   # m-equivalent, weighted norm
+        E_STOP_HARD = 2.0
+        if e_norm > E_STOP_HARD or (
+            len(err_hist) == window_steps
+            and all(e > E_STOP_SUSTAINED for e in err_hist)
+        ):
             estop = True
             break
 
