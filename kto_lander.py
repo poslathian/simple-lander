@@ -571,17 +571,27 @@ def run_episode(render: bool = False, duration_s: float = 3.0, seed: int | None 
     window_steps = max(1, int(round(0.1 / DT)))   # 100 ms
     err_hist: list[float] = []
 
+    window_closed = False
     for k in range(n_steps):
         action, dbg = control(obs_state, t, ref, params, gains, ff_only=ff_only)
         obs, reward, terminated, truncated, info = env.step(action)
         # Overlay the plan on top of the env's rendered frame, if we have a KTO plan.
-        if render and isinstance(ref, KTOReference):
+        if render:
             try:
                 import pygame
-                draw_plan_overlay(env, ref, current_t=t)
-                pygame.display.flip()
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT or (
+                        event.type == pygame.KEYDOWN
+                        and event.key in (pygame.K_q, pygame.K_ESCAPE)
+                    ):
+                        window_closed = True
+                if isinstance(ref, KTOReference):
+                    draw_plan_overlay(env, ref, current_t=t)
+                    pygame.display.flip()
             except Exception:
                 pass
+            if window_closed:
+                break
         obs_state = obs_to_state(obs)
         last_obs = obs
         t += DT
@@ -625,6 +635,7 @@ def run_episode(render: bool = False, duration_s: float = 3.0, seed: int | None 
         estop=estop,
         landed=landed,
         success=success,
+        window_closed=window_closed,
         final_x=float(final_state[0]),
         final_y=float(final_state[1]),
         max_abs_x_err=float(np.max(np.abs(errs[:, 0]))) if len(errs) else 0.0,
@@ -659,23 +670,42 @@ def main():
     p.add_argument("--brake-time", type=float, default=2.0)
     args = p.parse_args()
 
-    all_metrics = []
-    for i in range(args.episodes):
-        seed = args.seed + i if args.seed is not None else None
-        print(f"=== episode {i+1}/{args.episodes} (seed={seed}, ref={args.ref}, ff_only={args.ff_only}) ===")
-        m = run_episode(render=args.render, duration_s=args.duration, seed=seed,
-                        ref_kind=args.ref, ff_only=args.ff_only, brake_time=args.brake_time)
-        all_metrics.append(m)
+    # With --render, loop indefinitely with incrementing seeds unless the user
+    # specified --episodes explicitly. Close the window or press Q/Esc to exit.
+    infinite = args.render and args.episodes == 1 and not any(
+        a.startswith("--episodes") for a in __import__("sys").argv[1:]
+    )
 
-    if args.episodes > 1:
+    all_metrics = []
+    i = 0
+    base_seed = args.seed if args.seed is not None else 0
+    while True:
+        if not infinite and i >= args.episodes:
+            break
+        seed = base_seed + i if args.seed is not None else (None if not infinite else base_seed + i)
+        label = f"{i+1}/{'∞' if infinite else args.episodes}"
+        print(f"=== episode {label} (seed={seed}, ref={args.ref}, ff_only={args.ff_only}) ===")
+        try:
+            m = run_episode(render=args.render, duration_s=args.duration, seed=seed,
+                            ref_kind=args.ref, ff_only=args.ff_only, brake_time=args.brake_time)
+        except KeyboardInterrupt:
+            print("\n[interrupted]")
+            break
+        all_metrics.append(m)
+        i += 1
+        if m.get("window_closed"):
+            print("[window closed, stopping loop]")
+            break
+
+    if len(all_metrics) > 1:
         rms_x = np.mean([m["rms_x_err"] for m in all_metrics])
         rms_y = np.mean([m["rms_y_err"] for m in all_metrics])
         rms_t = np.mean([m["rms_th_err"] for m in all_metrics])
         landed = sum(m["landed"] for m in all_metrics)
         estopped = sum(m["estop"] for m in all_metrics)
         crashed = sum(m["terminated"] and not m["landed"] for m in all_metrics)
-        timed = args.episodes - landed - estopped - crashed
-        N = args.episodes
+        N = len(all_metrics)
+        timed = N - landed - estopped - crashed
         print(f"=== summary over {N} eps ===")
         print(f"  landed:  {landed}/{N}  ({100*landed/N:.0f}%)")
         print(f"  estop:   {estopped}/{N}  ({100*estopped/N:.0f}%)")
