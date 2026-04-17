@@ -81,17 +81,20 @@ def plan_pih_with_kto(
     s0, s_mo, s_ap, s_ct, s_ex, s_mr, s1 = waypoints_s
 
     # Waypoint positions — planner only sees assumed geometry
-    mountain_y = PIH_PAD_Y + PIH_MOUNTAIN_H + _MOUNTAIN_CLEARANCE_M   # 10.5 m
+    mountain_y_out = PIH_PAD_Y + PIH_MOUNTAIN_H + _MOUNTAIN_CLEARANCE_M
+    # On return the package hangs below the lander by ~LEG_OFFSET + package height,
+    # so raise mountain_ret by package_height_assumed to keep it clear of the peak.
+    mountain_y_ret = mountain_y_out + cfg.package_height_assumed
     approach_y = cfg.assumed_contact_lander_y + 2.5                    # ~7.6 m
     landing_y  = PIH_PAD_Y + PIH_LEG_OFFSET - 0.15                    # ~4.45 m
 
     wpts = PIHWaypoints(
         start        = (x0,             y0,                            s0),
-        mountain_out = (PIH_MOUNTAIN_X,  mountain_y,                   s_mo),
+        mountain_out = (PIH_MOUNTAIN_X,  mountain_y_out,               s_mo),
         approach     = (PIH_PICKUP_X,    approach_y,                   s_ap),
         contact      = (PIH_PICKUP_X,    cfg.assumed_contact_lander_y, s_ct),
         extraction   = (PIH_PICKUP_X,    cfg.extraction_lander_y,      s_ex),
-        mountain_ret = (PIH_MOUNTAIN_X,  mountain_y,                   s_mr),
+        mountain_ret = (PIH_MOUNTAIN_X,  mountain_y_ret,               s_mr),
         landing      = (PIH_START_X,     landing_y,                    s1),
     )
 
