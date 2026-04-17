@@ -1,0 +1,56 @@
+# Package-in-Hole Phase 1 validation environment.
+# Mirrors the Modal image setup (python:3.13-slim + Drake).
+# Checkpoints and results are volume-mounted — nothing baked into the image.
+#
+# Build (from repo root):
+#   docker build -f Dockerfile.pih-validate -t pih-validate .
+#
+# Run full validation (PowerShell — use explicit Windows path for volume):
+#   docker run --rm `
+#     -v "C:/Users/arian/src/poslathian/simple-lander/results:/app/results" `
+#     pih-validate python scripts/validate_pih.py
+#
+# Regression only:
+#   docker run --rm pih-validate python scripts/validate_pih.py --regression-only
+#
+# Diagnostic for a single episode:
+#   docker run --rm pih-validate python scripts/diag_pih.py --seed 70000
+
+FROM python:3.13-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        swig \
+        build-essential \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# torch CPU-only — inference only, no training in validation
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        "torch==2.6.0" \
+        --index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install --no-cache-dir \
+        "numpy==2.4.4" \
+        "scipy==1.17.1" \
+        "matplotlib==3.10.8" \
+        "gymnasium[box2d]==1.2.3" \
+        swig
+
+# Drake last — large layer (~500 MB)
+RUN pip install --no-cache-dir "drake==1.52.0"
+
+# Source files; results come from volume mount
+COPY kto_lander.py pih_env.py pih_solver.py lunar_lander.py ./
+COPY scripts/ ./scripts/
+
+RUN mkdir -p results/pih_validation
+
+CMD ["python", "scripts/validate_pih.py"]
