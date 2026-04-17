@@ -1,13 +1,5 @@
 """Tracking controller scaffold for LunarLander-v3 (continuous).
 
-This file implements steps (1) and (3) of the plan:
-    1. Extract / query dynamics constants from the installed gymnasium source.
-    3. Feedforward + PD tracker against a hand-written reference.
-
-KTO is deliberately NOT here yet — we first validate the dynamics model and
-tracker by tasking it with a trivial hover reference. If the tracker can hold
-the lander near the post-impulse snapshot to within a small error for a few
-seconds, our inverse-dynamics model is correct and KTO can be layered on.
 
 Usage:
     python kto_lander.py                 # run once, no render
@@ -24,6 +16,10 @@ from dataclasses import dataclass
 import gymnasium as gym
 import numpy as np
 
+from pydrake.planning import KinematicTrajectoryOptimization
+from pydrake.solvers import LinearEqualityConstraint, Solve
+
+import pygame
 
 # ---------------------------------------------------------------------------
 # Constants extracted from gymnasium/envs/box2d/lunar_lander.py
@@ -174,58 +170,19 @@ def warmup_and_snapshot(env, n_steps: int = 5, randomize: bool = True):
     return obs, state, params
 
 
-# ---------------------------------------------------------------------------
-# Reference trajectories (hand-written, for dynamics validation)
-# ---------------------------------------------------------------------------
-class Reference:
-    """Base class: produces (x, y, vx, vy, theta, omega, ax, ay, alpha) at time t."""
 
-    def __call__(self, t: float) -> np.ndarray:
-        raise NotImplementedError
+@dataclass
+class Plan:
+    """KTO plan: 2D BsplineTrajectory + duration. Callable: returns the 9-vector
+    [x, y, vx, vy, θ, ω, ẍ, ÿ, α] at time t, with θ/ω/α from differential flatness.
+    Outside [0, T] the terminal state is held."""
+    traj: object   # pydrake.trajectories.BsplineTrajectory (num_positions=2)
+    T: float
+    g: float = GRAVITY
 
-
-class HoverReference(Reference):
-    """Hold (x0, y0) with zero velocity and upright body. Feedforward is just gravity comp."""
-
-    def __init__(self, x0: float, y0: float):
-        self.x0, self.y0 = x0, y0
-
-    def __call__(self, t: float) -> np.ndarray:
-        return np.array([self.x0, self.y0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-
-
-class FreeFallReference(Reference):
-    """Predicted trajectory under no thrust. With FF=0 and PD=0, tracker should follow exactly."""
-
-    def __init__(self, x0, y0, vx0, vy0, th0, om0, g=GRAVITY):
-        self.x0, self.y0, self.vx0, self.vy0 = x0, y0, vx0, vy0
-        self.th0, self.om0 = th0, om0
-        self.g = g
-
-    def __call__(self, t: float) -> np.ndarray:
-        x  = self.x0 + self.vx0 * t
-        y  = self.y0 + self.vy0 * t - 0.5 * self.g * t * t
-        vx = self.vx0
-        vy = self.vy0 - self.g * t
-        th = self.th0 + self.om0 * t
-        om = self.om0
-        return np.array([x, y, vx, vy, th, om, 0.0, -self.g, 0.0])
-
-
-class KTOReference(Reference):
-    """Reference produced by pydrake KinematicTrajectoryOptimization in 2D (x, y),
-    with θ, ω, α derived from differential flatness:
-        θ(t) = atan2(-ẍ(t), ÿ(t)+g)
-
-    Outside [0, T] we hold the terminal state (useful when the tracker runs past the plan).
-    """
-
-    def __init__(self, traj, T: float, g: float = GRAVITY):
-        self._traj = traj            # pydrake BsplineTrajectory (2D)
-        self._dtraj = traj.MakeDerivative(1)
-        self._ddtraj = traj.MakeDerivative(2)
-        self.T = float(T)
-        self.g = g
+    def __post_init__(self):
+        self._dtraj = self.traj.MakeDerivative(1)
+        self._ddtraj = self.traj.MakeDerivative(2)
 
     def _theta_at(self, t: float) -> float:
         tc = float(np.clip(t, 0.0, self.T))
@@ -234,13 +191,12 @@ class KTOReference(Reference):
 
     def __call__(self, t: float) -> np.ndarray:
         tc = float(np.clip(t, 0.0, self.T))
-        q  = self._traj.value(tc).flatten()
-        qd = self._dtraj.value(tc).flatten()
+        q   = self.traj.value(tc).flatten()
+        qd  = self._dtraj.value(tc).flatten()
         qdd = self._ddtraj.value(tc).flatten()
         x, y = float(q[0]), float(q[1])
         vx, vy = float(qd[0]), float(qd[1])
         ax, ay = float(qdd[0]), float(qdd[1])
-
         th = math.atan2(-ax, ay + self.g)
         h = 5e-4
         th_p = self._theta_at(tc + h)
@@ -256,14 +212,13 @@ def _pad_center_world(env) -> tuple[float, float]:
     return WORLD_W / 2.0, helipad_y + LEG_DOWN_M
 
 
-def draw_plan_overlay(env, ref: "KTOReference", current_t: float | None = None,
+def draw_plan_overlay(env, plan: Plan, current_t: float | None = None,
                       n_samples: int = 80) -> None:
     """Overlay the KTO plan onto env.unwrapped.screen: path line + knot dots + current target.
 
     Must be called after env.step() (which invokes env.render()) and followed by
     pygame.display.flip() to push the overlay to the window.
     """
-    import pygame
     screen = env.unwrapped.screen
     if screen is None:
         return
@@ -278,30 +233,28 @@ def draw_plan_overlay(env, ref: "KTOReference", current_t: float | None = None,
         return (sx, sy)
 
     # Path line
-    ts = np.linspace(0.0, ref.T, n_samples)
+    ts = np.linspace(0.0, plan.T, n_samples)
     pts = []
     for t in ts:
-        r = ref(float(t))
+        r = plan(float(t))
         pts.append(to_screen(r[0], r[1]))
     if len(pts) > 1:
         pygame.draw.lines(screen, (255, 60, 255), False, pts, 2)
 
     # Control-point knots from the B-spline
-    if hasattr(ref, "_traj"):
-        cps = ref._traj.control_points()
-        for cp in cps:
-            arr = np.asarray(cp).flatten()
-            if arr.size >= 2:
-                pygame.draw.circle(screen, (255, 220, 0), to_screen(arr[0], arr[1]), 5)
-                pygame.draw.circle(screen, (0, 0, 0), to_screen(arr[0], arr[1]), 5, 1)
+    for cp in plan.traj.control_points():
+        arr = np.asarray(cp).flatten()
+        if arr.size >= 2:
+            pygame.draw.circle(screen, (255, 220, 0), to_screen(arr[0], arr[1]), 5)
+            pygame.draw.circle(screen, (0, 0, 0), to_screen(arr[0], arr[1]), 5, 1)
 
     # Terminal marker (landing target)
-    r_end = ref(ref.T)
+    r_end = plan(plan.T)
     pygame.draw.circle(screen, (0, 255, 0), to_screen(r_end[0], r_end[1]), 6)
 
     # Current reference target (where the tracker is aiming right now)
     if current_t is not None:
-        r_now = ref(float(current_t))
+        r_now = plan(float(current_t))
         pygame.draw.circle(screen, (60, 160, 255), to_screen(r_now[0], r_now[1]), 5)
 
 
@@ -314,11 +267,9 @@ def plan_with_kto(x0, y0, vx0, vy0, params: LanderParams,
                   verbose: bool = True):
     """Solve a pydrake KTO for a 2D (x, y) descent from (x0, y0, vx0, vy0) to (0, 0, 0, vy_target).
 
-    Returns (KTOReference, duration_T, solver_result).
+    Returns (Plan, duration_T, solver_result).
     Raises RuntimeError on solver failure.
     """
-    from pydrake.planning import KinematicTrajectoryOptimization
-    from pydrake.solvers import LinearEqualityConstraint, Solve
 
     m, g = params.mass, params.g
     F_max, F_min_on = params.F_main_max, M_POWER_MIN * params.F_main_max
@@ -402,68 +353,8 @@ def plan_with_kto(x0, y0, vx0, vy0, params: LanderParams,
         print(f"[kto] solved: T={T:.2f}s, #cp={num_control_points}, "
               f"solver={result.get_solver_id().name()}")
 
-    return KTOReference(traj, T), T, result
+    return Plan(traj, T), T, result
 
-
-class QuinticBrakeReference(Reference):
-    """Dynamically-feasible reference: quintic Hermite from (p0, v0, 0) to (p_end, 0, 0).
-
-    Reference theta, omega, alpha derived from differential flatness:
-        theta_ref(t) = atan2(-ax_ref(t), ay_ref(t) + g)
-    omega/alpha computed by finite differences on theta_ref (analytic but tedious).
-    """
-
-    def __init__(self, x0, y0, vx0, vy0, x_end, y_end, T, g=GRAVITY):
-        self.T = float(T)
-        self.g = g
-        self.cx = self._quintic(x0, vx0, 0.0, x_end, 0.0, 0.0, self.T)
-        self.cy = self._quintic(y0, vy0, 0.0, y_end, 0.0, 0.0, self.T)
-
-    @staticmethod
-    def _quintic(p0, v0, a0, pT, vT, aT, T):
-        A0 = p0
-        A1 = v0
-        A2 = a0 / 2.0
-        dp = pT - (A0 + A1 * T + A2 * T * T)
-        dv = vT - (A1 + 2 * A2 * T)
-        da = aT - 2 * A2
-        M = np.array([
-            [T**3,    T**4,    T**5],
-            [3*T**2,  4*T**3,  5*T**4],
-            [6*T,    12*T**2, 20*T**3],
-        ])
-        sol = np.linalg.solve(M, np.array([dp, dv, da]))
-        return np.array([A0, A1, A2, sol[0], sol[1], sol[2]])
-
-    @staticmethod
-    def _deriv(c, t, d):
-        s = 0.0
-        for k in range(d, 6):
-            s += c[k] * math.factorial(k) / math.factorial(k - d) * t ** (k - d)
-        return s
-
-    def _theta_at(self, t):
-        t = float(np.clip(t, 0.0, self.T))
-        ax = self._deriv(self.cx, t, 2)
-        ay = self._deriv(self.cy, t, 2)
-        return math.atan2(-ax, ay + self.g)
-
-    def __call__(self, t: float) -> np.ndarray:
-        tc = float(np.clip(t, 0.0, self.T))
-        x  = self._deriv(self.cx, tc, 0)
-        y  = self._deriv(self.cy, tc, 0)
-        vx = self._deriv(self.cx, tc, 1)
-        vy = self._deriv(self.cy, tc, 1)
-        ax = self._deriv(self.cx, tc, 2)
-        ay = self._deriv(self.cy, tc, 2)
-
-        th = math.atan2(-ax, ay + self.g)
-        h = 5e-4
-        th_p = self._theta_at(tc + h)
-        th_m = self._theta_at(tc - h)
-        om    = (th_p - th_m) / (2.0 * h)
-        alpha = (th_p - 2.0 * th + th_m) / (h * h)
-        return np.array([x, y, vx, vy, th, om, ax, ay, alpha])
 
 
 # ---------------------------------------------------------------------------
@@ -484,14 +375,14 @@ class TrackerGains:
     theta_des_max: float = 0.5
 
 
-def control(state: np.ndarray, t: float, ref: Reference, params: LanderParams,
+def control(state: np.ndarray, t: float, plan: Plan, params: LanderParams,
             gains: TrackerGains, ff_only: bool = False) -> tuple[np.ndarray, dict]:
     """Returns (action in [-1,1]^2, debug info).
 
-    If ff_only is True, PD gains are ignored and only the reference's feedforward is applied.
+    If ff_only is True, PD gains are ignored and only the plan's feedforward is applied.
     """
     x, y, vx, vy, theta, omega = state
-    r = ref(t)
+    r = plan(t)
     xr, yr, vxr, vyr, thr, omr, axr, ayr, alr = r
 
     if ff_only:
@@ -505,21 +396,15 @@ def control(state: np.ndarray, t: float, ref: Reference, params: LanderParams,
     Fx_req = params.mass * ax_des
     Fy_req = params.mass * (ay_des + params.g)
 
-    if ff_only:
-        theta_cmd = thr
-    else:
-        # Desired body-up direction from force vector (attitude outer loop)
-        theta_des = math.atan2(-Fx_req, max(Fy_req, 1e-6))
-        theta_des = float(np.clip(theta_des, -gains.theta_des_max, gains.theta_des_max))
-        theta_cmd = theta_des  # reference's thr is already encoded in ax/ay when feasible
+    # Desired body-up direction from force vector (attitude outer loop)
+    theta_des = math.atan2(-Fx_req, max(Fy_req, 1e-6))
+    theta_des = float(np.clip(theta_des, -gains.theta_des_max, gains.theta_des_max))
+    theta_cmd = theta_des  # reference's thr is already encoded in ax/ay when feasible
 
-    if ff_only:
-        alpha_des = alr
-        theta_err = 0.0
-    else:
-        theta_err = theta_cmd - theta
-        theta_err = (theta_err + math.pi) % (2 * math.pi) - math.pi
-        alpha_des = alr + gains.kp_theta * theta_err + gains.kd_theta * (omr - omega)
+
+    theta_err = theta_cmd - theta
+    theta_err = (theta_err + math.pi) % (2 * math.pi) - math.pi
+    alpha_des = alr + gains.kp_theta * theta_err + gains.kd_theta * (omr - omega)
 
     # --- Main thrust: project required world force onto current body +y ---
     # body +y in world = (-sin θ, cos θ); projection scalar:
@@ -560,7 +445,7 @@ def control(state: np.ndarray, t: float, ref: Reference, params: LanderParams,
 # Episode runner
 # ---------------------------------------------------------------------------
 def run_episode(render: bool = False, duration_s: float = 3.0, seed: int | None = None,
-                verbose: bool = True, ref_kind: str = "quintic", ff_only: bool = False,
+                verbose: bool = True, ref_kind: str = "kto", ff_only: bool = False,
                 brake_time: float = 2.0) -> dict:
     env = gym.make("LunarLander-v3", continuous=True,
                    render_mode="human" if render else None)
@@ -577,18 +462,9 @@ def run_episode(render: bool = False, duration_s: float = 3.0, seed: int | None 
         print(f"[params] F_main_max={params.F_main_max:.2f} N, need {hover_thrust:.2f} N to hover "
               f"→ m_power={hover_thrust/params.F_main_max:.3f}")
 
-    if ref_kind == "hover":
-        ref: Reference = HoverReference(x0=x0, y0=y0)
-    elif ref_kind == "freefall":
-        ref = FreeFallReference(x0, y0, vx0, vy0, th0, om0)
-    elif ref_kind == "quintic":
-        x_end = x0 + 0.5 * vx0 * brake_time
-        y_end = y0 + 0.5 * vy0 * brake_time
-        ref = QuinticBrakeReference(x0, y0, vx0, vy0, x_end, y_end, brake_time)
-        if verbose:
-            print(f"[ref] quintic brake T={brake_time}s  end=({x_end:+.2f}, {y_end:+.2f})")
-    elif ref_kind == "kto":
-        ref, plan_T, _ = plan_with_kto(x0, y0, vx0, vy0, params, verbose=verbose)
+
+    if ref_kind == "kto":
+        plan, plan_T, _ = plan_with_kto(x0, y0, vx0, vy0, params, verbose=verbose)
         # Override duration to cover the plan plus a small settling tail
         duration_s = max(duration_s, plan_T + 1.0)
     else:
@@ -610,21 +486,19 @@ def run_episode(render: bool = False, duration_s: float = 3.0, seed: int | None 
 
     window_closed = False
     for k in range(n_steps):
-        action, dbg = control(obs_state, t, ref, params, gains, ff_only=ff_only)
+        action, dbg = control(obs_state, t, plan, params, gains, ff_only=ff_only)
         obs, reward, terminated, truncated, info = env.step(action)
-        # Overlay the plan on top of the env's rendered frame, if we have a KTO plan.
+        # Overlay the plan on top of the env's rendered frame.
         if render:
             try:
-                import pygame
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT or (
                         event.type == pygame.KEYDOWN
                         and event.key in (pygame.K_q, pygame.K_ESCAPE)
                     ):
                         window_closed = True
-                if isinstance(ref, KTOReference):
-                    draw_plan_overlay(env, ref, current_t=t)
-                    pygame.display.flip()
+                draw_plan_overlay(env, plan, current_t=t)
+                pygame.display.flip()
             except Exception:
                 pass
             if window_closed:
@@ -632,7 +506,7 @@ def run_episode(render: bool = False, duration_s: float = 3.0, seed: int | None 
         obs_state = obs_to_state(obs)
         last_obs = obs
         t += DT
-        r_next = ref(t)
+        r_next = plan(t)
         e_x = obs_state[0] - r_next[0]
         e_y = obs_state[1] - r_next[1]
         e_th = obs_state[4] - r_next[4]
@@ -705,10 +579,8 @@ def main():
     p.add_argument("--episodes", type=int, default=1)
     p.add_argument("--duration", type=float, default=3.0)
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--ref", choices=["hover", "freefall", "quintic", "kto"], default="kto")
-    p.add_argument("--ff-only", action="store_true",
-                   help="disable PD feedback — tracker runs open-loop on reference feedforward")
-    p.add_argument("--brake-time", type=float, default=2.0)
+    p.add_argument("--ref", choices=["kto"], default="kto")
+
     args = p.parse_args()
 
     # With --render, loop indefinitely with incrementing seeds unless the user
@@ -725,10 +597,10 @@ def main():
             break
         seed = base_seed + i if args.seed is not None else (None if not infinite else base_seed + i)
         label = f"{i+1}/{'∞' if infinite else args.episodes}"
-        print(f"=== episode {label} (seed={seed}, ref={args.ref}, ff_only={args.ff_only}) ===")
+        print(f"=== episode {label} (seed={seed}, ref={args.ref}) ===")
         try:
             m = run_episode(render=args.render, duration_s=args.duration, seed=seed,
-                            ref_kind=args.ref, ff_only=args.ff_only, brake_time=args.brake_time)
+                            ref_kind=args.ref)
         except KeyboardInterrupt:
             print("\n[interrupted]")
             break
