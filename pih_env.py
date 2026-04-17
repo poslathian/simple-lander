@@ -72,6 +72,17 @@ PIH_TIMEOUT = 30.0   # s — must exceed longest feasible KTO plan (~22 s)
 
 RAY_MAX = 12.0   # world units — max raycast distance
 
+# Short names used in waypoint labels during rendering
+_WPT_SHORT: dict[str, str] = {
+    'start':        'start',
+    'mountain_out': 'mt_out',
+    'approach':     'appr',
+    'contact':      'ct',
+    'extraction':   'ex',
+    'mountain_ret': 'mt_ret',
+    'landing':      'land',
+}
+
 
 # ---------------------------------------------------------------------------
 # Termination reasons
@@ -274,7 +285,12 @@ class PackageInHoleEnv(gym.Env):
         self.elapsed_s    = 0.0
         self._attached    = False
         self._termination_reason = TerminationReason.NONE
-        self._kto_path_xy = None   # for rendering
+        self._kto_path_xy  = None   # sampled path for trajectory overlay
+        self._waypoints    = None   # PIHWaypoints, injected by controller
+        self._ctrl_t       = 0.0    # controller wall-clock time, for target circle
+        self._plan_ref     = None   # Plan callable, injected by controller
+        self._show_raycasts = False  # opt-in: visualise raycast beams
+        self._font         = None   # lazy pygame font
 
     # ── World construction ───────────────────────────────────────────────
 
@@ -476,6 +492,10 @@ class PackageInHoleEnv(gym.Env):
         if self._package is not None:
             self.drawlist.append(self._package)
         self._kto_path_xy = None
+        self._waypoints   = None
+        self._ctrl_t      = 0.0
+        self._plan_ref    = None
+        # _show_raycasts and _font are not reset — caller sets once, font is cached
 
         if self.render_mode == "human":
             self.render()
@@ -621,41 +641,140 @@ class PackageInHoleEnv(gym.Env):
             self.screen = pygame.display.set_mode((VIEWPORT_W, VIEWPORT_H))
         if self.clock is None:
             self.clock = pygame.time.Clock()
+        if self._font is None:
+            if not pygame.font.get_init():
+                pygame.font.init()
+            self._font = pygame.font.Font(None, 16)   # built-in, no fontconfig dep
 
         surf = pygame.Surface((VIEWPORT_W, VIEWPORT_H))
-        pygame.draw.rect(surf, (230, 230, 230), surf.get_rect())
 
-        if self._terrain is not None:
-            for fix in self._terrain.fixtures:
-                v1 = (int(fix.shape.vertices[0][0] * SCALE),
-                      int(VIEWPORT_H - fix.shape.vertices[0][1] * SCALE))
-                v2 = (int(fix.shape.vertices[1][0] * SCALE),
-                      int(VIEWPORT_H - fix.shape.vertices[1][1] * SCALE))
-                pygame.draw.line(surf, (50, 50, 50), v1, v2, 2)
+        # ── Black sky background (matches gymnasium LunarLander style) ────
+        pygame.draw.rect(surf, (0, 0, 0), surf.get_rect())
 
+        cfg = self.cfg
+        py  = PIH_PAD_Y
+        mx  = PIH_MOUNTAIN_X
+        mh  = PIH_MOUNTAIN_H
+        hhw = cfg.hole_half_width
+        hd  = cfg.hole_depth
+
+        def to_px(wx, wy):
+            return (int(round(wx * SCALE)), int(round(VIEWPORT_H - wy * SCALE)))
+
+        # ── White terrain polygon ─────────────────────────────────────────
+        # Traces the surface profile left → right (including hole walls and
+        # floor), then closes along the bottom of the viewport.  Filling
+        # white on a black background mirrors the gymnasium sky-poly trick.
+        terrain_poly = [
+            to_px(0,                   py),
+            to_px(PIH_START_X + 1.5,  py),
+            to_px(mx,                  py + mh),
+            to_px(PIH_PICKUP_X - 1.5, py),
+            to_px(PIH_PICKUP_X - hhw, py),
+            to_px(PIH_PICKUP_X - hhw, py - hd),
+            to_px(PIH_PICKUP_X + hhw, py - hd),
+            to_px(PIH_PICKUP_X + hhw, py),
+            to_px(WORLD_W,             py),
+            to_px(WORLD_W,             0.0),
+            to_px(0.0,                 0.0),
+        ]
+        pygame.draw.polygon(surf, (255, 255, 255), terrain_poly)
+        gfxdraw.aapolygon(surf, terrain_poly, (255, 255, 255))
+
+        # ── Hole void: overdraw hole interior with black ──────────────────
+        # The terrain polygon fills the hole cavity white; this restores it
+        # to black so the hole reads as an opening in the pad.
+        hole_void = [
+            to_px(PIH_PICKUP_X - hhw, py),
+            to_px(PIH_PICKUP_X - hhw, py - hd),
+            to_px(PIH_PICKUP_X + hhw, py - hd),
+            to_px(PIH_PICKUP_X + hhw, py),
+        ]
+        pygame.draw.polygon(surf, (0, 0, 0), hole_void)
+        gfxdraw.aapolygon(surf, hole_void, (0, 0, 0))
+
+        # ── Flags: two per pad, clamped to flat terrain ───────────────────
+        # The mountain starts at PIH_START_X+1.5 and ends at PIH_PICKUP_X-1.5,
+        # matching the hardcoded pad edges in _build_terrain().  Inner flags
+        # are clamped to these boundaries so they never land on a slope.
+        _FLAG_HALF   = 4 * LEG_AWAY / SCALE   # ≈ 2.67 m desired half-width
+        _MT_LEFT     = PIH_START_X  + 1.5     # 9.0 m — left pad / mountain boundary
+        _MT_RIGHT    = PIH_PICKUP_X - 1.5     # 21.0 m — mountain / right pad boundary
+        for pad_cx in (PIH_START_X, PIH_PICKUP_X):
+            fx_l = pad_cx - _FLAG_HALF
+            fx_r = pad_cx + _FLAG_HALF
+            if pad_cx == PIH_START_X:
+                fx_r = min(fx_r, _MT_LEFT)    # clamp right flag to pad edge
+            else:
+                fx_l = max(fx_l, _MT_RIGHT)   # clamp left flag to pad edge
+            for flag_wx in (fx_l, fx_r):
+                sx, sy = to_px(flag_wx, PIH_PAD_Y)
+                pygame.draw.line(surf, (255, 255, 255), (sx, sy), (sx, sy - 50), 1)
+                tri = [(sx, sy - 50), (sx, sy - 40), (sx + 25, sy - 45)]
+                pygame.draw.polygon(surf, (204, 204, 0), tri)
+                gfxdraw.aapolygon(surf, tri, (204, 204, 0))
+
+        # ── KTO trajectory line ───────────────────────────────────────────
+        if self._kto_path_xy is not None and len(self._kto_path_xy) > 1:
+            pts = [to_px(*p) for p in self._kto_path_xy]
+            pygame.draw.aalines(surf, (0, 180, 180), False, pts)
+
+        # ── Waypoint circles + labels ─────────────────────────────────────
+        if self._waypoints is not None:
+            for f in dataclasses.fields(self._waypoints):
+                wx, wy, _ws = getattr(self._waypoints, f.name)
+                sx, sy = to_px(wx, wy)
+                pygame.draw.circle(surf, (255, 200, 0), (sx, sy), 6)
+                pygame.draw.circle(surf, (255, 255, 255), (sx, sy), 2)
+                label = self._font.render(
+                    _WPT_SHORT.get(f.name, f.name), True, (220, 220, 220)
+                )
+                surf.blit(label, (sx + 8, sy - 6))
+
+        # ── Current reference target (blue circle) ────────────────────────
+        if self._plan_ref is not None:
+            ref = self._plan_ref(self._ctrl_t)
+            sx, sy = to_px(float(ref[0]), float(ref[1]))
+            pygame.draw.circle(surf, (60, 160, 255), (sx, sy), 5)
+
+        # ── Drawlist: lander, legs, package body (while not attached) ─────
         for obj in self.drawlist:
             for fix in obj.fixtures:
                 if not hasattr(fix.shape, 'vertices'):
                     continue
                 trans = fix.body.transform
-                path = [
-                    (int(v[0] * SCALE), int(VIEWPORT_H - v[1] * SCALE))
-                    for v in (trans * v for v in fix.shape.vertices)
-                ]
+                path  = [to_px(*trans * v) for v in fix.shape.vertices]
                 pygame.draw.polygon(surf, obj.color1, path)
                 gfxdraw.aapolygon(surf, path, obj.color2)
 
-        if self._kto_path_xy is not None and len(self._kto_path_xy) > 1:
-            pts = [
-                (int(p[0] * SCALE), int(VIEWPORT_H - p[1] * SCALE))
-                for p in self._kto_path_xy
+        # ── Package drawn at estimated lander-leg position when attached ──
+        if self._attached and self.lander is not None:
+            pos = self.lander.position
+            pcx = float(pos.x)
+            pcy = float(pos.y) - PIH_LEG_OFFSET - cfg.package_height_true / 2.0
+            phw = cfg.package_half_width
+            phh = cfg.package_height_true / 2.0
+            corners = [
+                to_px(pcx - phw, pcy + phh),
+                to_px(pcx + phw, pcy + phh),
+                to_px(pcx + phw, pcy - phh),
+                to_px(pcx - phw, pcy - phh),
             ]
-            pygame.draw.aalines(surf, (0, 180, 180), False, pts)
+            pygame.draw.polygon(surf, (200, 150, 80), corners)
+            gfxdraw.aapolygon(surf, corners, (160, 100, 40))
 
-        for sx in [PIH_START_X, PIH_PICKUP_X]:
-            px = int(sx * SCALE)
-            py_px = int(VIEWPORT_H - PIH_PAD_Y * SCALE)
-            pygame.draw.line(surf, (255, 200, 0), (px, py_px), (px, py_px - 30), 2)
+        # ── Raycasts (opt-in: set env._show_raycasts = True) ─────────────
+        if self._show_raycasts and self.lander is not None:
+            n      = cfg.n_raycast_rays
+            pos    = self.lander.position
+            origin = (float(pos.x), float(pos.y))
+            for k in range(n):
+                angle = self.lander.angle + (2.0 * math.pi * k / n)
+                frac  = self._cast_ray(origin, angle)
+                ex    = origin[0] + math.cos(angle) * RAY_MAX * frac
+                ey    = origin[1] + math.sin(angle) * RAY_MAX * frac
+                color = (220, 60, 60) if frac < 0.5 else (160, 160, 160)
+                pygame.draw.line(surf, color, to_px(*origin), to_px(ex, ey), 1)
 
         if self.render_mode == "human":
             self.screen.blit(surf, (0, 0))
@@ -666,7 +785,6 @@ class PackageInHoleEnv(gym.Env):
             self.clock.tick(FPS)
             pygame.display.flip()
         elif self.render_mode == "rgb_array":
-            import pygame
             return np.transpose(
                 np.array(pygame.surfarray.pixels3d(surf)), axes=(1, 0, 2)
             )

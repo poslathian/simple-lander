@@ -15,13 +15,20 @@
 #
 # Diagnostic for a single episode:
 #   docker run --rm pih-validate python scripts/diag_pih.py --seed 70000
+#
+# Render test (saves PNG frames to results/pih_render/):
+#   docker run --rm `
+#     -v "C:/Users/arian/src/poslathian/simple-lander/results:/app/results" `
+#     pih-validate python scripts/render_pih.py [--seed N] [--every N] [--raycasts]
 
 FROM python:3.13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    MPLBACKEND=Agg
+    MPLBACKEND=Agg \
+    SDL_VIDEODRIVER=dummy \
+    SDL_AUDIODRIVER=dummy
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         swig \
@@ -42,6 +49,7 @@ RUN pip install --no-cache-dir \
         "scipy==1.17.1" \
         "matplotlib==3.10.8" \
         "gymnasium[box2d]==1.2.3" \
+        "pygame==2.6.1" \
         swig
 
 # Drake last — large layer (~500 MB)
@@ -51,6 +59,6 @@ RUN pip install --no-cache-dir "drake==1.52.0"
 COPY kto_lander.py pih_env.py pih_solver.py lunar_lander.py ./
 COPY scripts/ ./scripts/
 
-RUN mkdir -p results/pih_validation
+RUN mkdir -p results/pih_validation results/pih_render
 
 CMD ["python", "scripts/validate_pih.py"]

@@ -181,8 +181,25 @@ class PackageInHoleKTOController:
 
         Must be called exactly once per env.step() call.
         Returns (action[2], debug_dict).
+
+        Also auto-injects rendering state into env.unwrapped on the first call
+        (_kto_path_xy, _waypoints, _plan_ref) and updates _ctrl_t every call.
         """
-        lander = env.unwrapped.lander
+        uw = env.unwrapped
+
+        # First call: sample the trajectory and store rendering references
+        if uw._kto_path_xy is None:
+            T = self.plan.T
+            uw._kto_path_xy = [
+                (float(self.plan(s * T)[0]), float(self.plan(s * T)[1]))
+                for s in np.linspace(0.0, 1.0, 80)
+            ]
+            uw._waypoints = self.waypoints
+            uw._plan_ref  = self.plan
+
+        uw._ctrl_t = self.t
+
+        lander = uw.lander
         pos    = lander.position
         vel    = lander.linearVelocity
         state  = np.array([
@@ -192,7 +209,7 @@ class PackageInHoleKTOController:
         ], dtype=np.float64)
 
         # Update mass model the first time attachment is detected
-        if env.unwrapped._attached and not self._saw_attachment:
+        if uw._attached and not self._saw_attachment:
             self._saw_attachment = True
             self.params = dataclasses.replace(
                 self.params,
