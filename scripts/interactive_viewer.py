@@ -205,6 +205,7 @@ def draw_overlays(
     n_frames: int,
     playing: bool,
     speed: float,
+    speed_flash: bool,
     status_msg: str,
 ) -> None:
     import pygame
@@ -229,27 +230,28 @@ def draw_overlays(
 
     # ── HUD ─────────────────────────────────────────────────────────────
     t_sim = ep.timestamps[min(frame_idx, len(ep.timestamps) - 1)]
+    speed_color = (255, 220, 60) if speed_flash else (200, 200, 200)
     hud_lines = [
-        f"Frame {frame_idx}/{n_frames - 1}  t={t_sim:.2f}s",
-        f"{'PLAYING' if playing else 'PAUSED'}  {speed:.2f}x",
-        f"Seed {ep.seed}  {ep.termination_reason}",
+        (f"Frame {frame_idx}/{n_frames - 1}  t={t_sim:.2f}s", (200, 200, 200)),
+        (f"{'PLAYING' if playing else 'PAUSED'}  {speed:.2f}x", speed_color),
+        (f"Seed {ep.seed}  {ep.termination_reason}", (200, 200, 200)),
     ]
     if user_wp:
         wx, wy = user_wp
-        hud_lines.append(f"Waypoint ({wx:.2f}, {wy:.2f})")
+        hud_lines.append((f"Waypoint ({wx:.2f}, {wy:.2f})", (200, 200, 200)))
         if prev_wp_name:
-            hud_lines.append(f"Prev: {prev_wp_name}")
+            hud_lines.append((f"Prev: {prev_wp_name}", (200, 200, 200)))
     if status_msg:
-        hud_lines.append(status_msg)
+        hud_lines.append((status_msg, (200, 200, 200)))
 
     y_off = 6
-    for line in hud_lines:
-        txt = font.render(line, True, (200, 200, 200))
+    for line, color in hud_lines:
+        txt = font.render(line, True, color)
         surf.blit(txt, (6, y_off))
         y_off += 14
 
     # ── Controls reminder ────────────────────────────────────────────────
-    controls = "[Space] play/pause  [←/→] step  [[/]] speed  [Click] waypoint"
+    controls = "[Space] play/pause  [Left/Right] step  [[/]] speed (0.25x-8x)  [Click] waypoint"
     controls2 = "[W] re-solve  [A] accept  [R] reject  [S] skip  [N] next  [Q] quit"
     for i, c in enumerate([controls, controls2]):
         txt = font.render(c, True, (140, 140, 140))
@@ -291,6 +293,7 @@ def run_viewer(
     speed       = 1.0        # display FPS multiplier (base = 10 fps)
     BASE_FPS    = 10
     play_accum  = 0.0        # accumulated time for frame advance
+    speed_flash_until = 0.0  # pygame.time.get_ticks() ms deadline for speed highlight
 
     user_wp:       Optional[tuple[float, float]] = None
     prev_wp_name:  Optional[str] = None
@@ -325,9 +328,11 @@ def run_viewer(
 
                 elif event.key == pygame.K_LEFTBRACKET:
                     speed = max(speed / 2.0, 0.25)
+                    speed_flash_until = pygame.time.get_ticks() + 400
 
                 elif event.key == pygame.K_RIGHTBRACKET:
                     speed = min(speed * 2.0, 8.0)
+                    speed_flash_until = pygame.time.get_ticks() + 400
 
                 elif event.key == pygame.K_s:
                     print(f"[viewer] skip ep {ep_idx}  seed={ep.seed}")
@@ -392,9 +397,10 @@ def run_viewer(
         base = frames[frame_idx]
         surf = pygame.surfarray.make_surface(base.swapaxes(0, 1))
 
+        speed_flash = pygame.time.get_ticks() < speed_flash_until
         draw_overlays(
             surf, ep, user_wp, prev_wp_name, corrected_path,
-            font, frame_idx, len(frames), playing, speed, status_msg,
+            font, frame_idx, len(frames), playing, speed, speed_flash, status_msg,
         )
 
         screen.blit(surf, (0, 0))
