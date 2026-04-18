@@ -56,9 +56,9 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir "drake==1.52.0"
 
 # Source files; results come from volume mount
-COPY kto_lander.py pih_env.py pih_solver.py lunar_lander.py ./
+COPY kto_lander.py pih_env.py pih_solver.py pih_weld.py lunar_lander.py ./
 COPY scripts/ ./scripts/
 
-RUN mkdir -p results/pih_validation results/pih_render
+RUN mkdir -p results/pih_validation results/pih_render results/phase2
 
 CMD ["python", "scripts/validate_pih.py"]

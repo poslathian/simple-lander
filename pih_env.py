@@ -171,6 +171,14 @@ class PIHConfig:
         """
         return PIH_PAD_Y + self.hole_depth + self.package_height_assumed + 0.2 + PIH_LEG_OFFSET
 
+    def with_true_as_assumed(self) -> "PIHConfig":
+        """Return a copy where assumed parameters equal true values (oracle config)."""
+        return dataclasses.replace(
+            self,
+            package_height_assumed=self.package_height_true,
+            package_mass_assumed=self.package_mass_true,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Contact listener — terrain crash + leg ground contact only

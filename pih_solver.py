@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import numpy as np
+from scipy.interpolate import BSpline as _ScipyBSpline
 from pydrake.planning import KinematicTrajectoryOptimization
 from pydrake.solvers import LinearEqualityConstraint, Solve
 
@@ -15,15 +17,95 @@ from pih_env import (
     PIH_MOUNTAIN_X, PIH_MOUNTAIN_H,
     DT,
 )
+from pih_weld import weld_c2, _make_uniform_clamped_knots
 
-# Clearance above the mountain peak (m).  Must exceed body height plus PD
-# tracking error headroom during the crossing.
+# Clearance above the mountain peak (m).
 _MOUNTAIN_CLEARANCE_M = 1.5
 
-# Default normalised times for the 7 PIH waypoints (approach_land is a read-back annotation).
-# These are the primary tuning knob as the task grows more complex.
+# Default normalised times for the 7 PIH waypoints (approach_land is a read-back).
 _DEFAULT_S: tuple[float, ...] = (0.00, 0.20, 0.40, 0.52, 0.62, 0.77, 0.88, 1.00)
 
+# Proximity thresholds (metres) per waypoint for the controller's index advance.
+_WP_THRESHOLDS: dict[str, float] = {
+    "mountain_out":  2.5,
+    "approach":      2.0,
+    "contact":       1.5,
+    "extraction":    0.8,
+    "mountain_ret":  2.5,
+    "approach_land": 2.0,
+    "landing":       1.5,
+}
+
+# Canonical ordering used by _tracked_waypoints (approach_land excluded — it
+# is a read-back annotation, not a physical navigation target).
+_WP_ORDER = ["mountain_out", "approach", "contact", "extraction",
+             "mountain_ret", "landing"]
+
+
+# ---------------------------------------------------------------------------
+# Scipy-backed trajectory wrapper — pydrake-compatible interface
+# ---------------------------------------------------------------------------
+
+class _ScipyBasisWrapper:
+    """Thin wrapper so _ScipyTrajWrapper.basis().knots() works."""
+    def __init__(self, knots: np.ndarray) -> None:
+        self._knots = knots
+
+    def knots(self):
+        return self._knots.tolist()
+
+
+class _ScipyTrajWrapper:
+    """Scipy BSpline wrapped with pydrake BsplineTrajectory interface.
+
+    Returned by _numpy_to_plan() so welded plans can be used in Plan objects
+    without requiring a round-trip through pydrake's BsplineTrajectory ctor.
+    """
+    def __init__(self, spl: _ScipyBSpline, T: float) -> None:
+        self._spl = spl
+        self._T = T
+
+    def value(self, t: float) -> np.ndarray:
+        """Returns (D, 1) column vector, matching pydrake convention."""
+        v = self._spl(float(np.clip(t, 0.0, self._T)))
+        return np.asarray(v, dtype=float).reshape(-1, 1)
+
+    def MakeDerivative(self, order: int) -> "_ScipyTrajWrapper":
+        return _ScipyTrajWrapper(self._spl.derivative(order), self._T)
+
+    def control_points(self) -> list[np.ndarray]:
+        c = self._spl.c          # (N, D) for multi-dim spline
+        return [c[i:i+1, :].T for i in range(len(c))]   # list of (D, 1)
+
+    def basis(self) -> _ScipyBasisWrapper:
+        return _ScipyBasisWrapper(self._spl.t)
+
+    def end_time(self) -> float:
+        return self._T
+
+    def start_time(self) -> float:
+        return 0.0
+
+
+def _plan_to_numpy(plan: Plan) -> tuple[np.ndarray, np.ndarray]:
+    """Extract (N, D) control points and (N+4,) knot vector from a Plan."""
+    cps_raw = plan.traj.control_points()          # list of (D, 1) arrays
+    cps = np.array([np.asarray(cp).flatten() for cp in cps_raw])  # (N, D)
+    knots = np.asarray(plan.traj.basis().knots(), dtype=float)     # (N+4,)
+    return cps, knots
+
+
+def _numpy_to_plan(cps: np.ndarray, knots: np.ndarray) -> Plan:
+    """Build a Plan from (N, D) control points and (N+4,) knot vector."""
+    T = float(knots[-1])
+    spl = _ScipyBSpline(knots, cps, 3)
+    traj = _ScipyTrajWrapper(spl, T)
+    return Plan(traj, T)
+
+
+# ---------------------------------------------------------------------------
+# PIHWaypoints
+# ---------------------------------------------------------------------------
 
 @dataclasses.dataclass(frozen=True)
 class PIHWaypoints:
@@ -32,8 +114,7 @@ class PIHWaypoints:
     s ∈ [0, 1] is the normalised KTO time; multiply by plan.T to get wall-clock
     seconds.  All coordinates are absolute world metres (not pad-centred).
 
-    The normalised times are the primary tuning knob as the task grows more complex —
-    pass an explicit waypoints_s to plan_pih_with_kto() to override them.
+    Fields not active in a partial (oracle) plan are set to (nan, nan, nan).
     """
     start:         tuple[float, float, float]
     mountain_out:  tuple[float, float, float]
@@ -47,6 +128,30 @@ class PIHWaypoints:
     def as_list(self) -> list[tuple[float, float, float]]:
         return [getattr(self, f.name) for f in dataclasses.fields(self)]
 
+    def to_dict(self) -> dict:
+        return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+
+
+# ---------------------------------------------------------------------------
+# plan_pih_with_kto
+# ---------------------------------------------------------------------------
+
+def _compute_wpt_positions(x0: float, y0: float, cfg: PIHConfig) -> dict[str, tuple[float, float]]:
+    """Compute the world-frame (x, y) position for every named PIH waypoint."""
+    mountain_y_out = PIH_PAD_Y + PIH_MOUNTAIN_H + _MOUNTAIN_CLEARANCE_M + 0.5
+    mountain_y_ret = mountain_y_out + cfg.package_height_assumed
+    approach_y     = cfg.assumed_contact_lander_y + 2.5
+    landing_y      = PIH_PAD_Y + cfg.package_height_assumed + PIH_LEG_OFFSET
+    return {
+        "start":        (x0,            y0),
+        "mountain_out": (PIH_MOUNTAIN_X, mountain_y_out),
+        "approach":     (PIH_PICKUP_X,   approach_y),
+        "contact":      (PIH_PICKUP_X,   cfg.assumed_contact_lander_y),
+        "extraction":   (PIH_PICKUP_X,   cfg.extraction_lander_y),
+        "mountain_ret": (PIH_MOUNTAIN_X, mountain_y_ret),
+        "landing":      (PIH_START_X,    landing_y),
+    }
+
 
 def plan_pih_with_kto(
     x0: float,
@@ -54,12 +159,13 @@ def plan_pih_with_kto(
     vx0: float,
     vy0: float,
     cfg: PIHConfig,
-    params: LanderParams,
+    params: LanderParams | None = None,
     *,
+    remaining_waypoints: list[str] | None = None,
     waypoints_s: tuple[float, ...] | None = None,
     num_control_points: int = 20,
     spline_order: int = 4,
-    T_min: float = 10.0,
+    T_min: float | None = None,
     T_max: float = 30.0,
     vy_contact: float = -0.1,
     vy_extraction: float = 0.5,
@@ -68,42 +174,87 @@ def plan_pih_with_kto(
 ) -> tuple[Plan, float, PIHWaypoints]:
     """Solve a PIH trajectory via pydrake KTO.
 
-    Works in absolute world coordinates because the task has two pads.
-    control() from kto_lander is coordinate-agnostic and accepts an
-    absolute-coordinate plan paired with absolute state directly.
+    When remaining_waypoints is None (default): plans through all 7 waypoints
+    using _DEFAULT_S normalised times — identical to original Phase 1 behaviour.
+
+    When remaining_waypoints is a list of waypoint names: plans only through
+    those waypoints starting from (x0, y0).  Used by the oracle replan.
 
     Returns (Plan, duration_T_seconds, PIHWaypoints).
     Raises RuntimeError on solver failure.
     """
-    if waypoints_s is None:
-        waypoints_s = _DEFAULT_S
-    if len(waypoints_s) != 8:
-        raise ValueError(f"waypoints_s must have 8 entries, got {len(waypoints_s)}")
-    s0, s_mo, s_ap, s_ct, s_ex, s_mr, s_al, s1 = waypoints_s
+    wpt_xy = _compute_wpt_positions(x0, y0, cfg)
+    _NaN3 = (float("nan"), float("nan"), float("nan"))
 
-    # Waypoint positions — planner only sees assumed geometry
-    mountain_y_out  = PIH_PAD_Y + PIH_MOUNTAIN_H + _MOUNTAIN_CLEARANCE_M + 0.5  # extra 0.5 m headroom
-    # On return the package hangs below the lander by ~LEG_OFFSET + package height,
-    # so raise mountain_ret by package_height_assumed to keep it clear of the peak.
-    mountain_y_ret  = mountain_y_out + cfg.package_height_assumed
-    approach_y      = cfg.assumed_contact_lander_y + 2.5               # ~7.6 m (pickup)
-    landing_y = PIH_PAD_Y + cfg.package_height_assumed + PIH_LEG_OFFSET
+    # ── Build active waypoint list and normalised times ───────────────────
+    if remaining_waypoints is None:
+        # Original full-plan path
+        if T_min is None:
+            T_min = 10.0
+        if waypoints_s is None:
+            waypoints_s = _DEFAULT_S
+        if len(waypoints_s) != 8:
+            raise ValueError(f"waypoints_s must have 8 entries for full plan, got {len(waypoints_s)}")
+        s0, s_mo, s_ap, s_ct, s_ex, s_mr, s_al, s1 = waypoints_s
 
-    # approach_land has no prescribed position — its actual position is read back
-    # from the spline after solving and stored in the waypoints for rendering.
-    wpts_fixed = dict(
-        start         = (x0,             y0,                            s0),
-        mountain_out  = (PIH_MOUNTAIN_X, mountain_y_out,                s_mo),
-        approach      = (PIH_PICKUP_X,   approach_y,                    s_ap),
-        contact       = (PIH_PICKUP_X,   cfg.assumed_contact_lander_y,  s_ct),
-        extraction    = (PIH_PICKUP_X,   cfg.extraction_lander_y,       s_ex),
-        mountain_ret  = (PIH_MOUNTAIN_X, mountain_y_ret,                s_mr),
-        landing       = (PIH_START_X,    landing_y,                     s1),
-    )
+        active_wpts: dict[str, tuple[float, float, float]] = {
+            "start":        (wpt_xy["start"][0],        wpt_xy["start"][1],        s0),
+            "mountain_out": (wpt_xy["mountain_out"][0], wpt_xy["mountain_out"][1], s_mo),
+            "approach":     (wpt_xy["approach"][0],     wpt_xy["approach"][1],     s_ap),
+            "contact":      (wpt_xy["contact"][0],      wpt_xy["contact"][1],      s_ct),
+            "extraction":   (wpt_xy["extraction"][0],   wpt_xy["extraction"][1],   s_ex),
+            "mountain_ret": (wpt_xy["mountain_ret"][0], wpt_xy["mountain_ret"][1], s_mr),
+            "landing":      (wpt_xy["landing"][0],      wpt_xy["landing"][1],      s1),
+        }
+        s_al_read = s_al
 
-    # Conservative acceleration / velocity box — same derivation as kto_lander.py.
-    # ax_max=1.5 ⟹ worst-case flatness atan2(1.5,9)=0.165 rad ≈ 9.5° — tighter than
-    # the old 3.0 (18°) to prevent angular-rate spikes in the descent arc.
+        vel_constraints = [
+            (vx0, vy0,          s0),
+            (0.0, vy_contact,   s_ct),
+            (0.0, vy_extraction, s_ex),
+            (0.0, vy_landing,   s1),
+        ]
+
+    else:
+        # Partial plan for oracle replan
+        if T_min is None:
+            T_min = 10.0
+        valid = set(wpt_xy.keys()) - {"start"}
+        unknown = [n for n in remaining_waypoints if n not in valid]
+        if unknown:
+            raise ValueError(f"Unknown waypoints: {unknown}")
+
+        ordered = [n for n in _WP_ORDER if n in remaining_waypoints]
+        n_active = 1 + len(ordered)  # start + ordered remaining
+
+        if waypoints_s is not None:
+            if len(waypoints_s) != n_active:
+                raise ValueError(
+                    f"waypoints_s needs {n_active} entries for this partial plan, "
+                    f"got {len(waypoints_s)}"
+                )
+            s_vals = list(waypoints_s)
+        else:
+            # Evenly-spaced times: gives each segment equal share of T_min,
+            # avoiding infeasibility when a waypoint is geometrically close but
+            # dynamically hard to reach (e.g. extraction requires upward velocity reversal).
+            s_vals = list(np.linspace(0.0, 1.0, n_active))
+
+        active_wpts = {"start": (x0, y0, s_vals[0])}
+        for i, name in enumerate(ordered):
+            wx, wy = wpt_xy[name]
+            active_wpts[name] = (wx, wy, s_vals[i + 1])
+
+        s0 = s_vals[0]
+        s1 = s_vals[-1]
+        s_al_read = None
+
+        vel_constraints = [(vx0, vy0, s0)]
+        if "contact"    in active_wpts: vel_constraints.append((0.0, vy_contact,    active_wpts["contact"][2]))
+        if "extraction" in active_wpts: vel_constraints.append((0.0, vy_extraction, active_wpts["extraction"][2]))
+        vel_constraints.append((0.0, vy_landing, s1))
+
+    # ── Build KTO problem ────────────────────────────────────────────────
     ax_max, ay_min, ay_max = 1.5, -1.0, 5.0
     vx_max, vy_min, vy_max = 7.0, -7.0, 5.0
 
@@ -114,29 +265,29 @@ def plan_pih_with_kto(
     )
     kto.AddDurationConstraint(T_min, T_max)
     kto.AddDurationCost(1.0)
-    kto.AddPathLengthCost(0.02)
+    # Full plans use 0.02 path-length weight (original value).
+    # Partial (oracle) plans use 0.001 — enough to prevent lateral detours through
+    # the extraction zone without triggering SNOPT's kSolverSpecificError.
+    path_len_weight = 0.02 if remaining_waypoints is None else 0.001
+    kto.AddPathLengthCost(path_len_weight)
     kto.AddVelocityBounds(np.array([-vx_max, vy_min]), np.array([vx_max, vy_max]))
     kto.AddAccelerationBounds(np.array([-ax_max, ay_min]), np.array([ax_max, ay_max]))
 
-    # Position constraints at the 7 prescribed waypoints
-    for wx, wy, ws in wpts_fixed.values():
+    for wx, wy, ws in active_wpts.values():
         kto.AddPathPositionConstraint(np.array([wx, wy]), np.array([wx, wy]), ws)
 
-    # Zero acceleration at boundaries → flatness gives θ_ref ≈ 0 at start and landing
     zero2 = np.zeros(2)
     kto.AddPathAccelerationConstraint(zero2, zero2, s0)
     kto.AddPathAccelerationConstraint(zero2, zero2, s1)
 
     def _vel_eq(vx_req: float, vy_req: float) -> LinearEqualityConstraint:
         A = np.zeros((2, 4))
-        A[0, 2] = 1.0  # qdot_x
-        A[1, 3] = 1.0  # qdot_y
+        A[0, 2] = 1.0
+        A[1, 3] = 1.0
         return LinearEqualityConstraint(A, np.array([vx_req, vy_req]))
 
-    kto.AddVelocityConstraintAtNormalizedTime(_vel_eq(vx0, vy0),           s0)    # initial
-    kto.AddVelocityConstraintAtNormalizedTime(_vel_eq(0.0, vy_contact),    s_ct)  # hover at contact
-    kto.AddVelocityConstraintAtNormalizedTime(_vel_eq(0.0, vy_extraction), s_ex)  # ascend at extraction
-    kto.AddVelocityConstraintAtNormalizedTime(_vel_eq(0.0, vy_landing),    s1)    # settle at landing
+    for vx_req, vy_req, s_req in vel_constraints:
+        kto.AddVelocityConstraintAtNormalizedTime(_vel_eq(vx_req, vy_req), s_req)
 
     result = Solve(kto.prog())
     if not result.is_success():
@@ -148,29 +299,75 @@ def plan_pih_with_kto(
     traj = kto.ReconstructTrajectory(result)
     T = float(traj.end_time() - traj.start_time())
 
-    # Read the actual approach_land position from the solved trajectory
-    al_q = traj.value(s_al * T).flatten()
+    # Read back approach_land from the trajectory if available
+    if s_al_read is not None:
+        al_q = traj.value(s_al_read * T).flatten()
+        al_wpt = (float(al_q[0]), float(al_q[1]), s_al_read)
+    else:
+        al_wpt = _NaN3
+
     wpts = PIHWaypoints(
-        approach_land=(float(al_q[0]), float(al_q[1]), s_al),
-        **wpts_fixed,
+        start         = active_wpts.get("start",        _NaN3),
+        mountain_out  = active_wpts.get("mountain_out", _NaN3),
+        approach      = active_wpts.get("approach",     _NaN3),
+        contact       = active_wpts.get("contact",      _NaN3),
+        extraction    = active_wpts.get("extraction",   _NaN3),
+        mountain_ret  = active_wpts.get("mountain_ret", _NaN3),
+        approach_land = al_wpt,
+        landing       = active_wpts.get("landing",      _NaN3),
     )
 
     if verbose:
-        print(f"[pih_kto] solved: T={T:.2f}s  #cp={num_control_points}  "
+        label = "oracle" if remaining_waypoints is not None else "kto"
+        print(f"[pih_{label}] solved: T={T:.2f}s  #cp={num_control_points}  "
               f"solver={result.get_solver_id().name()}")
         for f in dataclasses.fields(wpts):
             wx, wy, ws = getattr(wpts, f.name)
-            print(f"  {f.name:<14s} ({wx:6.2f}, {wy:5.2f})  s={ws:.2f}  t={ws * T:5.1f}s")
+            if not math.isnan(wx):
+                print(f"  {f.name:<14s} ({wx:6.2f}, {wy:5.2f})  s={ws:.2f}  t={ws * T:5.1f}s")
 
     return Plan(traj, T), T, wpts
 
 
-class _HoverPlan:
-    """Fake plan that holds the terminal landing position with zero velocity/accel.
+# ---------------------------------------------------------------------------
+# Oracle KTO
+# ---------------------------------------------------------------------------
 
-    Used after the KTO plan ends so the PD controller targets pure hover rather
-    than the vy=-0.3 terminal velocity, eliminating the downward drift bias.
+def oracle_plan_pih_with_kto(
+    current_state: np.ndarray,        # (6,) [x, y, vx, vy, theta, omega] — theta/omega unused
+    cfg: PIHConfig,
+    remaining_waypoints: list[str],
+    *,
+    verbose: bool = False,
+    **kwargs,
+) -> tuple[Plan, float, PIHWaypoints]:
+    """Replan from current_state using TRUE parameters (oracle config).
+
+    Thin wrapper around plan_pih_with_kto with:
+      - oracle_cfg = cfg.with_true_as_assumed()
+      - start position/velocity from current_state
+      - only plans through remaining_waypoints
+
+    Returns (Plan, T, PIHWaypoints) — same type as plan_pih_with_kto.
     """
+    oracle_cfg = cfg.with_true_as_assumed()
+    x0, y0, vx0, vy0 = (float(current_state[0]), float(current_state[1]),
+                         float(current_state[2]), float(current_state[3]))
+    return plan_pih_with_kto(
+        x0, y0, vx0, vy0,
+        oracle_cfg,
+        remaining_waypoints=remaining_waypoints,
+        verbose=verbose,
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _HoverPlan — fake terminal plan
+# ---------------------------------------------------------------------------
+
+class _HoverPlan:
+    """Fake plan that holds the terminal landing position with zero velocity/accel."""
 
     def __init__(self, landing_x: float, landing_y: float) -> None:
         self.T = 0.0
@@ -180,14 +377,59 @@ class _HoverPlan:
         return self._ref
 
 
+# ---------------------------------------------------------------------------
+# PackageInHoleKTOController
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class _TrackedWaypoint:
+    name:      str
+    x:         float
+    y:         float
+    threshold: float
+    vy_min:    float = -float("inf")  # require vy >= vy_min to advance past this waypoint
+
+
+# extraction is at the same x as contact but higher y — the lander passes through
+# its vicinity while DESCENDING to contact.  Require ascending velocity so the
+# index only advances past extraction on the genuine ascent phase.
+_WP_VY_MIN: dict[str, float] = {"extraction": 0.0}
+
+
+def _waypoints_from_pih(wpts: PIHWaypoints) -> list[_TrackedWaypoint]:
+    """Build the initial tracking list from PIHWaypoints (excludes start / approach_land)."""
+    result = []
+    for name in _WP_ORDER:
+        xy_s = getattr(wpts, name)
+        wx, wy, _ = xy_s
+        if not math.isnan(wx):
+            result.append(_TrackedWaypoint(
+                name, wx, wy, _WP_THRESHOLDS[name],
+                vy_min=_WP_VY_MIN.get(name, -float("inf")),
+            ))
+    return result
+
+
 class PackageInHoleKTOController:
     """Tracks the PIH plan using the PD+feedforward controller from kto_lander.
 
-    State is read directly from Box2D in absolute world coordinates, matching
-    the absolute-coordinate plan produced by plan_pih_with_kto().
+    Phase 2 additions:
+      - Waypoint index tracking (spatial proximity; advances when lander enters
+        threshold distance of the current target waypoint).
+      - Configurable replan triggers: "on_contact" and/or "periodic".
+      - Oracle replanning via oracle_plan_pih_with_kto() + C2 weld.
 
-    On the first step after env._attached becomes True, params.mass is increased
-    by cfg.package_mass_assumed so the controller accounts for the payload.
+    Parameters
+    ----------
+    plan, waypoints, cfg, params, gains:
+        Same as before.
+    replan_triggers:
+        List of trigger names to enable: "on_contact", "periodic".
+        Default [] → Phase 1 behaviour (no replan).
+    replan_interval_s:
+        Period for "periodic" trigger (seconds of simulation time).
+    weld_strategy:
+        Passed to weld_c2(); one of "point", "overlap_1", "overlap_2".
     """
 
     def __init__(
@@ -197,31 +439,67 @@ class PackageInHoleKTOController:
         cfg: PIHConfig,
         params: LanderParams,
         gains: TrackerGains | None = None,
+        *,
+        replan_triggers: list[str] | None = None,
+        replan_interval_s: float = 5.0,
+        weld_strategy: str = "point",
     ):
         self.plan      = plan
-        self.waypoints = waypoints           # stored for diagnostics / tuning interrogation
+        self.waypoints = waypoints
         self.cfg       = cfg
-        self.params    = dataclasses.replace(params)  # local mutable copy
+        self.params    = dataclasses.replace(params)
         self.gains     = gains if gains is not None else TrackerGains()
-        self.t         = 0.0
+        self.t         = 0.0               # total elapsed simulation time
         self._saw_attachment = False
-        # Pure-hover plan used after trajectory ends, eliminating the vy=-0.3 terminal
-        # bias that would keep the controller pushing downward after the KTO plan ends.
+        self._contact_replan_pending = False  # True after attachment, until vy > 0
+        self._pre_attach_params = dataclasses.replace(params)  # saved for oracle mass fix
+
+        # Active plan tracking (switches on replan)
+        self._active_plan   = plan
+        self._active_plan_t = 0.0          # time within the current active plan
         landing_ref = plan(plan.T)
         self._hover_plan = _HoverPlan(float(landing_ref[0]), float(landing_ref[1]))
+
+        # Waypoint index tracking
+        self._tracked_waypoints: list[_TrackedWaypoint] = _waypoints_from_pih(waypoints)
+        self._wp_idx: int = 0
+
+        # Replan trigger config
+        self.replan_triggers  = list(replan_triggers or [])
+        self.replan_interval_s = replan_interval_s
+        self.weld_strategy    = weld_strategy
+        self._last_replan_t   = -float("inf")
+
+        # Data collection: replan events
+        self.replan_events: list[dict] = []
+
+    # ── Public helpers ──────────────────────────────────────────────────
+
+    @property
+    def wp_idx(self) -> int:
+        return self._wp_idx
+
+    @property
+    def current_waypoint_name(self) -> str | None:
+        if self._wp_idx < len(self._tracked_waypoints):
+            return self._tracked_waypoints[self._wp_idx].name
+        return None
+
+    def remaining_waypoint_names(self) -> list[str]:
+        """Names of waypoints from current index onward."""
+        return [w.name for w in self._tracked_waypoints[self._wp_idx:]]
+
+    # ── Core step ──────────────────────────────────────────────────────
 
     def step(self, env) -> tuple[np.ndarray, dict]:
         """Compute one action from live Box2D state; advance internal clock by DT.
 
         Must be called exactly once per env.step() call.
         Returns (action[2], debug_dict).
-
-        Also auto-injects rendering state into env.unwrapped on the first call
-        (_kto_path_xy, _waypoints, _plan_ref) and updates _ctrl_t every call.
         """
         uw = env.unwrapped
 
-        # First call: sample the trajectory and store rendering references
+        # First call: inject rendering state
         if uw._kto_path_xy is None:
             T = self.plan.T
             uw._kto_path_xy = [
@@ -237,14 +515,12 @@ class PackageInHoleKTOController:
         pos    = lander.position
         vel    = lander.linearVelocity
         state  = np.array([
-            float(pos.x),        float(pos.y),
-            float(vel.x),        float(vel.y),
+            float(pos.x), float(pos.y),
+            float(vel.x), float(vel.y),
             float(lander.angle), float(lander.angularVelocity),
         ], dtype=np.float64)
 
-        # Update mass + inertia the first time attachment is detected.
-        # Inertia uses parallel-axis theorem: I += m_pkg * d^2 where d is the
-        # distance from lander COM to package COM (leg offset + half package height).
+        # ── Update mass on first attachment ────────────────────────────
         if uw._attached and not self._saw_attachment:
             self._saw_attachment = True
             d = PIH_LEG_OFFSET + self.cfg.package_height_assumed / 2.0
@@ -253,10 +529,110 @@ class PackageInHoleKTOController:
                 mass=self.params.mass + self.cfg.package_mass_assumed,
                 inertia=self.params.inertia + self.cfg.package_mass_assumed * d * d,
             )
+            if "on_contact" in self.replan_triggers:
+                self._contact_replan_pending = True  # defer until lander reverses
 
-        if self.t >= self.plan.T:
+        # Fire on_contact replan once lander is ascending after attachment bounce.
+        # Replanning from vy < 0 (still descending at contact) causes the oracle
+        # plan to start by going DOWN, which immediately diverges from the actual
+        # lander trajectory after the contact bounce.
+        if self._contact_replan_pending and state[3] > 0.0:
+            self._contact_replan_pending = False
+            self._fire_replan(state, trigger="on_contact")
+
+        # ── Periodic replan ────────────────────────────────────────────
+        if ("periodic" in self.replan_triggers
+                and self.t - self._last_replan_t >= self.replan_interval_s):
+            self._fire_replan(state, trigger="periodic")
+
+        # ── Advance waypoint index by spatial proximity ────────────────
+        self._advance_wp_idx(state)
+
+        # ── Compute action from active plan ────────────────────────────
+        if self._active_plan_t >= self._active_plan.T:
             action, debug = control(state, 0.0, self._hover_plan, self.params, self.gains)
         else:
-            action, debug = control(state, self.t, self.plan, self.params, self.gains)
-        self.t += DT
+            action, debug = control(state, self._active_plan_t, self._active_plan,
+                                    self.params, self.gains)
+
+        self.t              += DT
+        self._active_plan_t += DT
         return action, debug
+
+    # ── Internal helpers ────────────────────────────────────────────────
+
+    def _advance_wp_idx(self, state: np.ndarray) -> None:
+        """Advance _wp_idx when lander enters proximity of current target waypoint.
+
+        Uses spatial proximity only (not temporal).  The vy_min guard on
+        'extraction' prevents a false advance while the lander is descending
+        through the extraction zone on its way down to contact.
+        """
+        while self._wp_idx < len(self._tracked_waypoints):
+            wp = self._tracked_waypoints[self._wp_idx]
+            dist = math.hypot(state[0] - wp.x, state[1] - wp.y)
+            if dist < wp.threshold and state[3] >= wp.vy_min:
+                self._wp_idx += 1
+            else:
+                break
+
+    def _fire_replan(self, state: np.ndarray, trigger: str) -> None:
+        """Run oracle KTO + C2 weld and switch to the welded plan."""
+        self._last_replan_t = self.t
+
+        # Remaining waypoints: skip "contact" if we just attached there
+        remaining = self.remaining_waypoint_names()
+        if trigger == "on_contact" and remaining and remaining[0] == "contact":
+            remaining = remaining[1:]
+        if not remaining:
+            return  # nothing left to replan toward
+
+        try:
+            oracle_plan, oracle_T, oracle_wpts = oracle_plan_pih_with_kto(
+                state, self.cfg, remaining, verbose=False,
+            )
+        except RuntimeError:
+            return  # oracle solve failed; keep current plan
+
+        # Oracle plan is already solved from actual state — switch directly.
+        # Welding from old plan's state at weld_param causes position/velocity
+        # mismatch (old plan descending; lander may already be ascending after
+        # contact), which leads to x-deviation and extraction_collision.
+        oracle_cps, oracle_knots = _plan_to_numpy(oracle_plan)
+
+        # Fix tracker params to use oracle (true) mass/inertia.
+        # Before attachment: params = lander-only.
+        # After assumed-mass attachment: params = lander + assumed_package (may differ
+        # from true). Oracle plan was solved with true mass, so tracking must use true.
+        if self._saw_attachment:
+            oracle_cfg = self.cfg.with_true_as_assumed()
+            d = PIH_LEG_OFFSET + oracle_cfg.package_height_assumed / 2.0
+            self.params = dataclasses.replace(
+                self._pre_attach_params,
+                mass=self._pre_attach_params.mass + oracle_cfg.package_mass_assumed,
+                inertia=self._pre_attach_params.inertia + oracle_cfg.package_mass_assumed * d * d,
+            )
+
+        # Switch active plan
+        self._active_plan   = oracle_plan
+        self._active_plan_t = 0.0
+        landing_ref = oracle_plan(oracle_plan.T)
+        self._hover_plan = _HoverPlan(float(landing_ref[0]), float(landing_ref[1]))
+
+        # Update tracked waypoints to oracle's waypoints
+        new_tracked = _waypoints_from_pih(oracle_wpts)
+        if new_tracked:
+            self._tracked_waypoints = new_tracked
+            self._wp_idx = 0
+
+        # Record the event (include oracle CPs for data analysis)
+        self.replan_events.append({
+            "trigger":          trigger,
+            "sim_time":         self.t,
+            "state_at_trigger": state.tolist(),
+            "remaining_wpts":   remaining,
+            "oracle_T":         oracle_T,
+            "oracle_wpts":      oracle_wpts.to_dict(),
+            "oracle_cps":       oracle_cps.tolist(),
+            "oracle_knots":     oracle_knots.tolist(),
+        })
