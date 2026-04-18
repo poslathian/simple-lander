@@ -295,10 +295,12 @@ def run_viewer(
     play_accum  = 0.0        # accumulated time for frame advance
     speed_flash_until = 0.0  # pygame.time.get_ticks() ms deadline for speed highlight
 
-    user_wp:       Optional[tuple[float, float]] = None
-    prev_wp_name:  Optional[str] = None
-    corrected_path: Optional[list[tuple[float, float]]] = None
-    status_msg  = ""
+    user_wp:            Optional[tuple[float, float]] = None
+    prev_wp_name:       Optional[str] = None
+    corrected_path:     Optional[list[tuple[float, float]]] = None
+    corrected_result:   Optional[dict] = None   # full waypoint_replan result dict
+    frame_at_click:     int = 0
+    status_msg = ""
 
     running = True
     while running:
@@ -339,47 +341,47 @@ def run_viewer(
                     ep_idx = (ep_idx + 1) % n_total
                     ep, frames = load_and_render(ep_idx)
                     frame_idx = 0
-                    user_wp = prev_wp_name = corrected_path = None
+                    user_wp = prev_wp_name = corrected_path = corrected_result = None
                     status_msg = ""
 
                 elif event.key == pygame.K_n:
                     ep_idx = (ep_idx + 1) % n_total
                     ep, frames = load_and_render(ep_idx)
                     frame_idx = 0
-                    user_wp = prev_wp_name = corrected_path = None
+                    user_wp = prev_wp_name = corrected_path = corrected_result = None
                     status_msg = ""
 
                 elif event.key == pygame.K_r:
-                    user_wp = None
-                    prev_wp_name = None
-                    corrected_path = None
+                    user_wp = prev_wp_name = corrected_path = corrected_result = None
                     status_msg = "Waypoint cleared."
 
                 elif event.key == pygame.K_w:
                     if user_wp is None:
                         status_msg = "Place a waypoint first (left-click)."
                     else:
-                        corrected_path, status_msg = _try_resolve(
+                        corrected_path, corrected_result, status_msg = _try_resolve(
                             ep, user_wp, prev_wp_name
                         )
 
                 elif event.key == pygame.K_a:
-                    if corrected_path is None:
+                    if corrected_result is None:
                         status_msg = "Run re-solve first (W)."
                     else:
                         status_msg = _accept_correction(
-                            ep, user_wp, prev_wp_name, corrected_path, out_path
+                            ep, user_wp, prev_wp_name, frame_at_click,
+                            corrected_result, out_path,
                         )
                         ep_idx = (ep_idx + 1) % n_total
                         ep, frames = load_and_render(ep_idx)
                         frame_idx = 0
-                        user_wp = prev_wp_name = corrected_path = None
+                        user_wp = prev_wp_name = corrected_path = corrected_result = None
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 user_wp = to_world(mx, my)
                 prev_wp_name = last_passed_waypoint(ep, frame_idx)
-                corrected_path = None
+                frame_at_click = frame_idx
+                corrected_path = corrected_result = None
                 status_msg = (
                     f"Waypoint set. Prev: {prev_wp_name or 'none'}. Press W to re-solve."
                 )
@@ -410,21 +412,24 @@ def run_viewer(
 
 
 # ---------------------------------------------------------------------------
-# Re-solve stub (Component 2 — implemented separately)
+# Re-solve (Component 2)
 # ---------------------------------------------------------------------------
 
 def _try_resolve(
     ep: Episode,
     user_wp: tuple[float, float],
     prev_wp_name: Optional[str],
-) -> tuple[Optional[list[tuple[float, float]]], str]:
-    """Trigger waypoint_replan_pih_with_kto (requires Drake / pih_solver)."""
+) -> tuple[Optional[list[tuple[float, float]]], Optional[dict], str]:
+    """Run waypoint_replan_pih_with_kto (requires Drake).
+
+    Returns (corrected_path_for_display, full_result_dict, status_message).
+    """
     if prev_wp_name is None:
-        return None, "No previous waypoint — cannot re-solve."
+        return None, None, "No previous waypoint — cannot re-solve."
 
     prev_state = ep.waypoint_states.get(prev_wp_name)
     if prev_state is None:
-        return None, f"No recorded state for waypoint '{prev_wp_name}'."
+        return None, None, f"No recorded state for waypoint '{prev_wp_name}'."
 
     wp_order = ["mountain_out", "approach", "contact", "extraction", "mountain_ret", "landing"]
     try:
@@ -437,7 +442,7 @@ def _try_resolve(
         from pih_solver import waypoint_replan_pih_with_kto
         from kto_lander import LanderParams, compound_inertia_about_body_com
     except ImportError as exc:
-        return None, f"Drake not available: {exc}"
+        return None, None, f"Drake not available: {exc}"
 
     env = PackageInHoleEnv(config=ep.cfg, render_mode=None)
     env.reset(seed=ep.seed)
@@ -456,7 +461,7 @@ def _try_resolve(
     )
 
     if not result.get("feasible", False):
-        return None, "Re-solve infeasible — try a different waypoint."
+        return None, None, "Re-solve infeasible — try a different waypoint."
 
     plan   = result["plan"]
     plan_T = result["T"]
@@ -464,50 +469,55 @@ def _try_resolve(
         (float(plan(s * plan_T)[0]), float(plan(s * plan_T)[1]))
         for s in np.linspace(0.0, 1.0, 80)
     ]
-    return path, f"Re-solve OK (T={plan_T:.1f}s). Press A to accept or R to reject."
+    return path, result, f"Re-solve OK (T={plan_T:.1f}s). Press A to accept or R to reject."
 
 
 # ---------------------------------------------------------------------------
-# Accept stub (Component 3 + 4 — implemented separately)
+# Accept (Components 3 + 4)
 # ---------------------------------------------------------------------------
 
 def _accept_correction(
     ep: Episode,
     user_wp: tuple[float, float],
     prev_wp_name: Optional[str],
-    corrected_path: list[tuple[float, float]],
+    frame_at_click: int,
+    corrected_result: dict,
     out_path: Optional[str],
 ) -> str:
-    """Save user-correction record; replay_with_correction in Component 3."""
-    if out_path is None:
-        return "No --out path specified; correction not saved."
+    """Replay episode with corrected plan, then save the full record."""
+    from replay_pih import replay_with_correction
 
-    record = {
-        "seed":            ep.seed,
-        "cfg":             ep.raw["cfg"],
-        "correction_type": "user_waypoint",
-        "kto_plan":        ep.raw["kto_plan"],
-        "waypoint_states": ep.waypoint_states,
-        "replan_events":   ep.raw.get("replan_events", []),
-        "user_correction": {
-            "user_waypoint":          list(user_wp),
-            "previous_waypoint_name": prev_wp_name,
-            "corrected_path_xy":      corrected_path,
-        },
-        "states":         ep.raw["states"],
-        "actions":        ep.raw["actions"],
-        "timestamps":     ep.raw["timestamps"],
-        "termination_reason": ep.termination_reason,
-    }
+    corrected_wpts_dict = corrected_result["waypoints"].to_dict()
 
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "a") as f:
-        f.write(json.dumps(record) + "\n")
+    print(f"[viewer] replaying seed={ep.seed} with correction …")
+    record = replay_with_correction(
+        seed=ep.seed,
+        cfg=ep.cfg,
+        original_cps=ep.kto_cps,
+        original_knots=ep.kto_knots,
+        original_waypoints_dict=ep.kto_plan_dict,
+        corrected_cps=corrected_result["cps"],
+        corrected_knots=corrected_result["knots"],
+        corrected_waypoints_dict=corrected_wpts_dict,
+        previous_waypoint_name=prev_wp_name,
+        user_waypoint=user_wp,
+        frame_index=frame_at_click,
+        verbose=True,
+    )
 
-    print(f"[viewer] saved correction  seed={ep.seed}  prev={prev_wp_name}  "
-          f"wp={user_wp}  → {out_path}")
-    return f"Saved. Advancing to next episode."
+    reason = record["termination_reason"]
+    spliced = record["splice_happened"]
+
+    if out_path is not None:
+        out = Path(out_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        print(f"[viewer] saved  seed={ep.seed}  reason={reason}  → {out_path}")
+
+    outcome = "SUCCESS" if reason == "success" else reason
+    return (f"Replay: {outcome}{'  (splice happened)' if spliced else '  (no splice!)'}. "
+            f"Saved. Advancing.")
 
 
 # ---------------------------------------------------------------------------
