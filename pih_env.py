@@ -322,10 +322,13 @@ class PackageInHoleEnv(gym.Env):
         self.elapsed_s    = 0.0
         self._attached    = False
         self._termination_reason = TerminationReason.NONE
-        self._kto_path_xy  = None   # sampled path for trajectory overlay
-        self._waypoints    = None   # PIHWaypoints, injected by controller
-        self._ctrl_t       = 0.0    # controller wall-clock time, for target circle
-        self._plan_ref        = None   # Plan callable, injected by controller
+        self._kto_path_xy    = None   # sampled path for trajectory overlay
+        self._oracle_path_xy = None   # oracle-corrected path (set on replan)
+        self._waypoints      = None   # PIHWaypoints, injected by controller
+        self._ctrl_t         = 0.0    # elapsed time for original plan reference dot
+        self._plan_ref       = None   # original Plan callable, injected by controller
+        self._oracle_plan_ref = None  # oracle Plan callable, set on replan
+        self._oracle_ctrl_t  = 0.0   # elapsed time within oracle plan (resets on replan)
         self._show_raycasts   = False  # opt-in: visualise raycast beams
         self._font            = None   # lazy pygame font
         self._collision_side: float | None = None  # +1/-1 = which hole wall was hit
@@ -537,10 +540,13 @@ class PackageInHoleEnv(gym.Env):
         self.drawlist = [self.lander] + self.legs
         if self._package is not None:
             self.drawlist.append(self._package)
-        self._kto_path_xy = None
-        self._waypoints   = None
-        self._ctrl_t      = 0.0
-        self._plan_ref    = None
+        self._kto_path_xy     = None
+        self._oracle_path_xy  = None
+        self._waypoints       = None
+        self._ctrl_t          = 0.0
+        self._plan_ref        = None
+        self._oracle_plan_ref = None
+        self._oracle_ctrl_t   = 0.0
         # _show_raycasts and _font are not reset — caller sets once, font is cached
 
         if self.render_mode == "human":
@@ -765,10 +771,15 @@ class PackageInHoleEnv(gym.Env):
                 pygame.draw.polygon(surf, (204, 204, 0), tri)
                 gfxdraw.aapolygon(surf, tri, (204, 204, 0))
 
-        # ── KTO trajectory line ───────────────────────────────────────────
+        # ── KTO trajectory line (original plan, cyan) ────────────────────
         if self._kto_path_xy is not None and len(self._kto_path_xy) > 1:
             pts = [to_px(*p) for p in self._kto_path_xy]
             pygame.draw.aalines(surf, (0, 180, 180), False, pts)
+
+        # ── Oracle trajectory line (post-replan, orange) ─────────────────
+        if self._oracle_path_xy is not None and len(self._oracle_path_xy) > 1:
+            pts = [to_px(*p) for p in self._oracle_path_xy]
+            pygame.draw.aalines(surf, (255, 140, 0), False, pts)
 
         # ── Waypoint circles + labels ─────────────────────────────────────
         if self._waypoints is not None:
@@ -782,11 +793,17 @@ class PackageInHoleEnv(gym.Env):
                 )
                 surf.blit(label, (sx + 8, sy - 6))
 
-        # ── Current reference target (blue circle) ────────────────────────
+        # ── Original plan reference dot (cyan — "where KTO thought") ────────
         if self._plan_ref is not None:
             ref = self._plan_ref(self._ctrl_t)
             sx, sy = to_px(float(ref[0]), float(ref[1]))
-            pygame.draw.circle(surf, (60, 160, 255), (sx, sy), 5)
+            pygame.draw.circle(surf, (0, 200, 200), (sx, sy), 5)
+
+        # ── Oracle plan reference dot (green — "where oracle expects") ───────
+        if self._oracle_plan_ref is not None:
+            ref = self._oracle_plan_ref(self._oracle_ctrl_t)
+            sx, sy = to_px(float(ref[0]), float(ref[1]))
+            pygame.draw.circle(surf, (0, 220, 80), (sx, sy), 5)
 
         # ── Drawlist: lander, legs, package body (while not attached) ─────
         for obj in self.drawlist:

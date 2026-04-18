@@ -510,6 +510,8 @@ class PackageInHoleKTOController:
             uw._plan_ref  = self.plan
 
         uw._ctrl_t = self.t
+        if uw._oracle_plan_ref is not None:
+            uw._oracle_ctrl_t = self._active_plan_t
 
         lander = uw.lander
         pos    = lander.position
@@ -538,12 +540,12 @@ class PackageInHoleKTOController:
         # lander trajectory after the contact bounce.
         if self._contact_replan_pending and state[3] > 0.0:
             self._contact_replan_pending = False
-            self._fire_replan(state, trigger="on_contact")
+            self._fire_replan(state, trigger="on_contact", uw=uw)
 
         # ── Periodic replan ────────────────────────────────────────────
         if ("periodic" in self.replan_triggers
                 and self.t - self._last_replan_t >= self.replan_interval_s):
-            self._fire_replan(state, trigger="periodic")
+            self._fire_replan(state, trigger="periodic", uw=uw)
 
         # ── Advance waypoint index by spatial proximity ────────────────
         self._advance_wp_idx(state)
@@ -576,7 +578,7 @@ class PackageInHoleKTOController:
             else:
                 break
 
-    def _fire_replan(self, state: np.ndarray, trigger: str) -> None:
+    def _fire_replan(self, state: np.ndarray, trigger: str, uw=None) -> None:
         """Run oracle KTO + C2 weld and switch to the welded plan."""
         self._last_replan_t = self.t
 
@@ -618,6 +620,15 @@ class PackageInHoleKTOController:
         self._active_plan_t = 0.0
         landing_ref = oracle_plan(oracle_plan.T)
         self._hover_plan = _HoverPlan(float(landing_ref[0]), float(landing_ref[1]))
+
+        # Inject oracle arc + reference into renderer
+        if uw is not None:
+            uw._oracle_path_xy = [
+                (float(oracle_plan(s * oracle_T)[0]), float(oracle_plan(s * oracle_T)[1]))
+                for s in np.linspace(0.0, 1.0, 80)
+            ]
+            uw._oracle_plan_ref = oracle_plan
+            uw._oracle_ctrl_t   = 0.0
 
         # Update tracked waypoints to oracle's waypoints
         new_tracked = _waypoints_from_pih(oracle_wpts)
