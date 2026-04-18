@@ -75,12 +75,16 @@ def main():
         done = term or trunc
         step_i += 1
 
+    reason = info.get("termination_reason", TerminationReason.NONE)
+
+    # Hold the final frame; longer pause for collision events so the marker is visible.
+    hold = 50 if reason == TerminationReason.EXTRACTION_COLLISION else 5
     frame = env.render()
     if frame is not None:
-        plt.imsave(out_dir / f"frame_{step_i:05d}_final.png", frame)
-        n_saved += 1
+        for h in range(hold):
+            plt.imsave(out_dir / f"frame_{step_i + h:05d}.png", frame)
+            n_saved += 1
 
-    reason = info.get("termination_reason", TerminationReason.NONE)
     print(f"[render] done  steps={step_i}  reason={reason.value}  saved={n_saved} frames")
     env.close()
 

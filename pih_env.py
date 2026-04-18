@@ -226,6 +226,33 @@ class _RayCastCallback(Box2D.b2RayCastCallback):
 
 
 # ---------------------------------------------------------------------------
+# Terrain geometry helper
+# ---------------------------------------------------------------------------
+
+def _terrain_y_at(x: float, cfg: PIHConfig) -> float:
+    """Return terrain surface y-coordinate at world x.
+
+    Matches the edge geometry built in _build_terrain().  Used by the renderer
+    to compute package-ground penetration depth.
+    """
+    hhw = cfg.hole_half_width
+    hd  = cfg.hole_depth
+    if x <= PIH_START_X + 1.5:
+        return PIH_PAD_Y
+    if x <= PIH_MOUNTAIN_X:
+        t = (x - (PIH_START_X + 1.5)) / (PIH_MOUNTAIN_X - (PIH_START_X + 1.5))
+        return PIH_PAD_Y + t * PIH_MOUNTAIN_H
+    if x <= PIH_PICKUP_X - 1.5:
+        t = (x - PIH_MOUNTAIN_X) / (PIH_PICKUP_X - 1.5 - PIH_MOUNTAIN_X)
+        return PIH_PAD_Y + PIH_MOUNTAIN_H * (1.0 - t)
+    if x <= PIH_PICKUP_X - hhw:
+        return PIH_PAD_Y
+    if x <= PIH_PICKUP_X + hhw:
+        return PIH_PAD_Y - hd   # hole floor
+    return PIH_PAD_Y
+
+
+# ---------------------------------------------------------------------------
 # PackageInHoleEnv
 # ---------------------------------------------------------------------------
 class PackageInHoleEnv(gym.Env):
@@ -290,9 +317,10 @@ class PackageInHoleEnv(gym.Env):
         self._kto_path_xy  = None   # sampled path for trajectory overlay
         self._waypoints    = None   # PIHWaypoints, injected by controller
         self._ctrl_t       = 0.0    # controller wall-clock time, for target circle
-        self._plan_ref     = None   # Plan callable, injected by controller
-        self._show_raycasts = False  # opt-in: visualise raycast beams
-        self._font         = None   # lazy pygame font
+        self._plan_ref        = None   # Plan callable, injected by controller
+        self._show_raycasts   = False  # opt-in: visualise raycast beams
+        self._font            = None   # lazy pygame font
+        self._collision_point: tuple[float, float] | None = None  # extraction collision world pos
 
     # ── World construction ───────────────────────────────────────────────
 
@@ -470,6 +498,7 @@ class PackageInHoleEnv(gym.Env):
         self.elapsed_s           = 0.0
         self._attached           = False
         self._termination_reason = TerminationReason.NONE
+        self._collision_point    = None
 
         self._build_terrain()
         self._build_package()
@@ -594,6 +623,10 @@ class PackageInHoleEnv(gym.Env):
             pkg_in_hole = pkg_bottom < PIH_PAD_Y
             lateral_dev = abs(pos.x - PIH_PICKUP_X)
             if pkg_in_hole and lateral_dev > cfg.package_gap + 0.02:
+                sign   = 1.0 if pos.x > PIH_PICKUP_X else -1.0
+                wall_x = PIH_PICKUP_X + sign * cfg.hole_half_width
+                pkg_top_in_hole = min(PIH_PAD_Y, float(pos.y) - PIH_LEG_OFFSET)
+                self._collision_point = (wall_x, (float(pkg_bottom) + pkg_top_in_hole) / 2.0)
                 self._termination_reason = TerminationReason.EXTRACTION_COLLISION
                 info = {"termination_reason": self._termination_reason}
                 return self._build_obs(), -(PIH_TIMEOUT - self.elapsed_s) - DT, True, False, info
@@ -771,6 +804,24 @@ class PackageInHoleEnv(gym.Env):
             ]
             pygame.draw.polygon(surf, (200, 150, 80), corners)
             gfxdraw.aapolygon(surf, corners, (160, 100, 40))
+
+            # ── Package-ground penetration highlight ──────────────────────
+            pkg_bottom = float(pos.y) - PIH_LEG_OFFSET - cfg.package_height_true
+            terrain_y  = _terrain_y_at(pcx, cfg)
+            if pkg_bottom < terrain_y:
+                sliver = [
+                    to_px(pcx - phw, pkg_bottom),
+                    to_px(pcx + phw, pkg_bottom),
+                    to_px(pcx + phw, terrain_y),
+                    to_px(pcx - phw, terrain_y),
+                ]
+                pygame.draw.polygon(surf, (220, 50, 50), sliver)
+
+        # ── Extraction collision marker ───────────────────────────────────
+        if self._collision_point is not None:
+            sx, sy = to_px(*self._collision_point)
+            pygame.draw.circle(surf, (255, 50, 50), (sx, sy), 10)
+            pygame.draw.circle(surf, (255, 200, 200), (sx, sy), 5)
 
         # ── Raycasts (opt-in: set env._show_raycasts = True) ─────────────
         if self._show_raycasts and self.lander is not None:
