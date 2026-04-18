@@ -87,7 +87,7 @@ def plan_pih_with_kto(
     # so raise mountain_ret by package_height_assumed to keep it clear of the peak.
     mountain_y_ret  = mountain_y_out + cfg.package_height_assumed
     approach_y      = cfg.assumed_contact_lander_y + 2.5               # ~7.6 m (pickup)
-    landing_y = PIH_PAD_Y + PIH_LEG_OFFSET - 0.15                       # ~4.45 m
+    landing_y = PIH_PAD_Y + cfg.package_height_assumed + PIH_LEG_OFFSET
 
     # approach_land has no prescribed position — its actual position is read back
     # from the spline after solving and stored in the waypoints for rendering.

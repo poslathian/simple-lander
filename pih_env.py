@@ -601,7 +601,7 @@ class PackageInHoleEnv(gym.Env):
         obs = self._build_obs()
 
         # ── Termination ───────────────────────────────────────────────────
-        near_ground = pos.y < PIH_PAD_Y + PIH_LEG_OFFSET + 0.05
+        near_ground = pos.y < PIH_PAD_Y + cfg.package_height_true + PIH_LEG_OFFSET + 0.05
         speed  = math.sqrt(vel.x ** 2 + vel.y ** 2)
         at_start = abs(pos.x - PIH_START_X) < 3.0
         landed = (
