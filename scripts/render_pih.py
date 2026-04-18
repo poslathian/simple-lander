@@ -39,13 +39,12 @@ def main():
         package_height_assumed=0.5,
         package_mass_true=2.0,
         package_mass_assumed=2.0,
+        start_at_pad=True,
     )
 
     env = PackageInHoleEnv(config=cfg, render_mode="rgb_array")
     env.reset(seed=args.seed)
     uw = env.unwrapped
-    uw.lander.linearVelocity  = (0.0, 0.0)
-    uw.lander.angularVelocity = 0.0
     if args.raycasts:
         uw._show_raycasts = True
 

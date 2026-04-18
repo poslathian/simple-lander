@@ -27,13 +27,12 @@ cfg = PIHConfig(
     package_height_assumed=0.5,
     package_mass_true=2.0,
     package_mass_assumed=2.0,
+    start_at_pad=True,
 )
 
 env = PackageInHoleEnv(config=cfg, render_mode=None)
 env.reset(seed=SEED)
 uw = env.unwrapped
-uw.lander.linearVelocity  = (0.0, 0.0)
-uw.lander.angularVelocity = 0.0
 
 x0 = float(uw.lander.position.x)
 y0 = float(uw.lander.position.y)

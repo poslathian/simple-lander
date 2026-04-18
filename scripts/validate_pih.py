@@ -57,10 +57,6 @@ def run_pih_episode(cfg: PIHConfig, seed: int, verbose: bool = False) -> dict:
     obs, _ = env.reset(seed=seed)
     uw = env.unwrapped
 
-    # Zero initial random velocity for clean planning
-    uw.lander.linearVelocity  = (0.0, 0.0)
-    uw.lander.angularVelocity = 0.0
-
     x0 = float(uw.lander.position.x)
     y0 = float(uw.lander.position.y)
 
@@ -230,6 +226,7 @@ def check_parameter_sweep(
         cfg = PIHConfig(
             hole_depth=1.0, package_height_true=pkg_h_true,
             package_height_assumed=0.5, package_mass_true=2.0, package_mass_assumed=2.0,
+            start_at_pad=True,
         )
         outfile = RESULTS_DIR / f"sweep_h{pkg_h_true:.2f}.jsonl"
         n_collision = n_feasible = 0
@@ -288,18 +285,18 @@ def check_failure_isolation(
         # True protrusion=1.0, assumed=0.5 → KTO underestimates → EXTRACTION_COLLISION
         "depth_wrong_mass_ok": PIHConfig(
             hole_depth=1.0, package_height_true=2.0, package_height_assumed=0.5,
-            package_mass_true=2.0, package_mass_assumed=2.0,
+            package_mass_true=2.0, package_mass_assumed=2.0, start_at_pad=True,
         ),
         # True protrusion=0.5=assumed (correct height). Mass very wrong.
         # Expect: dynamics mismatch (flyaway or timeout), no extraction collision.
         "depth_ok_mass_wrong": PIHConfig(
             hole_depth=1.0, package_height_true=1.5, package_height_assumed=0.5,
-            package_mass_true=1.0, package_mass_assumed=4.0,
+            package_mass_true=1.0, package_mass_assumed=4.0, start_at_pad=True,
         ),
         # Both wrong: height underestimate + mass wrong
         "both_wrong": PIHConfig(
             hole_depth=1.0, package_height_true=2.0, package_height_assumed=0.5,
-            package_mass_true=1.0, package_mass_assumed=4.0,
+            package_mass_true=1.0, package_mass_assumed=4.0, start_at_pad=True,
         ),
     }
 
@@ -352,7 +349,7 @@ def check_hover_fallback(n_seeds: int = 3, seed_offset: int = 72000) -> tuple[bo
     # Tall package + extreme assumed protrusion → contact waypoint below pad surface
     cfg = PIHConfig(
         hole_depth=1.0, package_height_true=3.0, package_height_assumed=0.05,
-        package_mass_true=2.0, package_mass_assumed=3.0,
+        package_mass_true=2.0, package_mass_assumed=3.0, start_at_pad=True,
     )
     outfile = RESULTS_DIR / "fallback_test.jsonl"
     n_infeasible = 0

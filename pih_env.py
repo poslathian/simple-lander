@@ -117,6 +117,7 @@ class PIHConfig:
     package_gap:            float = 0.05  # clearance between package and hole wall, metres
     n_raycast_rays:         int   = 8
     use_raycast_obs:        bool  = True
+    start_at_pad:           bool  = False  # spawn at left pad instead of high altitude
 
     # ── True geometry — used by the environment ──────────────────────────
 
@@ -473,17 +474,24 @@ class PackageInHoleEnv(gym.Env):
         self._build_terrain()
         self._build_package()
 
-        ix = float(self.np_random.uniform(PIH_START_X - 1.0, PIH_START_X + 1.0))
-        iy = float(np.clip(
-            WORLD_H * 0.85 + self.np_random.normal(0, 0.3),
-            WORLD_H * 0.60, WORLD_H - 0.5,
-        ))
-        self._build_lander(ix, iy)
-        self.lander.linearVelocity = (
-            float(self.np_random.normal(0, 0.3)),
-            float(self.np_random.normal(0, 0.3)),
-        )
-        self.lander.angularVelocity = float(self.np_random.normal(0, 0.05))
+        if self.cfg.start_at_pad:
+            ix = float(self.np_random.uniform(PIH_START_X - 0.5, PIH_START_X + 0.5))
+            iy = float(PIH_PAD_Y + PIH_LEG_OFFSET + self.np_random.uniform(0.1, 0.3))
+            self._build_lander(ix, iy)
+            self.lander.linearVelocity = (0.0, 0.0)
+            self.lander.angularVelocity = 0.0
+        else:
+            ix = float(self.np_random.uniform(PIH_START_X - 1.0, PIH_START_X + 1.0))
+            iy = float(np.clip(
+                WORLD_H * 0.85 + self.np_random.normal(0, 0.3),
+                WORLD_H * 0.60, WORLD_H - 0.5,
+            ))
+            self._build_lander(ix, iy)
+            self.lander.linearVelocity = (
+                float(self.np_random.normal(0, 0.3)),
+                float(self.np_random.normal(0, 0.3)),
+            )
+            self.lander.angularVelocity = float(self.np_random.normal(0, 0.05))
 
         cl = _ContactListener(self)
         self.world.contactListener_keepref = cl
