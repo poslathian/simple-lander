@@ -618,7 +618,11 @@ class PackageInHoleEnv(gym.Env):
         # Gate on extraction_lander_y (a plan event) not contact_lander_y.
         # Below extraction_lander_y the plan is still in its ascent phase;
         # any lateral drift there is tracking error, not a real wall strike.
-        if self._attached and pos.y >= cfg.extraction_lander_y:
+        # Gate on x proximity to the hole: package-below-terrain elsewhere
+        # (e.g. on the landing approach) is a landing geometry issue, not an
+        # extraction failure — without this gate those episodes are mislabeled.
+        if self._attached and pos.y >= cfg.extraction_lander_y \
+                and abs(pos.x - PIH_PICKUP_X) < cfg.hole_width:
             pkg_bottom = pos.y - PIH_LEG_OFFSET - cfg.package_height_true
             pkg_in_hole = pkg_bottom < PIH_PAD_Y
             lateral_dev = abs(pos.x - PIH_PICKUP_X)
