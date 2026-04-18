@@ -70,7 +70,7 @@ class DPConfig:
     hidden_dim: int = 256
     num_layers: int = 4
     dropout: float = 0.1
-    advantage_dropout: float = 0.2
+    advantage_dropout: float = 0.1
     n_diffusion_steps: int = 100
     n_ddim_steps: int = 10
     beta_start: float = 1e-4
@@ -553,10 +553,12 @@ class DPTrainConfig:
     epochs: int = 100
     steps_per_epoch: int = 200
     max_grad_norm: float = 1.0
-    advantage_dropout: float = 0.2
+    advantage_dropout: float = 0.1
     # Phase 3
     episodes_per_iteration: int = 500
     n_iterations: int = 20
+    # Critic
+    critic_tau: float = 0.005  # EMA rate for target network soft update
     # HER
     her_relabel_prob: float = 0.5
     # Evaluation
@@ -590,6 +592,19 @@ class DPTrainer:
         self.norm = norm
         self.config = config or DPTrainConfig()
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.config.lr)
+
+        # Target network for critic stability (EMA of critic weights)
+        import copy
+        self.critic_target = copy.deepcopy(critic)
+        self.critic_target.eval()
+        for p in self.critic_target.parameters():
+            p.requires_grad_(False)
+
+    def _soft_update_critic_target(self):
+        """Polyak averaging: target = tau * critic + (1-tau) * target."""
+        tau = self.config.critic_tau
+        for p, pt in zip(self.critic.parameters(), self.critic_target.parameters()):
+            pt.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
 
     def train_phase2(self) -> DPTrainResult:
         cfg = self.config
@@ -657,12 +672,19 @@ class DPTrainer:
 
         actions_norm = self.norm.normalize(actions)
 
-        # Compute binarized advantages
-        self.critic.eval()
-        with torch.no_grad():
-            v = self.critic.forward_v(states).squeeze(-1)
-            q = self.critic.forward_q(states, actions).squeeze(-1)
-            advantages = torch.sign(q - v)
+        # Binarized advantage: did this plan beat the critic's prediction?
+        # advantage = sign(MC_return - V(s))
+        # Positive = plan did better than expected, negative = worse.
+        if "mc_return" in batch:
+            mc = batch["mc_return"][has_action]
+            self.critic.eval()
+            with torch.no_grad():
+                v = self.critic.forward_v(states).squeeze(-1)
+            advantages = torch.sign(mc - v)
+        elif "episode_advantage" in batch:
+            advantages = torch.sign(batch["episode_advantage"][has_action])
+        else:
+            advantages = torch.zeros(bs)
 
         # Advantage dropout
         adv_mask = torch.rand(bs) < cfg.advantage_dropout
@@ -703,11 +725,16 @@ class DPTrainer:
 
         actions_norm = self.norm.normalize(actions)
 
-        self.critic.eval()
-        with torch.no_grad():
-            v = self.critic.forward_v(states).squeeze(-1)
-            q = self.critic.forward_q(states, actions).squeeze(-1)
-            advantages = torch.sign(q - v)
+        if "mc_return" in batch:
+            mc = batch["mc_return"][has_action]
+            self.critic.eval()
+            with torch.no_grad():
+                v = self.critic.forward_v(states).squeeze(-1)
+            advantages = torch.sign(mc - v)
+        elif "episode_advantage" in batch:
+            advantages = torch.sign(batch["episode_advantage"][has_action])
+        else:
+            advantages = torch.zeros(bs)
 
         cond = torch.cat([states, advantages.unsqueeze(-1)], dim=-1)
 
@@ -729,27 +756,59 @@ class DPTrainer:
         best_epoch = 0
         total_epoch = 0
 
+        # Evaluate baseline before any phase 3 changes
+        baseline = self._evaluate_holdout()
+        best_landing = baseline["landing_rate"]
+        print(f"[phase3] baseline: landing_rate={best_landing:.1%}, "
+              f"mean_adv={baseline['mean_advantage']:.3f}")
+        self.save_checkpoint(cfg.checkpoint_dir / "best.pt")
+
         print(f"[phase3] starting online improvement, {cfg.n_iterations} iterations")
+        _last_print = time.perf_counter()
+
+        def _status(msg: str) -> None:
+            nonlocal _last_print
+            _last_print = time.perf_counter()
+            print(msg, flush=True)
+
+        def _maybe_tick(phase: str, detail: str) -> None:
+            nonlocal _last_print
+            now = time.perf_counter()
+            if now - _last_print >= 60.0:
+                _last_print = now
+                print(f"  [{phase}] {detail}", flush=True)
 
         for iteration in range(cfg.n_iterations):
-            print(f"\n--- iteration {iteration+1}/{cfg.n_iterations} ---")
+            iter_start = time.perf_counter()
+            _status(f"\n--- iteration {iteration+1}/{cfg.n_iterations} ---")
 
             # 1. Collect DP episodes
             stats = self._collect_dp_episodes(
                 cfg.episodes_per_iteration, iteration
             )
-            print(f"  collected {cfg.episodes_per_iteration} eps: "
-                  f"landed={stats['landed']}, failed={stats['failed']}")
+            collect_rate = stats["landed"] / max(stats["landed"] + stats["failed"], 1)
+            _status(f"  collected {cfg.episodes_per_iteration} eps: "
+                    f"landed={stats['landed']}, failed={stats['failed']} "
+                    f"({100*collect_rate:.0f}%)")
 
-            # 2. Update critic
-            print("  updating critic...")
-            critic_cfg = CriticTrainConfig(epochs=50, steps_per_epoch=100)
+            # 2. Update critic on all data
+            _status("  updating critic...")
+            critic_cfg = CriticTrainConfig(epochs=30, steps_per_epoch=100)
             critic_trainer = CriticTrainer(self.critic, self.db, critic_cfg)
             critic_trainer.train()
+            # Soft-update target network
+            self._soft_update_critic_target()
+            _status("  critic updated (target network EMA applied)")
 
-            # 3. Update DP with structured sampling
-            print("  updating policy...")
-            for epoch in range(50):
+            # Validate critic against ground truth
+            self._evaluate_critic(n_seeds=20)
+
+            # 3. Update DP — very conservative: 3 epochs, 1/10th LR
+            _status("  updating policy (3 epochs, lr=3e-5)...")
+            # Temporarily lower LR for fine-tuning
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = cfg.lr * 0.1
+            for epoch in range(3):
                 epoch_loss = 0.0
                 for step in range(cfg.steps_per_epoch):
                     batch = self.db.sample_structured_batch(
@@ -758,11 +817,17 @@ class DPTrainer:
                     )
                     loss = self._train_step_phase3(batch, cfg_dp, iteration)
                     epoch_loss += loss
+                    _maybe_tick("policy", f"epoch {epoch+1}/20 step {step+1}/{cfg.steps_per_epoch}")
                 avg_loss = epoch_loss / cfg.steps_per_epoch
                 loss_hist.append(avg_loss)
                 total_epoch += 1
+            # Restore LR
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = cfg.lr
+            _status(f"  policy updated (loss={avg_loss:.6f})")
 
             # 4. Evaluate
+            _status("  evaluating holdout...")
             metrics = self._evaluate_holdout()
             print(f"  holdout: landing_rate={metrics['landing_rate']:.1%}, "
                   f"mean_adv={metrics['mean_advantage']:.3f}, "
@@ -772,6 +837,11 @@ class DPTrainer:
                 best_landing = metrics["landing_rate"]
                 best_epoch = total_epoch
                 self.save_checkpoint(cfg.checkpoint_dir / "best.pt")
+                print(f"  new best! saved checkpoint")
+            else:
+                # Revert to best checkpoint to prevent catastrophic forgetting
+                print(f"  no improvement (best={best_landing:.1%}), reverting to best checkpoint")
+                self.load_checkpoint(cfg.checkpoint_dir / "best.pt")
 
             # Early stopping
             if metrics["landing_rate"] > 0.95 and metrics["mean_advantage"] > 0:
@@ -850,6 +920,7 @@ class DPTrainer:
         landed = 0
         failed = 0
 
+        t_start = time.perf_counter()
         for ep in range(n_episodes):
             seed = 10_000 + iteration * n_episodes + ep
             env = gym.make("LunarLander-v3", continuous=True, render_mode=None)
@@ -969,8 +1040,11 @@ class DPTrainer:
             env.close()
 
             ep_outcome = Outcome.LANDED if episode_landed else Outcome.FAILED
+            # Only store initial transition for DP episodes (we only train on step_idx=0)
+            # This saves ~200x DB capacity vs storing every frame
+            initial_only = [transitions[0]] if transitions else transitions
             self.db.append_episode_with_meta(
-                transitions,
+                initial_only,
                 advantage=advantage,
                 outcome=ep_outcome,
                 max_tracking_error=max_tracking_error,
@@ -983,8 +1057,13 @@ class DPTrainer:
             else:
                 failed += 1
 
-            if (ep + 1) % 50 == 0:
-                print(f"    collected {ep+1}/{n_episodes} (landed={landed}, failed={failed})")
+            elapsed = time.perf_counter() - t_start
+            if (ep + 1) % 25 == 0 or elapsed - getattr(self, '_last_collect_print', 0) >= 60:
+                self._last_collect_print = elapsed
+                rate = (ep + 1) / max(elapsed, 0.1)
+                eta = (n_episodes - ep - 1) / rate
+                print(f"    collected {ep+1}/{n_episodes} (landed={landed}, failed={failed}) "
+                      f"[{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]", flush=True)
 
         return {"landed": landed, "failed": failed}
 
@@ -1018,6 +1097,133 @@ class DPTrainer:
             "mean_return": total_return / n,
             "mean_advantage": total_advantage / n,
             "planning_latency_ms": total_latency / n,
+        }
+
+    def _evaluate_critic(self, n_seeds: int = 30) -> dict[str, float]:
+        """Check critic V(s) predictions against actual MC episode returns."""
+        import gymnasium as gym
+
+        seeds = self.config.holdout_seeds[:n_seeds]
+        v_preds = []
+        actual_returns = []
+
+        self.critic.eval()
+        for seed in seeds:
+            env = gym.make("LunarLander-v3", continuous=True, render_mode=None)
+            env.reset(seed=seed)
+            try:
+                obs_raw, state0, params = warmup_and_snapshot(env, n_steps=5)
+            except RuntimeError:
+                env.close()
+                continue
+
+            cs = CriticState(obs_t=obs_raw.copy(), obs_prev=obs_raw.copy(), t_remaining=10.0)
+            with torch.no_grad():
+                v = self.critic.forward_v(cs.to_tensor().unsqueeze(0)).item()
+            v_preds.append(v)
+
+            # Roll out with DP to get actual return
+            condition = DPCondition.from_critic_state(cs, advantage=1.0)
+            plan_enc = self.policy.generate_plan(condition, self.norm)
+            try:
+                plan = encoding_to_plan(plan_enc)
+            except Exception:
+                env.close()
+                actual_returns.append(-20.0)  # worst case
+                continue
+
+            plan_T = plan.T
+            total_duration = max(3.0, plan_T + 1.0)
+            n_steps = int(round(total_duration / DT))
+            gains = TrackerGains()
+            t = 0.0
+            obs_cur = obs_raw
+            episode_landed = False
+            estop = False
+            window_steps = max(1, int(round(0.1 / DT)))
+            err_hist: list[float] = []
+
+            for k in range(n_steps):
+                obs_state = obs_to_state(obs_cur)
+                action_ctrl, _ = control(obs_state, t, plan, params, gains)
+                obs_next, _, terminated, truncated, _ = env.step(action_ctrl)
+                t += DT
+                r = plan(t)
+                ns = obs_to_state(obs_next)
+                e_norm = math.sqrt((ns[0]-r[0])**2 + (ns[1]-r[1])**2 + (2*(ns[4]-r[4]))**2)
+                err_hist.append(e_norm)
+                if len(err_hist) > window_steps:
+                    err_hist.pop(0)
+                if e_norm > 2.0 or (len(err_hist) == window_steps and all(e > 1.0 for e in err_hist)):
+                    estop = True
+                if obs_next[6] > 0.5 and obs_next[7] > 0.5:
+                    episode_landed = True
+                if terminated or truncated or estop or episode_landed:
+                    break
+                obs_cur = obs_next
+
+            env.close()
+            if episode_landed:
+                actual_returns.append(-t)
+            else:
+                actual_returns.append(-t - 10.0)
+
+        v_preds = np.array(v_preds)
+        actual_returns = np.array(actual_returns)
+        n = len(v_preds)
+        if n < 2:
+            print("  critic eval: insufficient data", flush=True)
+            return {"corr": 0.0, "mae": 0.0}
+
+        corr = float(np.corrcoef(v_preds, actual_returns)[0, 1])
+        mae = float(np.mean(np.abs(v_preds - actual_returns)))
+        bias = float(np.mean(v_preds - actual_returns))
+
+        print(f"  critic eval ({n} seeds): corr={corr:.3f} MAE={mae:.2f} bias={bias:+.2f}", flush=True)
+        print(f"    V_pred:  mean={v_preds.mean():.2f} std={v_preds.std():.2f}", flush=True)
+        print(f"    actual:  mean={actual_returns.mean():.2f} std={actual_returns.std():.2f}", flush=True)
+        return {"corr": corr, "mae": mae, "bias": bias}
+
+    def _evaluate_advantage_conditioning(self, n_seeds: int = 20) -> dict[str, float]:
+        """Run same seeds with advantage=-1 and +1, check for effect."""
+        seeds = self.config.holdout_seeds[:n_seeds]
+        results = {-1.0: [], 1.0: []}
+
+        for adv_cond in [-1.0, 1.0]:
+            for seed in seeds:
+                r = run_dp_episode(
+                    self.policy, self.critic, self.norm,
+                    render=False, seed=seed, verbose=False,
+                    advantage_cond=adv_cond,
+                )
+                if not r.get("planning_failed"):
+                    ret = -r["t_elapsed"] if r["landed"] else -(r["t_elapsed"] + 10.0)
+                    results[adv_cond].append({
+                        "landed": r["landed"],
+                        "return": ret,
+                        "advantage": r.get("advantage", 0.0),
+                    })
+
+        pos = results[1.0]
+        neg = results[-1.0]
+        pos_land = sum(1 for r in pos if r["landed"]) / max(len(pos), 1)
+        neg_land = sum(1 for r in neg if r["landed"]) / max(len(neg), 1)
+        pos_ret = np.mean([r["return"] for r in pos]) if pos else 0.0
+        neg_ret = np.mean([r["return"] for r in neg]) if neg else 0.0
+        pos_adv = np.mean([r["advantage"] for r in pos]) if pos else 0.0
+        neg_adv = np.mean([r["advantage"] for r in neg]) if neg else 0.0
+
+        print(f"  advantage conditioning test ({len(seeds)} seeds):", flush=True)
+        print(f"    adv=+1: land={100*pos_land:.0f}% ret={pos_ret:.2f} critic_adv={pos_adv:.3f}", flush=True)
+        print(f"    adv=-1: land={100*neg_land:.0f}% ret={neg_ret:.2f} critic_adv={neg_adv:.3f}", flush=True)
+        delta = pos_ret - neg_ret
+        print(f"    delta(+1 minus -1): return={delta:+.2f} land={100*(pos_land-neg_land):+.0f}pp", flush=True)
+
+        return {
+            "pos_landing": pos_land, "neg_landing": neg_land,
+            "pos_return": pos_ret, "neg_return": neg_ret,
+            "pos_advantage": pos_adv, "neg_advantage": neg_adv,
+            "delta_return": delta,
         }
 
     def save_checkpoint(self, path: Path) -> None:
@@ -1260,6 +1466,20 @@ def main():
     p_run.add_argument("--seed", type=int, default=None)
     p_run.add_argument("--advantage", type=float, default=1.0)
 
+    # adv-test
+    # critic-eval
+    p_crit = sub.add_parser("critic-eval", help="Evaluate critic V(s) vs actual returns")
+    p_crit.add_argument("--dp-ckpt", type=str, default="dp_checkpoints/best.pt")
+    p_crit.add_argument("--critic-ckpt", type=str, default="checkpoints/best.pt")
+    p_crit.add_argument("--norm", type=str, default="dp_checkpoints/norm.npz")
+    p_crit.add_argument("--seeds", type=int, default=50)
+
+    p_adv = sub.add_parser("adv-test", help="Test advantage conditioning effect")
+    p_adv.add_argument("--dp-ckpt", type=str, default="dp_checkpoints/best.pt")
+    p_adv.add_argument("--critic-ckpt", type=str, default="checkpoints/best.pt")
+    p_adv.add_argument("--norm", type=str, default="dp_checkpoints/norm.npz")
+    p_adv.add_argument("--seeds", type=int, default=20)
+
     # compare
     p_cmp = sub.add_parser("compare", help="Compare KTO vs DP on same seeds")
     p_cmp.add_argument("--dp-ckpt", type=str, default="dp_checkpoints/best.pt")
@@ -1371,6 +1591,26 @@ def main():
         print(f"  Mean return:     {mean_return:.2f}")
         print(f"  Mean advantage:  {mean_adv:.3f}")
         print(f"  Planning time:   {mean_latency:.1f} ms")
+
+    elif args.cmd == "critic-eval":
+        critic = _load_critic(args.critic_ckpt)
+        policy = _load_dp(args.dp_ckpt)
+        norm = PlanNormalization.load(Path(args.norm))
+
+        db = DPRolloutDB(Path("dp_rollout_db"), readonly=True) if Path("dp_rollout_db/meta.json").exists() else None
+        train_cfg = DPTrainConfig(holdout_seeds=list(range(5000, 5000 + args.seeds)))
+        trainer = DPTrainer(policy, critic, db, norm, train_cfg)
+        trainer._evaluate_critic(n_seeds=args.seeds)
+
+    elif args.cmd == "adv-test":
+        critic = _load_critic(args.critic_ckpt)
+        policy = _load_dp(args.dp_ckpt)
+        norm = PlanNormalization.load(Path(args.norm))
+
+        db = DPRolloutDB(Path("dp_rollout_db"), readonly=True) if Path("dp_rollout_db/meta.json").exists() else None
+        train_cfg = DPTrainConfig(holdout_seeds=list(range(5000, 5000 + args.seeds)))
+        trainer = DPTrainer(policy, critic, db, norm, train_cfg)
+        trainer._evaluate_advantage_conditioning(n_seeds=args.seeds)
 
     elif args.cmd == "run":
         critic = _load_critic(args.critic_ckpt)
