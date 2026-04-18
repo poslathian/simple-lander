@@ -700,26 +700,38 @@ class DPTrainer:
                     f"landed={stats['landed']}, failed={stats['failed']} "
                     f"({100*collect_rate:.0f}%)")
 
-            # 2. Update critic on all data
-            _status("  updating critic...")
-            critic_cfg = CriticTrainConfig(epochs=30, steps_per_epoch=100)
+            # 2. Update critic — check if full retrain needed
+            critic_metrics = self._evaluate_critic(n_seeds=20)
+            critic_ok = (critic_metrics.get("corr", 0) > 0.3 and
+                         critic_metrics.get("mae", 99) < 2.0)
+            if not critic_ok:
+                _status("  critic drifted — full retrain on all data...")
+                critic_cfg = CriticTrainConfig(epochs=100, steps_per_epoch=8)
+            else:
+                _status("  updating critic (incremental)...")
+                critic_cfg = CriticTrainConfig(epochs=50, steps_per_epoch=8)
             critic_trainer = CriticTrainer(self.critic, self.db, critic_cfg)
             critic_trainer.train()
-            # Soft-update target network
             self._soft_update_critic_target()
-            _status("  critic updated (target network EMA applied)")
+            _status("  critic updated")
 
-            # Validate critic against ground truth
-            self._evaluate_critic(n_seeds=20)
+            # 3. Policy update: fine-tune or full retrain
+            full_retrain = (iteration % 5 == 0)  # full retrain every 5th iteration
+            if full_retrain:
+                n_epochs = 200
+                lr = cfg.lr
+                _status(f"  full retrain ({n_epochs} epochs, lr={lr})...")
+                fresh_policy = DirectPolicy(cfg_dp)
+                self.policy = fresh_policy
+                self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
+            else:
+                n_epochs = 100
+                lr = cfg.lr / 5
+                _status(f"  fine-tuning from best ({n_epochs} epochs, lr={lr})...")
+                self.load_checkpoint(cfg.checkpoint_dir / "best.pt")
+                self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
 
-            # 3. Full retrain of DP on all data with MC-return weighting
-            n_retrain_epochs = 200
-            _status(f"  retraining policy from scratch ({n_retrain_epochs} epochs)...")
-            # Re-initialize policy and optimizer
-            fresh_policy = DirectPolicy(cfg_dp)
-            self.policy = fresh_policy
-            self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr)
-            for epoch in range(n_retrain_epochs):
+            for epoch in range(n_epochs):
                 epoch_loss = 0.0
                 for step in range(cfg.steps_per_epoch):
                     batch = self.db.sample_initial_states(cfg.batch_size)
@@ -729,8 +741,9 @@ class DPTrainer:
                 loss_hist.append(avg_loss)
                 total_epoch += 1
                 if (epoch + 1) % 50 == 0:
-                    _status(f"    retrain epoch {epoch+1}/{n_retrain_epochs} loss={avg_loss:.6f}")
-            _status(f"  policy retrained (loss={avg_loss:.6f})")
+                    _status(f"    epoch {epoch+1}/{n_epochs} loss={avg_loss:.6f}")
+            mode = "retrained" if full_retrain else "fine-tuned"
+            _status(f"  policy {mode} (loss={avg_loss:.6f})")
 
             # 4. Evaluate
             _status("  evaluating holdout...")
@@ -747,7 +760,7 @@ class DPTrainer:
                 best_return = metrics["mean_return"]
                 best_epoch = total_epoch
                 self.save_checkpoint(cfg.checkpoint_dir / "best.pt")
-                print(f"  new best! saved checkpoint")
+                print(f"  NEW BEST! saved checkpoint")
             else:
                 print(f"  no improvement (best={best_landing:.1%}, ret={best_return:.2f}), reverting")
                 self.load_checkpoint(cfg.checkpoint_dir / "best.pt")
@@ -861,18 +874,18 @@ class DPTrainer:
             n_steps = int(round(total_duration / DT))
             gains = TrackerGains()
 
-            # Compute advantage for this plan (critic needs real t_remaining)
+            # Compute advantage using EMA target critic for stable labels
             cs_critic = CriticState(
                 obs_t=obs_raw.copy(),
                 obs_prev=obs_raw.copy(),
                 t_remaining=total_duration,
             )
-            self.critic.eval()
+            self.critic_target.eval()
             with torch.no_grad():
                 s_tensor = cs_critic.to_tensor().unsqueeze(0)
                 a_tensor = plan_enc.to_tensor().unsqueeze(0)
-                v_val = self.critic.forward_v(s_tensor).item()
-                q_val = self.critic.forward_q(s_tensor, a_tensor).item()
+                v_val = self.critic_target.forward_v(s_tensor).item()
+                q_val = self.critic_target.forward_q(s_tensor, a_tensor).item()
             advantage = q_val - v_val
 
             transitions = []
