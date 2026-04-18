@@ -1,0 +1,35 @@
+# PIH interactive viewer — X11 display forwarding to VcXsrv on Windows.
+#
+# Usage:
+#   docker compose -f docker-compose.pih-viewer.yml build
+#   docker compose -f docker-compose.pih-viewer.yml run --rm pih-viewer \
+#       --jsonl results/phase2_5/failures.jsonl --episode 0 \
+#       --out   results/phase2_5/user_corrections.jsonl
+#
+# The command args after the service name are forwarded to interactive_viewer.py.
+#
+# VcXsrv setup (one-time):
+#   1. Install VcXsrv from https://sourceforge.net/projects/vcxsrv/
+#   2. Run XLaunch: Multiple windows → display 0 → Start no client →
+#      check "Disable access control" → Finish.
+#   3. Allow VcXsrv through Windows Defender Firewall (public + private).
+
+services:
+  pih-viewer:
+    image: pih-viewer
+    build:
+      context: .
+      dockerfile: Dockerfile.pih-viewer
+    environment:
+      - DISPLAY=host.docker.internal:0.0
+      - SDL_VIDEODRIVER=x11
+      - SDL_AUDIODRIVER=
+    volumes:
+      - type: bind
+        source: ./results
+        target: /app/results
+    stdin_open: true
+    tty: true
+    entrypoint: ["python", "scripts/interactive_viewer.py"]
+    # Default args — override on command line after service name
+    command: ["--jsonl", "results/phase2_5/failures.jsonl", "--episode", "0"]

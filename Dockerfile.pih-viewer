@@ -1,0 +1,48 @@
+# PIH interactive viewer — extends pih-validate with X11 display forwarding.
+#
+# Build:
+#   docker build -f Dockerfile.pih-validate -t pih-validate .
+#   docker build -f Dockerfile.pih-viewer   -t pih-viewer   .
+#
+# Run (via compose — preferred):
+#   docker compose -f docker-compose.pih-viewer.yml run --rm pih-viewer \
+#       --jsonl results/phase2_5/failures.jsonl --episode 0
+#
+# Prerequisites (Windows):
+#   1. Install VcXsrv: https://sourceforge.net/projects/vcxsrv/
+#   2. Launch XLaunch with "Multiple windows", display 0, "Disable access control" checked.
+#   3. Allow VcXsrv through Windows Firewall if prompted.
+#
+# Manual run (without compose):
+#   docker run --rm -it \
+#     -e DISPLAY=host.docker.internal:0.0 \
+#     -e SDL_VIDEODRIVER=x11 \
+#     -e SDL_AUDIODRIVER= \
+#     -v "C:/Users/arian/src/poslathian/simple-lander/results:/app/results" \
+#     pih-viewer \
+#     python scripts/interactive_viewer.py \
+#       --jsonl results/phase2_5/failures.jsonl --episode 0 \
+#       --out   results/phase2_5/user_corrections.jsonl
+
+FROM pih-validate
+
+# X11 client libraries that SDL2's x11 driver dlopens at runtime.
+# pygame 2.x bundles SDL2 itself; we only need the X11 side.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+        libxrandr2 \
+        libxfixes3 \
+        libxi6 \
+        libxcursor1 \
+        libxinerama1 \
+        libxss1 \
+        libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Override the dummy driver set in pih-validate; compose/runtime can override again.
+ENV SDL_VIDEODRIVER=x11 \
+    SDL_AUDIODRIVER=
+
+CMD ["python", "scripts/interactive_viewer.py", "--help"]
