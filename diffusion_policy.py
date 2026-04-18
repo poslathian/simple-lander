@@ -471,9 +471,10 @@ class DPRolloutDB(RolloutDB):
 
         selected_eps = np.array(sorted(selected))
 
-        # Sample transitions from selected episodes
+        # Sample initial-state transitions from selected episodes
         ep_ids_col = self._episode_ids[:self._size]
-        mask = np.isin(ep_ids_col, selected_eps)
+        step_idx_col = self._step_indices[:self._size]
+        mask = np.isin(ep_ids_col, selected_eps) & (step_idx_col == 0)
         candidate_indices = np.where(mask)[0]
 
         if len(candidate_indices) == 0:
@@ -494,6 +495,42 @@ class DPRolloutDB(RolloutDB):
         if self._mc_returns is not None:
             batch["mc_return"] = torch.tensor(self._mc_returns[chosen], dtype=torch.float32)
         # Add per-episode metadata for each transition
+        trans_ep_ids = self._episode_ids[chosen]
+        batch["episode_advantage"] = torch.tensor(
+            self._ep_advantages[trans_ep_ids], dtype=torch.float32
+        )
+        batch["episode_outcome"] = torch.tensor(
+            self._ep_outcomes[trans_ep_ids], dtype=torch.float32
+        )
+        return batch
+
+    def sample_initial_states(self, batch_size: int) -> dict[str, torch.Tensor]:
+        """Sample only episode-initial transitions (step_idx=0).
+
+        The DP generates a plan once per episode at the initial state,
+        so training should focus on these transitions, not mid-episode frames.
+        """
+        step_indices = self._step_indices[:self._size]
+        initial_mask = step_indices == 0
+        initial_indices = np.where(initial_mask)[0]
+
+        if len(initial_indices) == 0:
+            return self.sample_batch(batch_size)
+
+        chosen = np.random.choice(
+            initial_indices,
+            size=min(batch_size, len(initial_indices)),
+            replace=len(initial_indices) < batch_size,
+        )
+
+        batch = {
+            "state": torch.tensor(self._states[chosen], dtype=torch.float32),
+            "action": torch.tensor(self._actions[chosen], dtype=torch.float32),
+            "reward": torch.tensor(self._rewards[chosen], dtype=torch.float32),
+            "terminal": torch.tensor(self._terminals[chosen], dtype=torch.bool),
+        }
+        if self._mc_returns is not None:
+            batch["mc_return"] = torch.tensor(self._mc_returns[chosen], dtype=torch.float32)
         trans_ep_ids = self._episode_ids[chosen]
         batch["episode_advantage"] = torch.tensor(
             self._ep_advantages[trans_ep_ids], dtype=torch.float32
@@ -563,13 +600,13 @@ class DPTrainer:
         best_val = float("inf")
         best_epoch = 0
 
-        print(f"[phase2] training on {len(self.db)} transitions, "
-              f"{self.db.num_episodes} episodes")
+        print(f"[phase2] training on {self.db.num_episodes} initial-state transitions "
+              f"({len(self.db)} total frames, {self.db.num_episodes} episodes)")
 
         for epoch in range(cfg.epochs):
             epoch_loss = 0.0
             for step in range(cfg.steps_per_epoch):
-                batch = self.db.sample_batch(cfg.batch_size)
+                batch = self.db.sample_initial_states(cfg.batch_size)
                 loss = self._train_step_inner(batch, cfg_dp)
                 epoch_loss += loss
 
@@ -577,7 +614,7 @@ class DPTrainer:
             loss_hist.append(avg_loss)
 
             # Validation
-            val_batch = self.db.sample_batch(min(1024, len(self.db)))
+            val_batch = self.db.sample_initial_states(min(1024, self.db.num_episodes))
             val_loss = self._validate(val_batch, cfg_dp)
 
             if val_loss < best_val:
@@ -1165,6 +1202,26 @@ def run_dp_episode(
 # CLI
 # ===========================================================================
 
+def _make_pickle_helper(module):
+    """Create a pickle-compatible module shim so torch.load can find
+    classes like CriticConfig/TrunkType when __main__ is diffusion_policy."""
+    import pickle as _pickle
+    import types
+
+    class _Unpickler(_pickle.Unpickler):
+        def find_class(self, mod_name, name):
+            if mod_name == "__main__" and hasattr(module, name):
+                return getattr(module, name)
+            return super().find_class(mod_name, name)
+
+    # torch.load expects a module with Unpickler + load/loads
+    shim = types.ModuleType("_pickle_shim")
+    shim.Unpickler = _Unpickler
+    shim.load = _pickle.load
+    shim.loads = _pickle.loads
+    return shim
+
+
 def main():
     parser = argparse.ArgumentParser(description="Diffusion policy: phase2, phase3, evaluate, run, compare")
     sub = parser.add_subparsers(dest="cmd")
@@ -1213,7 +1270,9 @@ def main():
     args = parser.parse_args()
 
     def _load_critic(ckpt_path: str) -> LanderCritic:
-        ckpt = torch.load(Path(ckpt_path), weights_only=False)
+        import lander_critic as _lc
+        ckpt = torch.load(Path(ckpt_path), weights_only=False,
+                          pickle_module=_make_pickle_helper(_lc))
         critic = LanderCritic(ckpt["config"])
         critic.load_state_dict(ckpt["critic"])
         critic.eval()
