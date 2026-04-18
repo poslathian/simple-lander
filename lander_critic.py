@@ -333,6 +333,10 @@ class RolloutDB:
             indices = np.where(self._terminals[:self._size])[0]
         else:
             indices = np.arange(self._size)
+        # Exclude entries with mc_return=0 (unfilled initial-state-only entries)
+        if self._mc_returns is not None:
+            valid_mc = self._mc_returns[indices] != 0.0
+            indices = indices[valid_mc]
         chosen = np.random.choice(indices, size=min(batch_size, len(indices)), replace=False)
         batch = {
             "state": torch.tensor(self._states[chosen], dtype=torch.float32),

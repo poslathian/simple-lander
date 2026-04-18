@@ -58,7 +58,7 @@ from lander_critic import (
 # ===========================================================================
 
 COND_DIM = 18        # obs_t(8) + obs_prev(8) + t_remaining(1) + advantage(1)
-TIMESTEP_EMB_DIM = 32
+TIMESTEP_EMB_DIM = 1  # scalar t/T normalized to [0,1]
 
 
 # ===========================================================================
@@ -67,24 +67,23 @@ TIMESTEP_EMB_DIM = 32
 
 @dataclass
 class DPConfig:
-    hidden_dim: int = 256
-    num_layers: int = 4
+    hidden_dim: int = 192
+    num_layers: int = 3
     dropout: float = 0.1
-    advantage_dropout: float = 0.1
-    n_diffusion_steps: int = 100
-    n_ddim_steps: int = 10
+    advantage_dropout: float = 1.0  # unconditional BC
+    n_diffusion_steps: int = 20
+    n_ddim_steps: int = 20
     beta_start: float = 1e-4
-    beta_end: float = 0.02
+    beta_end: float = 0.1
 
     @property
     def param_count_estimate(self) -> int:
-        input_dim = ACTION_DIM + TIMESTEP_EMB_DIM + COND_DIM
+        input_dim = COND_DIM
         p = input_dim * self.hidden_dim + self.hidden_dim
         for _ in range(self.num_layers):
             p += self.hidden_dim * self.hidden_dim + self.hidden_dim  # linear
             p += 2 * self.hidden_dim  # layernorm
         p += self.hidden_dim * ACTION_DIM + ACTION_DIM
-        p += TIMESTEP_EMB_DIM * TIMESTEP_EMB_DIM  # timestep projection
         return p
 
 
@@ -222,6 +221,13 @@ class _ResidualBlock(nn.Module):
 
 
 class DiffusionPolicy(nn.Module):
+    """Direct conditional plan predictor (obs → plan).
+
+    Despite the name, this is no longer a diffusion model — it directly
+    predicts normalized plan encodings from observation conditioning.
+    Exploration noise is added at inference time via `noise_scale`.
+    """
+
     def __init__(self, config: DPConfig | None = None):
         super().__init__()
         self.config = config or DPConfig()
@@ -229,13 +235,8 @@ class DiffusionPolicy(nn.Module):
 
         self.schedule = NoiseSchedule(cfg.n_diffusion_steps, cfg.beta_start, cfg.beta_end)
 
-        # Timestep embedding
-        self.time_embed = _SinusoidalEmbedding(TIMESTEP_EMB_DIM)
-        self.time_proj = nn.Linear(TIMESTEP_EMB_DIM, TIMESTEP_EMB_DIM)
-
-        # Input projection: noisy_action(25) + time_emb(32) + cond(18) = 75
-        input_dim = ACTION_DIM + TIMESTEP_EMB_DIM + COND_DIM
-        self.input_proj = nn.Linear(input_dim, cfg.hidden_dim)
+        # Input: cond(18) only — no noisy action or timestep
+        self.input_proj = nn.Linear(COND_DIM, cfg.hidden_dim)
 
         # Residual blocks
         self.blocks = nn.ModuleList([
@@ -247,41 +248,22 @@ class DiffusionPolicy(nn.Module):
 
     def forward(
         self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
         cond: torch.Tensor,
     ) -> torch.Tensor:
-        t_emb = F.silu(self.time_proj(self.time_embed(t)))
-        h = torch.cat([x_t, t_emb, cond], dim=-1)
-        h = self.input_proj(h)
+        """Predict normalized plan directly from conditioning."""
+        h = self.input_proj(cond)
         for block in self.blocks:
             h = block(h)
         return self.output_proj(h)
 
-    @torch.no_grad()
-    def sample_ddim(
+    # Legacy forward signature for compatibility with callers passing (x_t, t, cond)
+    def forward_diffusion(
         self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
         cond: torch.Tensor,
-        n_steps: int | None = None,
     ) -> torch.Tensor:
-        self.eval()
-        n = n_steps or self.config.n_ddim_steps
-        device = cond.device
-        batch_size = cond.shape[0]
-
-        # Evenly spaced timesteps from T-1 down to 0
-        step_indices = torch.linspace(
-            self.config.n_diffusion_steps - 1, 0, n + 1, device=device
-        ).long()
-
-        x = torch.randn(batch_size, ACTION_DIM, device=device)
-
-        for i in range(n):
-            t_cur = int(step_indices[i].item())
-            t_prev = int(step_indices[i + 1].item())
-            t_batch = torch.full((batch_size,), t_cur, device=device, dtype=torch.long)
-            pred_noise = self.forward(x, t_batch, cond)
-            x = self.schedule.ddim_step(x, pred_noise, t_cur, t_prev)
+        return self.forward(cond)
 
         return x
 
@@ -290,10 +272,13 @@ class DiffusionPolicy(nn.Module):
         self,
         condition: DPCondition,
         norm: PlanNormalization,
+        noise_scale: float = 0.0,
     ) -> PlanEncoding:
         self.eval()
         cond = condition.to_tensor().unsqueeze(0)
-        x_norm = self.sample_ddim(cond)
+        x_norm = self.forward(cond)
+        if noise_scale > 0:
+            x_norm = x_norm + noise_scale * torch.randn_like(x_norm)
         x = norm.denormalize(x_norm).squeeze(0).cpu().numpy()
         return PlanEncoding(
             control_points=x[:24],
@@ -511,7 +496,9 @@ class DPRolloutDB(RolloutDB):
         so training should focus on these transitions, not mid-episode frames.
         """
         step_indices = self._step_indices[:self._size]
-        initial_mask = step_indices == 0
+        ep_ids = self._episode_ids[:self._size]
+        # Only KTO episodes (< 1000) — phase3 stubs have mode-collapsed plans
+        initial_mask = (step_indices == 0) & (self._mc_returns[:self._size] != 0.0)
         initial_indices = np.where(initial_mask)[0]
 
         if len(initial_indices) == 0:
@@ -523,8 +510,10 @@ class DPRolloutDB(RolloutDB):
             replace=len(initial_indices) < batch_size,
         )
 
+        state_data = self._states[chosen].copy()
+        state_data[:, 16] = 0.0  # zero t_remaining — not meaningful at episode start
         batch = {
-            "state": torch.tensor(self._states[chosen], dtype=torch.float32),
+            "state": torch.tensor(state_data, dtype=torch.float32),
             "action": torch.tensor(self._actions[chosen], dtype=torch.float32),
             "reward": torch.tensor(self._rewards[chosen], dtype=torch.float32),
             "terminal": torch.tensor(self._terminals[chosen], dtype=torch.bool),
@@ -548,10 +537,10 @@ class DPRolloutDB(RolloutDB):
 @dataclass
 class DPTrainConfig:
     phase: int = 2
-    lr: float = 3e-4
+    lr: float = 1e-3
     batch_size: int = 256
     epochs: int = 100
-    steps_per_epoch: int = 200
+    steps_per_epoch: int = 4  # ~1 pass over 1000 samples per epoch
     max_grad_norm: float = 1.0
     advantage_dropout: float = 0.1
     # Phase 3
@@ -640,6 +629,9 @@ class DPTrainer:
             if (epoch + 1) % 10 == 0:
                 print(f"  epoch {epoch+1}/{cfg.epochs}  loss={avg_loss:.6f}  val={val_loss:.6f}")
 
+        # Save last checkpoint too
+        self.save_checkpoint(cfg.checkpoint_dir / "last.pt")
+
         # Final evaluation
         metrics = self._evaluate_holdout()
         print(f"[phase2] done — best epoch {best_epoch}, landing_rate={metrics['landing_rate']:.1%}")
@@ -693,13 +685,9 @@ class DPTrainer:
         # Build conditioning
         cond = torch.cat([states, advantages.unsqueeze(-1)], dim=-1)
 
-        # DDPM
-        t = torch.randint(0, cfg_dp.n_diffusion_steps, (bs,))
-        noise = torch.randn_like(actions_norm)
-        x_t = schedule.q_sample(actions_norm, t, noise)
-
-        pred_noise = self.policy(x_t, t, cond)
-        loss = F.mse_loss(pred_noise, noise)
+        # Direct prediction: predict normalized plan from conditioning
+        pred_plan = self.policy(cond)
+        loss = F.mse_loss(pred_plan, actions_norm)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -711,7 +699,6 @@ class DPTrainer:
     def _validate(self, batch: dict[str, torch.Tensor], cfg_dp: DPConfig) -> float:
         """Compute validation loss."""
         self.policy.eval()
-        schedule = self.policy.schedule
 
         states = batch["state"]
         actions = batch["action"]
@@ -739,11 +726,8 @@ class DPTrainer:
         cond = torch.cat([states, advantages.unsqueeze(-1)], dim=-1)
 
         with torch.no_grad():
-            t = torch.randint(0, cfg_dp.n_diffusion_steps, (bs,))
-            noise = torch.randn_like(actions_norm)
-            x_t = schedule.q_sample(actions_norm, t, noise)
-            pred_noise = self.policy(x_t, t, cond)
-            loss = F.mse_loss(pred_noise, noise)
+            pred_plan = self.policy(cond)
+            loss = F.mse_loss(pred_plan, actions_norm)
         return loss.item()
 
     def train_phase3(self) -> DPTrainResult:
@@ -898,12 +882,8 @@ class DPTrainer:
 
         cond = torch.cat([states, advantages.unsqueeze(-1)], dim=-1)
 
-        t = torch.randint(0, cfg_dp.n_diffusion_steps, (bs,))
-        noise = torch.randn_like(actions_norm)
-        x_t = schedule.q_sample(actions_norm, t, noise)
-
-        pred_noise = self.policy(x_t, t, cond)
-        loss = F.mse_loss(pred_noise, noise)
+        pred_plan = self.policy(cond)
+        loss = F.mse_loss(pred_plan, actions_norm)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -937,7 +917,7 @@ class DPTrainer:
             cs = CriticState(
                 obs_t=obs_raw.copy(),
                 obs_prev=obs_raw.copy(),
-                t_remaining=10.0,
+                t_remaining=0.0,
             )
             condition = DPCondition.from_critic_state(cs, advantage=1.0)
             plan_enc = self.policy.generate_plan(condition, self.norm)
@@ -1078,7 +1058,7 @@ class DPTrainer:
         for seed in seeds:
             result = run_dp_episode(
                 self.policy, self.critic, self.norm,
-                render=False, seed=seed, verbose=False, advantage_cond=1.0,
+                render=False, seed=seed, verbose=False, advantage_cond=0.0,
             )
             if result.get("planning_failed"):
                 continue
@@ -1122,8 +1102,9 @@ class DPTrainer:
                 v = self.critic.forward_v(cs.to_tensor().unsqueeze(0)).item()
             v_preds.append(v)
 
-            # Roll out with DP to get actual return
-            condition = DPCondition.from_critic_state(cs, advantage=1.0)
+            # Roll out with DP to get actual return (zero t_remaining for DP conditioning)
+            cs_dp = CriticState(obs_t=obs_raw.copy(), obs_prev=obs_raw.copy(), t_remaining=0.0)
+            condition = DPCondition.from_critic_state(cs_dp, advantage=1.0)
             plan_enc = self.policy.generate_plan(condition, self.norm)
             try:
                 plan = encoding_to_plan(plan_enc)
@@ -1268,13 +1249,18 @@ def run_dp_episode(
             print(f"[dp] warmup failed: {e}")
         return {"planning_failed": True, "landed": False, "t_elapsed": 0.0}
 
-    # Generate plan with DP
+    # Generate plan with DP (t_remaining=0 for DP, 10 for critic)
     cs = CriticState(
         obs_t=obs_raw.copy(),
         obs_prev=obs_raw.copy(),
         t_remaining=10.0,
     )
-    condition = DPCondition.from_critic_state(cs, advantage=advantage_cond)
+    cs_dp = CriticState(
+        obs_t=obs_raw.copy(),
+        obs_prev=obs_raw.copy(),
+        t_remaining=0.0,
+    )
+    condition = DPCondition.from_critic_state(cs_dp, advantage=advantage_cond)
 
     t0 = time.perf_counter()
     plan_enc = policy.generate_plan(condition, norm)
@@ -1542,7 +1528,8 @@ def main():
         n_params = sum(p.numel() for p in policy.parameters())
         print(f"[phase2] model: {n_params:,} params")
 
-        train_cfg = DPTrainConfig(phase=2, epochs=args.epochs, lr=args.lr)
+        train_cfg = DPTrainConfig(phase=2, epochs=args.epochs, lr=args.lr,
+                                   advantage_dropout=1.0)  # unconditional BC
         trainer = DPTrainer(policy, critic, db, norm, train_cfg)
         result = trainer.train_phase2()
         print(f"[phase2] result: landing_rate={result.landing_rate:.1%}, "
