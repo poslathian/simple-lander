@@ -99,7 +99,7 @@ def plan_with_kto(
     params: LanderParams,
     vy_target: float = -0.3,
     num_control_points: int = 12,
-    spline_order: int = 4,
+    spline_order: int = 4,  # B-spline order (degree + 1); 4 = cubic
     T_min: float = 1.5,
     T_max: float = 10.0,
     verbose: bool = True,
