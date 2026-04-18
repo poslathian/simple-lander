@@ -363,6 +363,178 @@ def oracle_plan_pih_with_kto(
 
 
 # ---------------------------------------------------------------------------
+# Waypoint re-solve (Phase 2.5)
+# ---------------------------------------------------------------------------
+
+def waypoint_replan_pih_with_kto(
+    user_waypoint: np.ndarray,
+    previous_waypoint_name: str,
+    previous_waypoint_state: np.ndarray,
+    cfg: PIHConfig,
+    remaining_waypoints: list[str],
+    params: LanderParams | None = None,
+    *,
+    waypoint_tolerance: float = 0.5,
+    T_min: float = 5.0,
+    T_max: float = 30.0,
+    verbose: bool = False,
+) -> dict:
+    """Replan from previous_waypoint through user_waypoint using ASSUMED parameters.
+
+    The user waypoint is inserted as an intermediate soft position constraint
+    (bounding box ±waypoint_tolerance metres) between previous_waypoint and the
+    first remaining named waypoint.  All remaining named waypoints are added as
+    hard position constraints.
+
+    Parameters
+    ----------
+    user_waypoint : (2,) array  — (x, y) in world metres, from operator click
+    previous_waypoint_name : str  — e.g. "contact"
+    previous_waypoint_state : (6,) array  — [x, y, vx, vy, theta, omega]
+    cfg : PIHConfig  — ASSUMED parameters (NOT oracle/true)
+    remaining_waypoints : list of named waypoints after the user waypoint
+    waypoint_tolerance : soft-constraint half-width in metres (default 0.5)
+
+    Returns
+    -------
+    dict with keys:
+      feasible : bool
+      plan     : Plan (if feasible)
+      T        : float — plan duration seconds (if feasible)
+      waypoints: PIHWaypoints (if feasible)
+      cps      : np.ndarray (N, 2)  — control points (if feasible)
+      knots    : np.ndarray (N+4,)  — knot vector (if feasible)
+    """
+    x0 = float(previous_waypoint_state[0])
+    y0 = float(previous_waypoint_state[1])
+    vx0 = float(previous_waypoint_state[2])
+    vy0 = float(previous_waypoint_state[3])
+
+    uw_x = float(user_waypoint[0])
+    uw_y = float(user_waypoint[1])
+
+    # Compute remaining named waypoint positions using ASSUMED config
+    wpt_xy = _compute_wpt_positions(x0, y0, cfg)
+
+    # Build ordered remaining list (only those actually in _WP_ORDER)
+    ordered_remaining = [n for n in _WP_ORDER if n in remaining_waypoints]
+
+    # Estimate normalised time for user waypoint by distance proportion
+    prev_pos = np.array([x0, y0])
+    uw_pos   = np.array([uw_x, uw_y])
+
+    seg_lens = [np.linalg.norm(uw_pos - prev_pos)]
+    cur = uw_pos
+    for name in ordered_remaining:
+        nxt = np.array(wpt_xy.get(name, (cur[0], cur[1])))
+        seg_lens.append(float(np.linalg.norm(nxt - cur)))
+        cur = nxt
+    total = sum(seg_lens) or 1.0
+    s_user = seg_lens[0] / total
+
+    # Normalised times for named waypoints (evenly distributed in [s_user, 1])
+    n_after = len(ordered_remaining)
+    if n_after > 0:
+        s_after = list(np.linspace(s_user + (1.0 - s_user) / (n_after + 1),
+                                   1.0, n_after))
+    else:
+        s_after = []
+
+    # ── Build KTO problem ────────────────────────────────────────────────
+    num_control_points = 20
+    spline_order = 4
+    kto = KinematicTrajectoryOptimization(
+        num_positions=2,
+        num_control_points=num_control_points,
+        spline_order=spline_order,
+    )
+    kto.AddDurationConstraint(T_min, T_max)
+    kto.AddDurationCost(1.0)
+    kto.AddPathLengthCost(0.001)
+    kto.AddVelocityBounds(np.array([-7.0, -7.0]), np.array([7.0, 5.0]))
+    kto.AddAccelerationBounds(np.array([-1.5, -1.0]), np.array([1.5, 5.0]))
+
+    # Start position (hard)
+    kto.AddPathPositionConstraint(np.array([x0, y0]), np.array([x0, y0]), 0.0)
+
+    # User waypoint (soft — tolerance box)
+    tol = waypoint_tolerance
+    kto.AddPathPositionConstraint(
+        np.array([uw_x - tol, uw_y - tol]),
+        np.array([uw_x + tol, uw_y + tol]),
+        s_user,
+    )
+
+    # Named remaining waypoints (hard)
+    for name, s_req in zip(ordered_remaining, s_after):
+        wx, wy = wpt_xy[name]
+        kto.AddPathPositionConstraint(np.array([wx, wy]), np.array([wx, wy]), s_req)
+
+    # Zero acceleration at endpoints
+    zero2 = np.zeros(2)
+    kto.AddPathAccelerationConstraint(zero2, zero2, 0.0)
+    kto.AddPathAccelerationConstraint(zero2, zero2, 1.0)
+
+    # Velocity constraints
+    def _vel_eq(vx_req: float, vy_req: float) -> LinearEqualityConstraint:
+        A = np.zeros((2, 4))
+        A[0, 2] = 1.0
+        A[1, 3] = 1.0
+        return LinearEqualityConstraint(A, np.array([vx_req, vy_req]))
+
+    kto.AddVelocityConstraintAtNormalizedTime(_vel_eq(vx0, vy0), 0.0)
+    if "extraction" in ordered_remaining:
+        s_ex = s_after[ordered_remaining.index("extraction")]
+        kto.AddVelocityConstraintAtNormalizedTime(_vel_eq(0.0, 0.5), s_ex)
+    kto.AddVelocityConstraintAtNormalizedTime(_vel_eq(0.0, -0.3), 1.0)
+
+    result = Solve(kto.prog())
+    if not result.is_success():
+        if verbose:
+            print(f"[pih_wp_replan] FAILED: {result.get_solver_id().name()} "
+                  f"{result.get_solution_result()}")
+        return {"feasible": False}
+
+    traj = kto.ReconstructTrajectory(result)
+    T = float(traj.end_time() - traj.start_time())
+
+    _NaN3 = (float("nan"), float("nan"), float("nan"))
+    active: dict[str, tuple] = {}
+    active[previous_waypoint_name] = (x0, y0, 0.0)
+    for name, s_req in zip(ordered_remaining, s_after):
+        wx, wy = wpt_xy[name]
+        active[name] = (wx, wy, s_req)
+
+    wpts = PIHWaypoints(
+        start         = (x0, y0, 0.0),
+        mountain_out  = active.get("mountain_out", _NaN3),
+        approach      = active.get("approach",     _NaN3),
+        contact       = active.get("contact",      _NaN3),
+        extraction    = active.get("extraction",   _NaN3),
+        mountain_ret  = active.get("mountain_ret", _NaN3),
+        approach_land = _NaN3,
+        landing       = active.get("landing",      _NaN3),
+    )
+
+    plan_obj = Plan(traj, T)
+    cps, knots = _plan_to_numpy(plan_obj)
+
+    if verbose:
+        print(f"[pih_wp_replan] solved: T={T:.2f}s  solver={result.get_solver_id().name()}")
+        print(f"  prev={previous_waypoint_name}  user_wp=({uw_x:.2f},{uw_y:.2f})  "
+              f"s_user={s_user:.2f}  remaining={ordered_remaining}")
+
+    return {
+        "feasible":  True,
+        "plan":      plan_obj,
+        "T":         T,
+        "waypoints": wpts,
+        "cps":       cps,
+        "knots":     knots,
+    }
+
+
+# ---------------------------------------------------------------------------
 # _HoverPlan — fake terminal plan
 # ---------------------------------------------------------------------------
 
@@ -470,8 +642,9 @@ class PackageInHoleKTOController:
         self.weld_strategy    = weld_strategy
         self._last_replan_t   = -float("inf")
 
-        # Data collection: replan events
+        # Data collection: replan events + waypoint crossing states
         self.replan_events: list[dict] = []
+        self.waypoint_states: dict[str, list[float]] = {}  # name → state when crossed
 
     # ── Public helpers ──────────────────────────────────────────────────
 
@@ -574,6 +747,7 @@ class PackageInHoleKTOController:
             wp = self._tracked_waypoints[self._wp_idx]
             dist = math.hypot(state[0] - wp.x, state[1] - wp.y)
             if dist < wp.threshold and state[3] >= wp.vy_min:
+                self.waypoint_states[wp.name] = state.tolist()
                 self._wp_idx += 1
             else:
                 break

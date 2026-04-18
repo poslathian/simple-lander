@@ -45,6 +45,7 @@ def _collect_episode(
     weld_strategy: str,
     replan_interval_s: float,
     verbose: bool = False,
+    correction_type: str | None = None,
 ) -> dict:
     """Run one PIH episode, return the complete data record."""
     env = PackageInHoleEnv(config=cfg, render_mode=None)
@@ -71,11 +72,14 @@ def _collect_episode(
 
     if not kto_feasible:
         env.close()
+        _ctype = correction_type if correction_type is not None else ("none" if not replan_triggers else "oracle")
         return {
             "seed": seed,
             "cfg":  _cfg_to_dict(cfg),
+            "correction_type": _ctype,
             "kto_plan": {"feasible": False, "cps": None, "knots": None, "waypoints": None},
             "replan_events": [],
+            "waypoint_states": {},
             "states": [], "actions": [], "actual_accel": [], "timestamps": [],
             "attachment_time": None, "attachment_state": None,
             "termination_reason": TerminationReason.TIMEOUT.value,
@@ -153,9 +157,11 @@ def _collect_episode(
 
     env.close()
 
+    _ctype = correction_type if correction_type is not None else ("none" if not replan_triggers else "oracle")
     return {
         "seed": seed,
         "cfg":  _cfg_to_dict(cfg),
+        "correction_type": _ctype,
 
         "states":       states,
         "actions":      actions,
@@ -164,7 +170,8 @@ def _collect_episode(
 
         "kto_plan":     kto_plan_record,
 
-        "replan_events": ctrl.replan_events,
+        "replan_events":   ctrl.replan_events,
+        "waypoint_states": ctrl.waypoint_states,
 
         "attachment_time":  attachment_time,
         "attachment_state": attachment_state,
@@ -237,6 +244,7 @@ def main() -> None:
             record = _collect_episode(
                 cfg, seed, triggers, args.weld_strategy, args.replan_interval,
                 verbose=args.verbose,
+                correction_type=None,  # auto-determined from triggers
             )
             elapsed = time.monotonic() - t0
 
