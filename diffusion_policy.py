@@ -70,7 +70,7 @@ class DPConfig:
     hidden_dim: int = 192
     num_layers: int = 3
     dropout: float = 0.1
-    advantage_dropout: float = 1.0  # unconditional BC
+    advantage_dropout: float = 0.1  # 10% dropout for classifier-free guidance
     n_diffusion_steps: int = 20
     n_ddim_steps: int = 20
     beta_start: float = 1e-4
@@ -510,10 +510,12 @@ class DPRolloutDB(RolloutDB):
             replace=len(initial_indices) < batch_size,
         )
 
-        state_data = self._states[chosen].copy()
-        state_data[:, 16] = 0.0  # zero t_remaining — not meaningful at episode start
+        raw_state = self._states[chosen].copy()
+        state_data = raw_state.copy()
+        state_data[:, 16] = 0.0  # zero t_remaining for DP conditioning
         batch = {
             "state": torch.tensor(state_data, dtype=torch.float32),
+            "raw_state": torch.tensor(raw_state, dtype=torch.float32),  # original for critic
             "action": torch.tensor(self._actions[chosen], dtype=torch.float32),
             "reward": torch.tensor(self._rewards[chosen], dtype=torch.float32),
             "terminal": torch.tensor(self._terminals[chosen], dtype=torch.bool),
@@ -666,28 +668,33 @@ class DPTrainer:
 
         # Binarized advantage: did this plan beat the critic's prediction?
         # advantage = sign(MC_return - V(s))
-        # Positive = plan did better than expected, negative = worse.
+        # Use raw_state (with original t_remaining) for critic, not zeroed state
         if "mc_return" in batch:
             mc = batch["mc_return"][has_action]
+            critic_states = batch["raw_state"][has_action] if "raw_state" in batch else states
             self.critic.eval()
             with torch.no_grad():
-                v = self.critic.forward_v(states).squeeze(-1)
+                v = self.critic.forward_v(critic_states).squeeze(-1)
             advantages = torch.sign(mc - v)
         elif "episode_advantage" in batch:
             advantages = torch.sign(batch["episode_advantage"][has_action])
         else:
             advantages = torch.zeros(bs)
 
-        # Advantage dropout
+        # Advantage-weighted regression: upweight good plans in the loss
+        # w_i = 1 + advantage_i  (so +1 plans get weight 2, -1 plans get weight 0)
+        weights = (1.0 + advantages).clamp(min=0.1)  # floor at 0.1 to not fully ignore bad plans
+
+        # Build conditioning (advantage still passed as input for inference steering)
         adv_mask = torch.rand(bs) < cfg.advantage_dropout
-        advantages[adv_mask] = 0.0
+        cond_advantages = advantages.clone()
+        cond_advantages[adv_mask] = 0.0
+        cond = torch.cat([states, cond_advantages.unsqueeze(-1)], dim=-1)
 
-        # Build conditioning
-        cond = torch.cat([states, advantages.unsqueeze(-1)], dim=-1)
-
-        # Direct prediction: predict normalized plan from conditioning
+        # Direct prediction with advantage-weighted loss
         pred_plan = self.policy(cond)
-        loss = F.mse_loss(pred_plan, actions_norm)
+        per_sample_loss = (pred_plan - actions_norm).pow(2).mean(dim=-1)
+        loss = (weights * per_sample_loss).mean()
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -714,9 +721,10 @@ class DPTrainer:
 
         if "mc_return" in batch:
             mc = batch["mc_return"][has_action]
+            critic_states = batch["raw_state"][has_action] if "raw_state" in batch else states
             self.critic.eval()
             with torch.no_grad():
-                v = self.critic.forward_v(states).squeeze(-1)
+                v = self.critic.forward_v(critic_states).squeeze(-1)
             advantages = torch.sign(mc - v)
         elif "episode_advantage" in batch:
             advantages = torch.sign(batch["episode_advantage"][has_action])
@@ -1529,7 +1537,7 @@ def main():
         print(f"[phase2] model: {n_params:,} params")
 
         train_cfg = DPTrainConfig(phase=2, epochs=args.epochs, lr=args.lr,
-                                   advantage_dropout=1.0)  # unconditional BC
+                                   advantage_dropout=0.1)  # 10% dropout for CFG
         trainer = DPTrainer(policy, critic, db, norm, train_cfg)
         result = trainer.train_phase2()
         print(f"[phase2] result: landing_rate={result.landing_rate:.1%}, "
