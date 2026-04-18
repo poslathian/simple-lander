@@ -320,7 +320,7 @@ class PackageInHoleEnv(gym.Env):
         self._plan_ref        = None   # Plan callable, injected by controller
         self._show_raycasts   = False  # opt-in: visualise raycast beams
         self._font            = None   # lazy pygame font
-        self._collision_point: tuple[float, float] | None = None  # extraction collision world pos
+        self._collision_side: float | None = None  # +1/-1 = which hole wall was hit
 
     # ── World construction ───────────────────────────────────────────────
 
@@ -498,7 +498,7 @@ class PackageInHoleEnv(gym.Env):
         self.elapsed_s           = 0.0
         self._attached           = False
         self._termination_reason = TerminationReason.NONE
-        self._collision_point    = None
+        self._collision_side     = None
 
         self._build_terrain()
         self._build_package()
@@ -623,10 +623,7 @@ class PackageInHoleEnv(gym.Env):
             pkg_in_hole = pkg_bottom < PIH_PAD_Y
             lateral_dev = abs(pos.x - PIH_PICKUP_X)
             if pkg_in_hole and lateral_dev > cfg.package_gap + 0.02:
-                sign   = 1.0 if pos.x > PIH_PICKUP_X else -1.0
-                wall_x = PIH_PICKUP_X + sign * cfg.hole_half_width
-                pkg_top_in_hole = min(PIH_PAD_Y, float(pos.y) - PIH_LEG_OFFSET)
-                self._collision_point = (wall_x, (float(pkg_bottom) + pkg_top_in_hole) / 2.0)
+                self._collision_side = 1.0 if pos.x > PIH_PICKUP_X else -1.0
                 self._termination_reason = TerminationReason.EXTRACTION_COLLISION
                 info = {"termination_reason": self._termination_reason}
                 return self._build_obs(), -(PIH_TIMEOUT - self.elapsed_s) - DT, True, False, info
@@ -818,8 +815,13 @@ class PackageInHoleEnv(gym.Env):
                 pygame.draw.polygon(surf, (220, 50, 50), sliver)
 
         # ── Extraction collision marker ───────────────────────────────────
-        if self._collision_point is not None:
-            sx, sy = to_px(*self._collision_point)
+        if self._collision_side is not None and self.lander is not None:
+            lpos = self.lander.position
+            pkg_edge_x      = float(lpos.x) + self._collision_side * cfg.package_half_width
+            pkg_bottom_now  = float(lpos.y) - PIH_LEG_OFFSET - cfg.package_height_true
+            pkg_top_in_hole = min(PIH_PAD_Y, float(lpos.y) - PIH_LEG_OFFSET)
+            contact_y       = (pkg_bottom_now + pkg_top_in_hole) / 2.0
+            sx, sy = to_px(pkg_edge_x, contact_y)
             pygame.draw.circle(surf, (255, 50, 50), (sx, sy), 10)
             pygame.draw.circle(surf, (255, 200, 200), (sx, sy), 5)
 
