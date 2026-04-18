@@ -1,123 +1,128 @@
-# Diffusion Policy — Continuation Plan
+# Diffusion Policy — Continuation Plan (v2)
 
-## What Exists
+## Milestone 1: Clone KTO Return Stats — COMPLETE
 
-Three committed files implementing the full pipeline:
+### What Changed
 
-- **`kto_lander.py`** — Drake KTO trajectory optimizer + PD tracker (working, ~91% landing rate)
-- **`lander_critic.py`** — V/Q critic with MC training, RolloutDB (working)
-- **`diffusion_policy.py`** — DDPM/DDIM diffusion policy, DPRolloutDB, DPTrainer, CLI
+Replaced the DDPM diffusion policy with a **direct MLP plan predictor** (obs → plan).
+The diffusion approach mode-collapsed regardless of model size or sampling method because:
 
-The DP is a 292k-param noise-prediction MLP (256-wide, 4 residual blocks, SiLU, sinusoidal timestep embedding). 10-step DDIM inference. Outputs 25-dim plan (12 B-spline control points × 2 + duration T). Plan reconstruction via Drake BsplineTrajectory is verified exact (<1e-9 roundtrip error).
+1. **`t_remaining` mismatch (root cause of mode collapse)**: The DB stored `t_remaining = max(3.0, plan_T + 1.0)` at step_idx=0, which is the plan duration, NOT a fixed timeout. At inference, code hardcoded `t_remaining=10.0`. The model learned to copy t_remaining→plan_T (corr≈1.0), so it always predicted ~9s plans at inference. **Fix**: zero `t_remaining` in DP conditioning (training and inference).
 
-## Current State
+2. **Phase3 stub poisoning (critic)**: 1000 phase3 initial-state-only entries had `mc_return=0.0`, training the critic to predict V≈0 at high t_remaining. **Fix**: filter `mc_return != 0` in `RolloutDB.sample_batch`.
 
-**Phase 2 (behavioral cloning) works well:**
-- 1000 KTO episodes in `dp_rollout_db/` (201k transitions, 500k capacity)
-- DP trained on initial-state transitions only (step_idx=0)
-- **91% landing rate** on holdout seeds — matches KTO
-- Loss converged: ~0.025 train, ~0.018 val
+3. **Phase3 stub poisoning (DP)**: Same 1000 entries had mode-collapsed plans (all T≈8.9s), biasing the plan distribution. **Fix**: filter to `mc_return != 0` in `DPRolloutDB.sample_initial_states`.
 
-**Phase 3 (online improvement) has issues:**
-- Policy updates consistently degrade holdout performance (92% → ~60-86%)
-- Reduced to 3 epochs at LR/10 — better than 20 epochs but still no improvement over baseline
-- Checkpoint revert mechanism works (restores best on degradation)
+4. **Diffusion is wrong for this problem**: The obs→plan mapping is nearly deterministic (a simple 22k-param MLP achieves corr=0.999, MAE=0.05 on plan duration). Diffusion's multi-step denoising added no value and caused mode collapse at high-noise timesteps.
 
-**Advantage conditioning does NOT work yet:**
-- `adv-test` shows no meaningful difference between advantage=+1 and advantage=-1
-- Root cause identified: **the critic checkpoint (checkpoints/best.pt) is stale** — it was trained on only the original 200-episode `rollout_db/`, not the 1000-episode `dp_rollout_db/`
-- Critic eval shows: correlation=-0.008, MAE=8.03, bias=+8.03 (predicts -0.54 when actual returns are -8.57)
-- Since advantage = sign(MC_return - V(s)), and V(s) ≈ -0.54 while all returns are << -0.54, advantage labels are ALL -1 → no signal
+### Current Architecture
 
-## What To Do Next
+- **Model**: Direct MLP predictor, 121k params (192-wide, 3 residual blocks, SiLU)
+- **Input**: 18-dim conditioning (obs_t(8) + obs_prev(8) + t_remaining(1, always 0) + advantage(1))
+- **Output**: 25-dim normalized plan encoding (12 B-spline control points × 2 + duration T)
+- **Training**: MSE loss, lr=1e-3, batch_size=256, steps_per_epoch=4, 500 epochs
+- **Inference**: Direct forward pass (no sampling/denoising), optional noise_scale for exploration
 
-### Step 1: Retrain the critic on the 1000-episode DB
+### Current Stats (epoch 500, 100 holdout seeds)
 
-```bash
-.venv/bin/python3 lander_critic.py train --db dp_rollout_db --epochs 200
-```
+| Metric | DP | KTO |
+|--------|----|----|
+| Landing rate | 88% | 91% |
+| Overall return | -5.14 | -4.32 |
+| Landed return | -4.37 | -4.32 |
+| T mean | 3.94 | 4.32 |
+| T std | 2.20 | 1.94 |
+| Early failures (<2s) | 16 | ~9 |
 
-Then validate:
-```bash
-.venv/bin/python3 diffusion_policy.py critic-eval --seeds 50
-```
+### Key Files
 
-Target: correlation > 0.7, MAE < 2.0. The critic must accurately rank states before advantage conditioning can work.
+- `diffusion_policy.py` — all DP code (model, training, eval, CLI)
+- `lander_critic.py` — V/Q critic with MC training, RolloutDB
+- `kto_lander.py` — KTO planner + tracker (read-only)
+- `checkpoints/best.pt` — critic (retrained with MC=0 filter)
+- `dp_checkpoints/best.pt` — DP policy (epoch 500)
+- `dp_checkpoints/norm.npz` — plan normalization stats
+- `dp_rollout_db/` — 2000 episodes (1000 KTO + 1000 phase3 stubs, only KTO used for DP training)
 
-### Step 2: Retrain DP with good advantage labels
+---
+
+## Milestone 2: Demonstrate Advantage Conditioning — IN PROGRESS
+
+### Goal
+
+Show that conditioning on advantage=+1 produces measurably better plans than advantage=-1. Target: >5pp landing rate delta OR >0.3 return difference.
+
+### Plan
+
+1. Set `advantage_dropout=0.1` (was 1.0 for unconditional BC)
+2. Retrain DP with advantage labels from critic: `advantage = sign(mc_return - V(s))`
+   - The retrained critic (MAE=0.73 on live rollouts) provides meaningful V(s) predictions
+   - Training data has 69% positive / 31% negative advantage split
+3. Run advantage A/B test: same seeds with advantage=+1 vs -1
+4. Measure delta in landing rate, return, plan duration
+
+### Commands
 
 ```bash
 rm -rf dp_checkpoints
-.venv/bin/python3 diffusion_policy.py phase2 --db dp_rollout_db --critic-ckpt checkpoints/best.pt --epochs 200
-```
+PYTHONUNBUFFERED=1 .venv/bin/python3 diffusion_policy.py phase2 \
+    --db dp_rollout_db --critic-ckpt checkpoints/best.pt --epochs 500
 
-Then test advantage conditioning:
-```bash
+# Then test advantage conditioning
 .venv/bin/python3 diffusion_policy.py adv-test --seeds 50
 ```
 
-Target: measurable delta between adv=+1 and adv=-1 (>5pp landing or >0.3 return difference).
+### Risks
 
-### Step 3: Phase 3 online improvement
+- With only 1 scalar advantage input, the model may not learn a strong conditional
+- 1000 training samples may not be enough to learn the advantage-conditioned distribution
+- If advantage doesn't work, consider: larger advantage embedding, more training data, or advantage-weighted regression instead of conditioning
+
+---
+
+## Milestone 3: Stable Policy Iteration
+
+### Goal
+
+Use a slow-moving critic to label new DP rollouts with binarized advantage, retrain the DP, and iterate. Push return stats significantly above KTO baseline.
+
+### Plan
+
+1. Run DP to collect new episodes (with `noise_scale > 0` for exploration)
+2. Roll out each plan, compute MC return
+3. Retrain critic on combined old + new data (EMA target network, tau=0.005)
+4. Compute advantage = sign(MC_return - V(s)) for each episode
+5. Retrain DP on expanded dataset, conditioning on advantage=+1 for above-average plans
+6. Repeat 5-10 iterations, evaluating after each
+
+### Key Parameters
+
+- `episodes_per_iteration`: 200
+- `critic_tau`: 0.005 (EMA rate for target network)
+- `noise_scale`: TBD (exploration noise during DP rollouts)
+- `advantage_dropout`: 0.1
+- Policy update: 3 epochs at lr/10 (conservative fine-tuning)
+
+### Commands
 
 ```bash
-.venv/bin/python3 diffusion_policy.py phase3 --db dp_rollout_db --dp-ckpt dp_checkpoints/best.pt --critic-ckpt checkpoints/best.pt --iterations 10 --episodes-per-iter 200
+.venv/bin/python3 diffusion_policy.py phase3 \
+    --db dp_rollout_db --dp-ckpt dp_checkpoints/best.pt \
+    --critic-ckpt checkpoints/best.pt --iterations 10 --episodes-per-iter 200
 ```
 
-Phase 3 now includes:
-- **Target network EMA** (tau=0.005) — soft-updates critic target after each iteration
-- **Critic eval** — validates V(s) vs actual MC returns each iteration
-- **3 epochs at LR/10** — conservative policy updates to prevent catastrophic forgetting
-- **Checkpoint revert** — restores best checkpoint on holdout degradation
-- **Initial-state-only DP storage** — only stores step_idx=0 for DP episodes (saves ~200x DB capacity)
+### Success Criteria
 
-### Step 4: Final comparison
+- Landing rate > 95% (vs KTO 91%)
+- Mean return > -3.5 (vs KTO -4.32)
+- Critic stays calibrated (MAE < 1.5 throughout iterations)
 
-```bash
-.venv/bin/python3 diffusion_policy.py compare --episodes 100
-```
-
-## Architecture Notes
-
-### Advantage conditioning flow
-- Training: `advantage = sign(MC_return - V(s))` — did this plan beat the critic's prediction?
-- 10% advantage dropout (mask to 0) during training — classifier-free guidance
-- Inference: always condition on advantage=+1 ("generate a good plan")
-
-### Phase 3 structured replay sampling (500 transitions/batch)
-| Bucket | Count | Selection |
-|--------|-------|-----------|
-| Newest | 100 | Most recent episode IDs |
-| Worst recent | 100 | Lowest advantage in last 10 iterations |
-| Edge cases | 100 | Highest tracking error + failures |
-| Best overall | 100 | Highest advantage across all time |
-| Best recent | 100 | Highest advantage in last 10 iterations |
-
-### HER
-Relabels advantage conditioning to match actual achieved advantage with probability 0.5.
-
-### CLI subcommands
-- `phase2` — behavioral cloning from KTO
-- `phase3` — online improvement loop
-- `evaluate` — holdout evaluation (100 seeds)
-- `adv-test` — advantage conditioning A/B test
-- `critic-eval` — critic V(s) vs actual MC returns
-- `run [--render]` — single DP episode
-- `compare` — side-by-side KTO vs DP
-
-## Key Files
-- `diffusion_policy.py` — all DP code (~1500 lines)
-- `diffusion_policy.pyi` — type stub
-- `lander_critic.py` — critic + rollout collection
-- `kto_lander.py` — KTO planner + tracker (read-only, not modified)
-- `dp_rollout_db/` — 1000 KTO episodes, 500k capacity
-- `rollout_db/` — original 200-episode DB (stale, don't use)
-- `checkpoints/best.pt` — **STALE critic** trained on 200 episodes, needs retraining
-- `dp_checkpoints/best.pt` — DP policy checkpoint
-- `dp_checkpoints/norm.npz` — plan normalization stats
+---
 
 ## Known Issues
-1. `checkpoints/best.pt` critic is stale — trained on 200 episodes, not 1000. **Must retrain before anything else.**
-2. `lander_critic.py train` CLI uses `--db rollout_db` by default — pass `--db dp_rollout_db` explicitly
-3. Phase 3 critic trainer uses `CriticTrainer` which trains on ALL transitions (not just step_idx=0) — this is correct for the critic but means critic training is slower with the full DB
-4. The `_load_critic` helper in diffusion_policy.py uses a pickle shim (`_make_pickle_helper`) to handle `CriticConfig`/`TrunkType` deserialization when running as `__main__`
+
+1. 16 early failures (<2s) on holdout — likely bad plans from model generalization gaps
+2. Val loss is a poor proxy for landing rate — checkpoint selection should use holdout eval
+3. `_SinusoidalEmbedding` and `NoiseSchedule` classes are still in the code but unused by the direct predictor
+4. The critic uses `t_remaining=10.0` while DP uses `t_remaining=0.0` — separate CriticState instances required
+5. `advantage_dropout` in DPConfig is overridden in the phase2 CLI handler — need to keep both in sync
