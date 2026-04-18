@@ -74,13 +74,14 @@ RAY_MAX = 12.0   # world units — max raycast distance
 
 # Short names used in waypoint labels during rendering
 _WPT_SHORT: dict[str, str] = {
-    'start':        'start',
-    'mountain_out': 'mt_out',
-    'approach':     'appr',
-    'contact':      'ct',
-    'extraction':   'ex',
-    'mountain_ret': 'mt_ret',
-    'landing':      'land',
+    'start':         'start',
+    'mountain_out':  'mt_out',
+    'approach':      'appr',
+    'contact':       'ct',
+    'extraction':    'ex',
+    'mountain_ret':  'mt_ret',
+    'approach_land': 'appr_l',
+    'landing':       'land',
 }
 
 
@@ -592,11 +593,11 @@ class PackageInHoleEnv(gym.Env):
         obs = self._build_obs()
 
         # ── Termination ───────────────────────────────────────────────────
-        both_on_ground = self.legs[0].ground_contact and self.legs[1].ground_contact
+        near_ground = pos.y < PIH_PAD_Y + PIH_LEG_OFFSET + 0.05
         speed  = math.sqrt(vel.x ** 2 + vel.y ** 2)
         at_start = abs(pos.x - PIH_START_X) < 3.0
         landed = (
-            self._attached and both_on_ground and not self.game_over
+            self._attached and near_ground and not self.game_over
             and speed < 0.75 and abs(self.lander.angularVelocity) < 0.45
             and at_start
         )
