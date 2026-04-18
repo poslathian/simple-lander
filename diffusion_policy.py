@@ -471,8 +471,12 @@ class DPRolloutDB(RolloutDB):
             replace=len(candidate_indices) < batch_size,
         )
 
+        raw_state = self._states[chosen].copy()
+        state_data = raw_state.copy()
+        state_data[:, 16] = 0.0  # zero t_remaining for DP conditioning
         batch = {
-            "state": torch.tensor(self._states[chosen], dtype=torch.float32),
+            "state": torch.tensor(state_data, dtype=torch.float32),
+            "raw_state": torch.tensor(raw_state, dtype=torch.float32),
             "action": torch.tensor(self._actions[chosen], dtype=torch.float32),
             "reward": torch.tensor(self._rewards[chosen], dtype=torch.float32),
             "terminal": torch.tensor(self._terminals[chosen], dtype=torch.bool),
@@ -666,16 +670,17 @@ class DPTrainer:
 
         actions_norm = self.norm.normalize(actions)
 
-        # Binarized advantage: did this plan beat the critic's prediction?
-        # advantage = sign(MC_return - V(s))
-        # Use raw_state (with original t_remaining) for critic, not zeroed state
+        # Binarized advantage: sign(MC_return - batch_mean_return)
+        # Uses batch normalization instead of V(s) to avoid critic bias
         if "mc_return" in batch:
             mc = batch["mc_return"][has_action]
-            critic_states = batch["raw_state"][has_action] if "raw_state" in batch else states
-            self.critic.eval()
-            with torch.no_grad():
-                v = self.critic.forward_v(critic_states).squeeze(-1)
-            advantages = torch.sign(mc - v)
+            valid_mc = mc != 0
+            if valid_mc.any():
+                batch_mean = mc[valid_mc].mean()
+                advantages = torch.sign(mc - batch_mean)
+                advantages[~valid_mc] = 0.0
+            else:
+                advantages = torch.zeros(bs)
         elif "episode_advantage" in batch:
             advantages = torch.sign(batch["episode_advantage"][has_action])
         else:
@@ -795,28 +800,25 @@ class DPTrainer:
             # Validate critic against ground truth
             self._evaluate_critic(n_seeds=20)
 
-            # 3. Update DP — very conservative: 3 epochs, 1/10th LR
-            _status("  updating policy (3 epochs, lr=3e-5)...")
-            # Temporarily lower LR for fine-tuning
-            for pg in self.optimizer.param_groups:
-                pg["lr"] = cfg.lr * 0.1
-            for epoch in range(3):
+            # 3. Full retrain of DP on all data with MC-return weighting
+            n_retrain_epochs = 200
+            _status(f"  retraining policy from scratch ({n_retrain_epochs} epochs)...")
+            # Re-initialize policy and optimizer
+            fresh_policy = DiffusionPolicy(cfg_dp)
+            self.policy = fresh_policy
+            self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr)
+            for epoch in range(n_retrain_epochs):
                 epoch_loss = 0.0
                 for step in range(cfg.steps_per_epoch):
-                    batch = self.db.sample_structured_batch(
-                        batch_size=cfg.batch_size,
-                        current_iteration=iteration,
-                    )
+                    batch = self.db.sample_initial_states(cfg.batch_size)
                     loss = self._train_step_phase3(batch, cfg_dp, iteration)
                     epoch_loss += loss
-                    _maybe_tick("policy", f"epoch {epoch+1}/20 step {step+1}/{cfg.steps_per_epoch}")
                 avg_loss = epoch_loss / cfg.steps_per_epoch
                 loss_hist.append(avg_loss)
                 total_epoch += 1
-            # Restore LR
-            for pg in self.optimizer.param_groups:
-                pg["lr"] = cfg.lr
-            _status(f"  policy updated (loss={avg_loss:.6f})")
+                if (epoch + 1) % 50 == 0:
+                    _status(f"    retrain epoch {epoch+1}/{n_retrain_epochs} loss={avg_loss:.6f}")
+            _status(f"  policy retrained (loss={avg_loss:.6f})")
 
             # 4. Evaluate
             _status("  evaluating holdout...")
@@ -870,28 +872,38 @@ class DPTrainer:
 
         actions_norm = self.norm.normalize(actions)
 
-        # Compute advantages from critic
-        self.critic.eval()
-        with torch.no_grad():
-            v = self.critic.forward_v(states).squeeze(-1)
-            q = self.critic.forward_q(states, actions).squeeze(-1)
-            advantages = torch.sign(q - v)
+        # Proportional MC-return weighting: better trajectories get more influence
+        if "mc_return" in batch:
+            mc = batch["mc_return"][has_action]
+            valid_mc = mc != 0
+            if valid_mc.any():
+                # Normalize returns to [0, 1] range within batch
+                mc_valid = mc[valid_mc]
+                mc_min = mc_valid.min()
+                mc_max = mc_valid.max()
+                mc_range = max(mc_max - mc_min, 1e-6)
+                # Weight: 0.1 for worst, 2.0 for best in batch
+                weights = torch.full((bs,), 0.1)
+                weights[valid_mc] = 0.1 + 1.9 * (mc[valid_mc] - mc_min) / mc_range
+                # Binary advantage for conditioning input
+                batch_mean = mc_valid.mean()
+                advantages = torch.sign(mc - batch_mean)
+                advantages[~valid_mc] = 0.0
+            else:
+                weights = torch.ones(bs)
+                advantages = torch.zeros(bs)
+        else:
+            weights = torch.ones(bs)
+            advantages = torch.zeros(bs)
 
-        # HER: relabel advantage to match actual achieved advantage
-        if "episode_advantage" in batch:
-            ep_adv = batch["episode_advantage"][has_action]
-            actual_sign = torch.sign(ep_adv)
-            her_mask = torch.rand(bs) < cfg.her_relabel_prob
-            advantages = torch.where(her_mask, actual_sign, advantages)
-
-        # Advantage dropout
         adv_mask = torch.rand(bs) < cfg.advantage_dropout
-        advantages[adv_mask] = 0.0
-
-        cond = torch.cat([states, advantages.unsqueeze(-1)], dim=-1)
+        cond_advantages = advantages.clone()
+        cond_advantages[adv_mask] = 0.0
+        cond = torch.cat([states, cond_advantages.unsqueeze(-1)], dim=-1)
 
         pred_plan = self.policy(cond)
-        loss = F.mse_loss(pred_plan, actions_norm)
+        per_sample_loss = (pred_plan - actions_norm).pow(2).mean(dim=-1)
+        loss = (weights * per_sample_loss).mean()
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -941,10 +953,15 @@ class DPTrainer:
             n_steps = int(round(total_duration / DT))
             gains = TrackerGains()
 
-            # Compute advantage for this plan
+            # Compute advantage for this plan (critic needs real t_remaining)
+            cs_critic = CriticState(
+                obs_t=obs_raw.copy(),
+                obs_prev=obs_raw.copy(),
+                t_remaining=total_duration,
+            )
             self.critic.eval()
             with torch.no_grad():
-                s_tensor = cs.to_tensor().unsqueeze(0)
+                s_tensor = cs_critic.to_tensor().unsqueeze(0)
                 a_tensor = plan_enc.to_tensor().unsqueeze(0)
                 v_val = self.critic.forward_v(s_tensor).item()
                 q_val = self.critic.forward_q(s_tensor, a_tensor).item()
@@ -1028,9 +1045,21 @@ class DPTrainer:
             env.close()
 
             ep_outcome = Outcome.LANDED if episode_landed else Outcome.FAILED
+            ep_return = reward(ep_outcome, t)
             # Only store initial transition for DP episodes (we only train on step_idx=0)
-            # This saves ~200x DB capacity vs storing every frame
+            # Set terminal reward on the initial transition so MC return is computed
             initial_only = [transitions[0]] if transitions else transitions
+            if initial_only:
+                initial_only[0] = Transition(
+                    state=initial_only[0].state,
+                    action=initial_only[0].action,
+                    reward=ep_return,
+                    next_state=None,
+                    outcome=ep_outcome,
+                    t_elapsed=initial_only[0].t_elapsed,
+                    episode_id=initial_only[0].episode_id,
+                    step_idx=initial_only[0].step_idx,
+                )
             self.db.append_episode_with_meta(
                 initial_only,
                 advantage=advantage,
