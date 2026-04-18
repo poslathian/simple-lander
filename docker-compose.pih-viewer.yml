@@ -2,11 +2,18 @@
 #
 # Usage:
 #   docker compose -f docker-compose.pih-viewer.yml build
+#
+#   # Check progress stats (no viewer window):
+#   docker compose -f docker-compose.pih-viewer.yml run --rm --no-deps \
+#       -e SDL_VIDEODRIVER=dummy \
+#       pih-viewer python scripts/collect_pih_user.py --stats \
+#           --failures results/phase2_5/failures.jsonl \
+#           --out results/phase2_5/user_corrections.jsonl
+#
+#   # Launch viewer (args forwarded to interactive_viewer.py):
 #   docker compose -f docker-compose.pih-viewer.yml run --rm pih-viewer \
 #       --jsonl results/phase2_5/failures.jsonl --episode 0 \
 #       --out   results/phase2_5/user_corrections.jsonl
-#
-# The command args after the service name are forwarded to interactive_viewer.py.
 #
 # VcXsrv setup (one-time):
 #   1. Install VcXsrv from https://sourceforge.net/projects/vcxsrv/
