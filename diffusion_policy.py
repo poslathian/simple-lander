@@ -82,6 +82,30 @@ class DPConfig:
         return p
 
 
+@dataclass
+class DiffusionConfig:
+    hidden_dim: int = 192
+    num_layers: int = 4
+    time_embed_dim: int = 128
+    dropout: float = 0.1
+    advantage_dropout: float = 0.1
+    n_timesteps: int = 1000          # training schedule length
+    cosine_s: float = 0.008           # cosine schedule shift
+    # Inference-time defaults
+    inference_steps: int = 20         # DDIM steps
+    cfg_scale: float = 1.5            # classifier-free guidance weight
+
+
+def cosine_alphas_bar(n_timesteps: int, s: float = 0.008) -> torch.Tensor:
+    """Nichol & Dhariwal cosine noise schedule. Returns alpha_bar[0..T-1]."""
+    steps = torch.arange(n_timesteps + 1, dtype=torch.float64)
+    f = torch.cos(((steps / n_timesteps) + s) / (1 + s) * math.pi / 2) ** 2
+    alpha_bar = f / f[0]
+    # betas[t] = 1 - alpha_bar[t+1] / alpha_bar[t], clipped for stability
+    alphas_bar_cumprod = alpha_bar[1:]  # length n_timesteps, aligned so t=0 is first step
+    return alphas_bar_cumprod.clamp(min=1e-5, max=0.9999).to(torch.float32)
+
+
 # ===========================================================================
 # Conditioning
 # ===========================================================================
@@ -200,6 +224,173 @@ class DirectPolicy(nn.Module):
 
 
 # ===========================================================================
+# Diffusion components
+# ===========================================================================
+
+class _SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        assert dim % 2 == 0, "sinusoidal embedding dim must be even"
+        self.dim = dim
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (batch,) float
+        half = self.dim // 2
+        freqs = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, device=t.device, dtype=torch.float32)
+            / max(half - 1, 1)
+        )
+        args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+
+class _FiLMBlock(nn.Module):
+    """Residual MLP block with FiLM conditioning on a time embedding."""
+
+    def __init__(self, dim: int, time_dim: int, dropout: float):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim)
+        self.film = nn.Linear(time_dim, 2 * dim)
+        self.linear1 = nn.Linear(dim, dim)
+        self.linear2 = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        # Zero-init the FiLM projection so blocks start as identity.
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.ln(x)
+        scale, shift = self.film(t_emb).chunk(2, dim=-1)
+        h = h * (1.0 + scale) + shift
+        h = self.linear2(F.silu(self.linear1(F.silu(h))))
+        return x + self.dropout(h)
+
+
+class DiffusionPolicy(nn.Module):
+    """Conditional DDPM over plan encodings.
+
+    Predicts epsilon (added Gaussian noise) given noisy plan x_t, conditioning
+    (obs_t + obs_prev + advantage), and diffusion timestep t. Trained with the
+    standard denoising objective; inference uses DDIM with classifier-free
+    guidance steered by the advantage slot in the conditioning vector.
+    """
+
+    def __init__(self, config: DiffusionConfig | None = None):
+        super().__init__()
+        self.config = config or DiffusionConfig()
+        cfg = self.config
+
+        self.time_embed = nn.Sequential(
+            _SinusoidalPosEmb(cfg.time_embed_dim),
+            nn.Linear(cfg.time_embed_dim, cfg.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+        )
+        self.input_proj = nn.Linear(ACTION_DIM + COND_DIM, cfg.hidden_dim)
+        self.blocks = nn.ModuleList([
+            _FiLMBlock(cfg.hidden_dim, cfg.hidden_dim, cfg.dropout)
+            for _ in range(cfg.num_layers)
+        ])
+        self.out_norm = nn.LayerNorm(cfg.hidden_dim)
+        self.output_proj = nn.Linear(cfg.hidden_dim, ACTION_DIM)
+        # Zero-init output so initial epsilon prediction is 0 (stable start).
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+        # Precompute noise schedule (registered as buffer → moves with device).
+        alphas_bar = cosine_alphas_bar(cfg.n_timesteps, cfg.cosine_s)
+        self.register_buffer("alphas_bar", alphas_bar)
+
+    def forward(
+        self, x_t: torch.Tensor, cond: torch.Tensor, t: torch.Tensor
+    ) -> torch.Tensor:
+        """Predict noise added to x_0 to produce x_t.
+
+        Args:
+            x_t:  (batch, ACTION_DIM) noisy plan in normalized space
+            cond: (batch, COND_DIM) [obs_t, obs_prev, advantage]
+            t:    (batch,) int timestep indices in [0, n_timesteps)
+        Returns:
+            (batch, ACTION_DIM) predicted epsilon
+        """
+        t_emb = self.time_embed(t.float())
+        h = self.input_proj(torch.cat([x_t, cond], dim=-1))
+        for block in self.blocks:
+            h = block(h, t_emb)
+        return self.output_proj(self.out_norm(h))
+
+    @torch.no_grad()
+    def generate_plan(
+        self,
+        condition: DPCondition,
+        norm: PlanNormalization,
+        cfg_scale: float | None = None,
+        inference_steps: int | None = None,
+        noise_scale: float = 0.0,  # accepted for API parity; ignored
+        on_step=None,  # optional callback(step_idx, total_steps, x0_denorm_np)
+    ) -> PlanEncoding:
+        """DDIM sampling with classifier-free guidance.
+
+        CFG: model run twice per step — once with the true advantage, once with
+        advantage=0 (unconditional). The final epsilon is
+        eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond).
+
+        If `on_step` is given, it is invoked after each DDIM step with the
+        denormalized x_0 estimate at that step. Useful for visualization.
+        """
+        self.eval()
+        cfg = self.config
+        scale = cfg.cfg_scale if cfg_scale is None else cfg_scale
+        steps = cfg.inference_steps if inference_steps is None else inference_steps
+        device = next(self.parameters()).device
+
+        cond = condition.to_tensor().to(device).unsqueeze(0)  # (1, COND_DIM)
+        cond_uncond = cond.clone()
+        cond_uncond[:, -1] = 0.0  # zero out advantage slot
+
+        T = cfg.n_timesteps
+        # DDIM schedule: step from T-1 down to 0, `steps` points inclusive.
+        sched = torch.linspace(T - 1, 0, steps, device=device).long()
+
+        x = torch.randn(1, ACTION_DIM, device=device)
+        x_0_pred = x  # final value if steps == 1
+
+        for i in range(len(sched)):
+            t = sched[i]
+            t_b = t.unsqueeze(0)
+
+            if scale != 1.0:
+                eps_c = self.forward(x, cond, t_b)
+                eps_u = self.forward(x, cond_uncond, t_b)
+                eps = eps_u + scale * (eps_c - eps_u)
+            else:
+                eps = self.forward(x, cond, t_b)
+
+            alpha_bar_t = self.alphas_bar[t]
+            sqrt_ab = torch.sqrt(alpha_bar_t)
+            sqrt_one_minus_ab = torch.sqrt(1.0 - alpha_bar_t)
+            x_0_pred = (x - sqrt_one_minus_ab * eps) / sqrt_ab
+
+            if on_step is not None:
+                x0_denorm = norm.denormalize(x_0_pred).squeeze(0).cpu().numpy()
+                on_step(i, len(sched), x0_denorm)
+
+            if i < len(sched) - 1:
+                t_next = sched[i + 1]
+                alpha_bar_next = self.alphas_bar[t_next]
+                # DDIM deterministic update (eta=0).
+                x = (torch.sqrt(alpha_bar_next) * x_0_pred
+                     + torch.sqrt(1.0 - alpha_bar_next) * eps)
+
+        x_denorm = norm.denormalize(x_0_pred).squeeze(0).cpu().numpy()
+        return PlanEncoding(
+            control_points=x_denorm[:24],
+            duration=float(x_denorm[24]),
+        )
+
+
+# ===========================================================================
 # Plan reconstruction
 # ===========================================================================
 
@@ -222,6 +413,82 @@ def encoding_to_plan(enc: PlanEncoding, gravity: float = GRAVITY) -> Plan:
 
     traj = BsplineTrajectory(basis, control_points)
     return Plan(traj, T, gravity)
+
+
+# ===========================================================================
+# Diffusion-process visualizer
+# ===========================================================================
+
+def draw_diffusion_preview(
+    env,
+    x0_denorm: np.ndarray,
+    step_idx: int,
+    total_steps: int,
+) -> None:
+    """Overlay one DDIM step's x_0 estimate on the env's pygame screen.
+
+    Draws the 12 control points (always, even if they are still noise) and the
+    decoded B-spline path (best effort — may fail for early, very-noisy steps).
+    Color interpolates red (start of denoising) → green (final clean plan).
+    """
+    import pygame
+    from kto_lander import SCALE, VIEWPORT_H_PX, _pad_center_world
+
+    screen = env.unwrapped.screen
+    if screen is None:
+        return
+
+    pad_x, pad_y = _pad_center_world(env)
+
+    def to_screen(xrel: float, yrel: float) -> tuple[int, int]:
+        wx = pad_x + xrel
+        wy = pad_y + yrel
+        sx = int(round(wx * SCALE))
+        sy = int(round(VIEWPORT_H_PX - wy * SCALE))
+        return (sx, sy)
+
+    progress = step_idx / max(total_steps - 1, 1)
+    r = int(255 * (1.0 - progress))
+    g = int(80 + 175 * progress)
+    color = (r, g, 80)
+
+    cps_flat = x0_denorm[:24]
+    duration = float(x0_denorm[24])
+
+    # Best-effort path line — early noisy steps may not be decodable.
+    if duration > 0.3:
+        try:
+            enc = PlanEncoding(
+                control_points=cps_flat.astype(np.float32),
+                duration=max(duration, 0.5),
+            )
+            plan = encoding_to_plan(enc)
+            ts = np.linspace(0.0, plan.T, 80)
+            pts = []
+            for t in ts:
+                ref = plan(float(t))
+                pts.append(to_screen(float(ref[0]), float(ref[1])))
+            if len(pts) > 1:
+                pygame.draw.lines(screen, color, False, pts, 2)
+        except Exception:
+            pass
+
+    # Control points — clipped to a reasonable display range so wild early
+    # estimates don't draw at absurd screen coordinates.
+    for i in range(12):
+        cx = max(-30.0, min(30.0, float(cps_flat[2 * i])))
+        cy = max(-5.0, min(30.0, float(cps_flat[2 * i + 1])))
+        pos = to_screen(cx, cy)
+        pygame.draw.circle(screen, color, pos, 4)
+        pygame.draw.circle(screen, (0, 0, 0), pos, 4, 1)
+
+    # Step counter HUD.
+    try:
+        font = pygame.font.Font(None, 22)
+        msg = f"diffusion step {step_idx + 1}/{total_steps}   T={duration:+.2f}s"
+        screen.blit(font.render(msg, True, (255, 255, 255)), (10, 10))
+    except Exception:
+        pass
 
 
 # ===========================================================================
@@ -721,7 +988,7 @@ class DPTrainer:
                 n_epochs = 200
                 lr = cfg.lr
                 _status(f"  full retrain ({n_epochs} epochs, lr={lr})...")
-                fresh_policy = DirectPolicy(cfg_dp)
+                fresh_policy = type(self.policy)(cfg_dp)
                 self.policy = fresh_policy
                 self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
             else:
@@ -1170,12 +1437,172 @@ class DPTrainer:
             "policy": self.policy.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "config": self.policy.config,
+            "model_type": "direct",
         }, path)
 
     def load_checkpoint(self, path: Path) -> None:
         ckpt = torch.load(path, weights_only=False)
         self.policy.load_state_dict(ckpt["policy"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
+
+
+# ===========================================================================
+# Diffusion trainer
+# ===========================================================================
+
+class DiffusionTrainer(DPTrainer):
+    """Trainer for DiffusionPolicy.
+
+    Reuses DPTrainer's data pipeline, critic handling, phase3 outer loop, and
+    evaluation logic. Overrides the train/validate steps to use the diffusion
+    noise-prediction objective, and tags checkpoints so they can be loaded back.
+    """
+
+    def _diffusion_loss(
+        self,
+        batch: dict[str, torch.Tensor],
+        cfg_dp,
+        weight_mode: str,
+    ) -> torch.Tensor | None:
+        """Shared loss computation for phase2 and phase3.
+
+        weight_mode:
+          - "advantage":  w = clamp(1 + sign(mc - batch_mean), min=0.1)  (phase 2)
+          - "mc_range":   w linearly interpolated in [0.1, 2.0] by MC return (phase 3)
+        Returns scalar loss tensor, or None if no valid samples in batch.
+        """
+        cfg = self.config
+
+        states = batch["state"]
+        actions = batch["action"]
+        has_action = ~torch.isnan(actions[:, 0])
+        if not has_action.any():
+            return None
+
+        states = states[has_action]
+        actions = actions[has_action]
+        bs = states.shape[0]
+
+        x_0 = self.norm.normalize(actions)
+
+        # Advantage sign + per-sample weights.
+        if "mc_return" in batch:
+            mc = batch["mc_return"][has_action]
+            valid_mc = mc != 0
+            if valid_mc.any():
+                mc_valid = mc[valid_mc]
+                batch_mean = mc_valid.mean()
+                advantages = torch.sign(mc - batch_mean)
+                advantages[~valid_mc] = 0.0
+                if weight_mode == "mc_range":
+                    mc_min = mc_valid.min()
+                    mc_max = mc_valid.max()
+                    mc_range = torch.clamp(mc_max - mc_min, min=1e-6)
+                    weights = torch.full((bs,), 0.1, device=x_0.device)
+                    weights[valid_mc] = 0.1 + 1.9 * (mc[valid_mc] - mc_min) / mc_range
+                else:  # advantage
+                    weights = (1.0 + advantages).clamp(min=0.1)
+            else:
+                advantages = torch.zeros(bs, device=x_0.device)
+                weights = torch.ones(bs, device=x_0.device)
+        elif "episode_advantage" in batch:
+            advantages = torch.sign(batch["episode_advantage"][has_action])
+            weights = (1.0 + advantages).clamp(min=0.1)
+        else:
+            advantages = torch.zeros(bs, device=x_0.device)
+            weights = torch.ones(bs, device=x_0.device)
+
+        # Classifier-free guidance dropout on the advantage slot.
+        adv_mask = torch.rand(bs, device=x_0.device) < cfg.advantage_dropout
+        cond_advantages = advantages.clone()
+        cond_advantages[adv_mask] = 0.0
+        cond = torch.cat([states, cond_advantages.unsqueeze(-1)], dim=-1)
+
+        # Sample timesteps and noise, form x_t, predict epsilon, MSE.
+        T = self.policy.config.n_timesteps
+        t = torch.randint(0, T, (bs,), device=x_0.device)
+        noise = torch.randn_like(x_0)
+        alpha_bar_t = self.policy.alphas_bar[t].unsqueeze(-1)
+        x_t = torch.sqrt(alpha_bar_t) * x_0 + torch.sqrt(1.0 - alpha_bar_t) * noise
+
+        eps_pred = self.policy(x_t, cond, t)
+        per_sample = (eps_pred - noise).pow(2).mean(dim=-1)
+        return (weights * per_sample).mean()
+
+    def _train_step_inner(self, batch, cfg_dp) -> float:
+        self.policy.train()
+        loss = self._diffusion_loss(batch, cfg_dp, weight_mode="advantage")
+        if loss is None:
+            return 0.0
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        self.optimizer.step()
+        return loss.item()
+
+    def _train_step_phase3(self, batch, cfg_dp, iteration: int) -> float:
+        self.policy.train()
+        loss = self._diffusion_loss(batch, cfg_dp, weight_mode="mc_range")
+        if loss is None:
+            return 0.0
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        self.optimizer.step()
+        return loss.item()
+
+    def _validate(self, batch, cfg_dp) -> float:
+        self.policy.eval()
+        with torch.no_grad():
+            loss = self._diffusion_loss(batch, cfg_dp, weight_mode="advantage")
+        return loss.item() if loss is not None else 0.0
+
+    def save_checkpoint(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "policy": self.policy.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "config": self.policy.config,
+            "model_type": "diffusion",
+        }, path)
+
+    def _evaluate_holdout(self) -> dict[str, float]:
+        """Evaluate with advantage_cond=+1 to invoke CFG steering.
+
+        DirectPolicy's default is 0.0 (no steering) because the MLP is robust
+        to that, but diffusion needs a non-zero advantage to make the CFG
+        branches differ — otherwise it collapses to the unconditional model.
+        """
+        seeds = self.config.holdout_seeds
+        landed = 0
+        total_return = 0.0
+        total_advantage = 0.0
+        total_latency = 0.0
+        valid = 0
+
+        for seed in seeds:
+            result = run_dp_episode(
+                self.policy, self.critic, self.norm,
+                render=False, seed=seed, verbose=False, advantage_cond=1.0,
+            )
+            if result.get("planning_failed"):
+                continue
+            valid += 1
+            if result["landed"]:
+                landed += 1
+                total_return += -result["t_elapsed"]
+            else:
+                total_return += -(result["t_elapsed"] + 10.0)
+            total_advantage += result.get("advantage", 0.0)
+            total_latency += result.get("planning_ms", 0.0)
+
+        n = max(valid, 1)
+        return {
+            "landing_rate": landed / n,
+            "mean_return": total_return / n,
+            "mean_advantage": total_advantage / n,
+            "planning_latency_ms": total_latency / n,
+        }
 
 
 # ===========================================================================
@@ -1190,6 +1617,8 @@ def run_dp_episode(
     seed: int | None = None,
     verbose: bool = True,
     advantage_cond: float = 1.0,
+    visualize_diffusion: bool = False,
+    diffusion_step_delay_s: float = 0.05,
 ) -> dict:
     import gymnasium as gym
 
@@ -1210,7 +1639,38 @@ def run_dp_episode(
     condition = DPCondition.from_obs(obs_raw.copy(), obs_raw.copy(), advantage=advantage_cond)
 
     t0 = time.perf_counter()
-    plan_enc = policy.generate_plan(condition, norm)
+    if (visualize_diffusion and render
+            and isinstance(policy, DiffusionPolicy)):
+        # Render the world once to establish a baseline frame, then snapshot
+        # it. Each DDIM step redraws by blitting the snapshot and layering the
+        # overlay, flipping exactly once per step. This avoids the flicker
+        # caused by env.render()'s internal flip followed by our own flip.
+        import pygame
+        env.unwrapped.render()
+        base_surface = env.unwrapped.screen.copy()
+        viz_cancelled = {"v": False}
+
+        def _on_step(step_idx: int, total_steps: int, x0_denorm: np.ndarray) -> None:
+            if viz_cancelled["v"]:
+                return
+            try:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT or (
+                        event.type == pygame.KEYDOWN
+                        and event.key in (pygame.K_q, pygame.K_ESCAPE)
+                    ):
+                        viz_cancelled["v"] = True
+                        return
+                env.unwrapped.screen.blit(base_surface, (0, 0))
+                draw_diffusion_preview(env, x0_denorm, step_idx, total_steps)
+                pygame.display.flip()
+                time.sleep(diffusion_step_delay_s)
+            except Exception:
+                pass
+
+        plan_enc = policy.generate_plan(condition, norm, on_step=_on_step)
+    else:
+        plan_enc = policy.generate_plan(condition, norm)
     planning_ms = (time.perf_counter() - t0) * 1000.0
 
     try:
@@ -1257,13 +1717,28 @@ def run_dp_episode(
     err_hist: list[float] = []
 
     window_closed = False
+    # When rendering, suppress the pygame flip that env.step() triggers
+    # internally so each physics step is displayed exactly once — after we
+    # draw the plan overlay on top. Otherwise the user briefly sees the bare
+    # frame between env's flip and ours → flicker.
+    if render:
+        import pygame
+        _orig_flip = pygame.display.flip
+
     for k in range(n_steps):
         action, dbg = control(obs_state, t, plan, params, gains)
-        obs, _, terminated, truncated, _ = env.step(action)
+
+        if render:
+            pygame.display.flip = lambda: None
+            try:
+                obs, _, terminated, truncated, _ = env.step(action)
+            finally:
+                pygame.display.flip = _orig_flip
+        else:
+            obs, _, terminated, truncated, _ = env.step(action)
 
         if render:
             try:
-                import pygame
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT or (
                         event.type == pygame.KEYDOWN
@@ -1370,37 +1845,48 @@ def main():
 
     # phase2
     p2 = sub.add_parser("phase2", help="Behavioral cloning from KTO episodes")
+    p2.add_argument("--model", choices=["direct", "diffusion"], default="direct")
+    p2.add_argument("--ckpt-dir", type=str, default=None,
+                     help="Override checkpoint output dir (default: dp_checkpoints or dp_diff_checkpoints)")
     p2.add_argument("--db", type=str, default="dp_rollout_db")
     p2.add_argument("--source-db", type=str, default="rollout_db",
                      help="Existing RolloutDB to upgrade from (if dp DB doesn't exist)")
     p2.add_argument("--critic-ckpt", type=str, default="checkpoints/best.pt")
     p2.add_argument("--epochs", type=int, default=100)
+    p2.add_argument("--steps-per-epoch", type=int, default=None,
+                     help="Minibatches per epoch (default: 4 for direct, 32 for diffusion)")
     p2.add_argument("--lr", type=float, default=3e-4)
     p2.add_argument("--collect", type=int, default=0,
                      help="Collect N additional KTO episodes before training")
 
     # phase3
     p3 = sub.add_parser("phase3", help="Online improvement")
+    p3.add_argument("--model", choices=["direct", "diffusion"], default="direct")
+    p3.add_argument("--ckpt-dir", type=str, default=None)
     p3.add_argument("--db", type=str, default="dp_rollout_db")
-    p3.add_argument("--dp-ckpt", type=str, default="dp_checkpoints/best.pt")
+    p3.add_argument("--dp-ckpt", type=str, default=None)
     p3.add_argument("--critic-ckpt", type=str, default="checkpoints/best.pt")
     p3.add_argument("--iterations", type=int, default=20)
     p3.add_argument("--episodes-per-iter", type=int, default=500)
 
     # evaluate
     p_eval = sub.add_parser("evaluate", help="Evaluate on holdout seeds")
-    p_eval.add_argument("--dp-ckpt", type=str, default="dp_checkpoints/best.pt")
+    p_eval.add_argument("--dp-ckpt", type=str, default=None)
     p_eval.add_argument("--critic-ckpt", type=str, default="checkpoints/best.pt")
-    p_eval.add_argument("--norm", type=str, default="dp_checkpoints/norm.npz")
+    p_eval.add_argument("--norm", type=str, default=None)
 
     # run
     p_run = sub.add_parser("run", help="Run single DP episode")
-    p_run.add_argument("--dp-ckpt", type=str, default="dp_checkpoints/best.pt")
+    p_run.add_argument("--dp-ckpt", type=str, default=None)
     p_run.add_argument("--critic-ckpt", type=str, default="checkpoints/best.pt")
-    p_run.add_argument("--norm", type=str, default="dp_checkpoints/norm.npz")
+    p_run.add_argument("--norm", type=str, default=None)
     p_run.add_argument("--render", action="store_true")
     p_run.add_argument("--seed", type=int, default=None)
     p_run.add_argument("--advantage", type=float, default=1.0)
+    p_run.add_argument("--visualize-diffusion", action="store_true",
+                        help="(diffusion only) Animate the DDIM denoising process before each rollout.")
+    p_run.add_argument("--diffusion-step-delay", type=float, default=0.05,
+                        help="Seconds to pause after each DDIM step during the diffusion visualizer.")
 
     # adv-test
     # critic-eval
@@ -1418,12 +1904,33 @@ def main():
 
     # compare
     p_cmp = sub.add_parser("compare", help="Compare KTO vs DP on same seeds")
-    p_cmp.add_argument("--dp-ckpt", type=str, default="dp_checkpoints/best.pt")
+    p_cmp.add_argument("--dp-ckpt", type=str, default=None)
     p_cmp.add_argument("--critic-ckpt", type=str, default="checkpoints/best.pt")
-    p_cmp.add_argument("--norm", type=str, default="dp_checkpoints/norm.npz")
+    p_cmp.add_argument("--norm", type=str, default=None)
     p_cmp.add_argument("--episodes", type=int, default=100)
 
     args = parser.parse_args()
+
+    # Resolve default ckpt/norm paths from the checkpoint file itself when the
+    # user doesn't pass one. For commands that don't select a model explicitly,
+    # infer from the loaded checkpoint's model_type.
+    def _default_dir_for(model_type: str) -> Path:
+        return Path("dp_diff_checkpoints" if model_type == "diffusion" else "dp_checkpoints")
+
+    if args.cmd in ("phase2", "phase3"):
+        if args.ckpt_dir is None:
+            args.ckpt_dir = str(_default_dir_for(args.model))
+    if args.cmd == "phase3" and args.dp_ckpt is None:
+        args.dp_ckpt = str(_default_dir_for(args.model) / "best.pt")
+    for cmd in ("evaluate", "run", "compare"):
+        if args.cmd == cmd:
+            # For these commands model_type comes from the checkpoint itself,
+            # so the user only needs --dp-ckpt. Default to the direct path.
+            if args.dp_ckpt is None:
+                args.dp_ckpt = "dp_checkpoints/best.pt"
+            if args.norm is None:
+                # Norm lives next to the checkpoint.
+                args.norm = str(Path(args.dp_ckpt).parent / "norm.npz")
 
     def _load_critic(ckpt_path: str) -> LanderCritic:
         import lander_critic as _lc
@@ -1434,9 +1941,13 @@ def main():
         critic.eval()
         return critic
 
-    def _load_dp(ckpt_path: str) -> DirectPolicy:
+    def _load_dp(ckpt_path: str) -> nn.Module:
         ckpt = torch.load(Path(ckpt_path), weights_only=False)
-        policy = DirectPolicy(ckpt["config"])
+        model_type = ckpt.get("model_type", "direct")
+        if model_type == "diffusion":
+            policy = DiffusionPolicy(ckpt["config"])
+        else:
+            policy = DirectPolicy(ckpt["config"])
         policy.load_state_dict(ckpt["policy"])
         policy.eval()
         return policy
@@ -1465,22 +1976,34 @@ def main():
         # Load critic
         critic = _load_critic(args.critic_ckpt)
 
-        # Compute normalization
+        # Compute normalization — write next to the model checkpoints.
         norm = PlanNormalization.fit(db)
-        norm_path = Path("dp_checkpoints") / "norm.npz"
-        norm_path.parent.mkdir(parents=True, exist_ok=True)
+        ckpt_dir = Path(args.ckpt_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        norm_path = ckpt_dir / "norm.npz"
         norm.save(norm_path)
         print(f"[phase2] normalization saved to {norm_path}")
 
-        # Build policy
-        dp_cfg = DPConfig()
-        policy = DirectPolicy(dp_cfg)
+        # Build policy + trainer according to --model.
+        if args.model == "diffusion":
+            dp_cfg = DiffusionConfig()
+            policy = DiffusionPolicy(dp_cfg)
+            trainer_cls = DiffusionTrainer
+        else:
+            dp_cfg = DPConfig()
+            policy = DirectPolicy(dp_cfg)
+            trainer_cls = DPTrainer
         n_params = sum(p.numel() for p in policy.parameters())
-        print(f"[phase2] model: {n_params:,} params")
+        print(f"[phase2] model={args.model} ({n_params:,} params)")
 
+        steps_per_epoch = args.steps_per_epoch
+        if steps_per_epoch is None:
+            steps_per_epoch = 32 if args.model == "diffusion" else 4
         train_cfg = DPTrainConfig(phase=2, epochs=args.epochs, lr=args.lr,
-                                   advantage_dropout=0.1)  # 10% dropout for CFG
-        trainer = DPTrainer(policy, critic, db, norm, train_cfg)
+                                   steps_per_epoch=steps_per_epoch,
+                                   advantage_dropout=0.1,
+                                   checkpoint_dir=ckpt_dir)
+        trainer = trainer_cls(policy, critic, db, norm, train_cfg)
         result = trainer.train_phase2()
         print(f"[phase2] result: landing_rate={result.landing_rate:.1%}, "
               f"mean_adv={result.mean_advantage:.3f}")
@@ -1489,14 +2012,18 @@ def main():
         db = DPRolloutDB(Path(args.db))
         critic = _load_critic(args.critic_ckpt)
         policy = _load_dp(args.dp_ckpt)
-        norm = PlanNormalization.load(Path("dp_checkpoints/norm.npz"))
+        ckpt_dir = Path(args.ckpt_dir)
+        norm = PlanNormalization.load(ckpt_dir / "norm.npz")
 
+        trainer_cls = (DiffusionTrainer if isinstance(policy, DiffusionPolicy)
+                        else DPTrainer)
         train_cfg = DPTrainConfig(
             phase=3,
             n_iterations=args.iterations,
             episodes_per_iteration=args.episodes_per_iter,
+            checkpoint_dir=ckpt_dir,
         )
-        trainer = DPTrainer(policy, critic, db, norm, train_cfg)
+        trainer = trainer_cls(policy, critic, db, norm, train_cfg)
         result = trainer.train_phase3()
         print(f"[phase3] result: landing_rate={result.landing_rate:.1%}, "
               f"mean_adv={result.mean_advantage:.3f}")
@@ -1561,6 +2088,8 @@ def main():
                 m = run_dp_episode(
                     policy, critic, norm,
                     render=True, seed=seed, advantage_cond=args.advantage,
+                    visualize_diffusion=args.visualize_diffusion,
+                    diffusion_step_delay_s=args.diffusion_step_delay,
                 )
                 if m.get("window_closed"):
                     break
